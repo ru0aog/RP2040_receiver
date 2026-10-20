@@ -11,7 +11,7 @@
 // ------------------------------------------------------------
 static constexpr uint32_t RX_FREQ_HZ = 3600000UL;
 static constexpr uint32_t SERIAL_BAUD = 115200UL;
-static constexpr uint16_t FFT_N = 256;
+static constexpr uint16_t FFT_N = 1024;
 static constexpr uint32_t RX_STATUS_INTERVAL_MS = 2000UL;
 
 static float fftRe[FFT_N];

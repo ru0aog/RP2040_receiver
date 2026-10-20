@@ -19,8 +19,8 @@
   
 // ---- Параметры тракта ----  
 #define RX_FS_IN_HZ           (RX_ADC_SAMPLE_RATE_HZ / 2.0f)    // Fs на канал  
-#define RX_DECIM_STAGES       3                                 // кол-во последовательных КИХ-фильтров (3)
-#define RX_FS_OUT_HZ          (RX_FS_IN_HZ / 8.0f)              // ~15.6 ksps при 250k  
+#define RX_DECIM_STAGES       4                                 // кол-во последовательных КИХ-фильтров (3)
+#define RX_FS_OUT_HZ          (RX_FS_IN_HZ / 16.0f)              // ~15.6 ksps при 250k  
   
 // NCO: 32-битный фазовый аккумулятор  
 static volatile uint32_t nco_phase = 0;  
@@ -85,7 +85,7 @@ static inline bool hb_push(hb_state_t* st, int32_t x, int32_t* out) {
         // начиная от самой старой сохраненной точки к самой новой
         int idx = (int)st->w + k; if (idx >= HB_NTAPS) idx -= HB_NTAPS;
         // цифровое умножение отсчёта сигнала на соответствующий коэффициент фильтра (hb_taps)
-        acc += (int32_t)st->d[idx] * hb_taps[k];  
+        acc += st->d[idx] * hb_taps[k];  
     }
     // Масштабирование и выдача готового отсчёта
     *out = acc >> 15;
@@ -103,7 +103,7 @@ static inline int16_t sat16(int32_t v) {
     return (int16_t)v;
 }
 
-#define RX_OUT_SAMPLES   (RX_BLOCK_SAMPLES / 8)     // 64 пары отсчётов I/Q на блок  
+#define RX_OUT_SAMPLES   (RX_BLOCK_SAMPLES / 16)     // 64 пары отсчётов I/Q на блок  
 #define RX_OUT_BUFS      4                          // кол-во выходных буферов
 
 static int16_t out_i[RX_OUT_BUFS][RX_OUT_SAMPLES];  // выходные буферы обработанных данных I/Q
@@ -145,22 +145,22 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
             // извлекаем текущие отсчёты из массива
             int32_t i_meas = s[2 * n];
             int32_t q_meas = s[2 * n + 1];
-
+/*
 //обходка DC и NCO
     int32_t i_raw = i_meas;  
     int32_t q_raw = q_meas;
     int32_t i_rot = i_raw;
     int32_t q_rot = q_raw;
-/*
+*/
             // Центрирование
                 // EMA с коэффициентом 1/256
-                dc_i += (i_meas - (dc_i >> 8));        // dc в Q8  
-                dc_q += (q_meas - (dc_q >> 8));
+                dc_i += ((i_meas << 8) - dc_i) >> 8;
+                dc_q += ((q_meas << 8) - dc_q) >> 8;
                 // текущее вычисленное среднее (сдвинутое обратно на 8 бит вправо)
                 // вычитается из измерений.
                 // Получаем сигнал в i_raw и q_raw, компенсированный от постоянного смещения
-                int32_t i_raw = i_meas - (dc_i >> 8);  
-                int32_t q_raw = q_meas - (dc_q >> 8);  
+                int32_t i_raw = i_meas - (dc_i >> 8);
+                int32_t q_raw = q_meas - (dc_q >> 8);
   
             // Комплексный перенос частоты (Смеситель NCO)
                 int16_t sn, cs;
@@ -173,12 +173,12 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
                 // После этой операции целевой радиосигнал математически смещается в нулевую промежуточную частоту
                 int32_t i_rot = (i_raw * cs + q_raw * sn) >> 15;
                 int32_t q_rot = (q_raw * cs - i_raw * sn) >> 15;
-*/
-            // Трехкаскадная Half-Band фильтрация и децимация
+
+            // четырёхкаскадная Half-Band фильтрация и децимация
             int32_t vi = i_rot, vq = q_rot;  
             bool emit = true;
-                // цепочка последовательных КИХ-фильтров (RX_DECIM_STAGES = 3)
-                for (int st = 0; st < RX_DECIM_STAGES; st++) {  
+                // цепочка последовательных КИХ-фильтров (RX_DECIM_STAGES = 4)
+                for (int st = 0; st < RX_DECIM_STAGES; st++) {
                     int32_t oi, oq;
                     // hb_push укладывает данные в линию задержки очередного каскада
                     bool ri = hb_push(&hb_i[st], vi, &oi);  
