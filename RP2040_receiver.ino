@@ -13,6 +13,7 @@ static constexpr uint32_t RX_FREQ_HZ = 3600000UL;
 static constexpr uint32_t SERIAL_BAUD = 115200UL;
 static constexpr uint16_t FFT_N = 1024;
 static constexpr uint32_t RX_STATUS_INTERVAL_MS = 2000UL;
+static constexpr float FFT_WINDOW_GAIN = 0.5f;
 
 static float fftRe[FFT_N];
 static float fftIm[FFT_N];
@@ -91,7 +92,7 @@ static void calculateSpectrum()
     for (uint16_t k = 0; k < FFT_N; ++k) {
         const uint16_t b = (uint16_t)((k + FFT_N / 2) % FFT_N);
         const float mag = sqrtf(fftRe[b] * fftRe[b] + fftIm[b] * fftIm[b]);
-        const float normalized = mag / (float)FFT_N;
+        const float normalized = mag / ((float)FFT_N * FFT_WINDOW_GAIN);
         spectrumDb[k] = 20.0f * log10f(normalized + 1.0e-12f);
     }
 
