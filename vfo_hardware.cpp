@@ -48,41 +48,23 @@
 #include "vfo_hardware.h"
 
 // данные из параллельного проекта
-
+// ============================================================================
 int pin_freq_out = 0;
-
 // GPIO управления ДПФ (значения подставить из конфигурации)
 static const int subband_pins[] = {
     2, 3, 4, -1
 };
+// ============================================================================
 
-// ----------------
+
 
 // ДИАГНОСТИКА
 #define BOOST_DEBUG              0         // 0 — выключить отладочную печать блока разгона
 #define VFO_PLL_DEBUG            0         // 0 — выключить отладочную печать подбора кандидатов
 #define PLL_RUNTIME_DEBUG        0         // 0 — выключить отладочную печать блока PLL
 
-
-void vfo_quadrature_start(uint32_t freq_hz);   // freq_hz = частота ПРИЁМА (LO ставится на freq−IF)  
-void vfo_quadrature_stop(uint32_t freq_hz, double step_hz);  
-uint32_t vfo_quadrature_lo_hz(void);           // фактическая частота LO после квантования clkdiv
-
-static unsigned int quad_offset = 0;  
-static bool quad_program_loaded = false;  
-static bool quad_active = false;          // true = SM сконфигурирована под RX-квадратуру
-  
-// Фактическая квантованная частота LO (для NCO)  
-static uint32_t quad_lo_actual_hz = 0;
-
-uint32_t vfo_quadrature_lo_hz(void) {
-    return quad_lo_actual_hz; 
-}
-
-
-
 // ============================================================================
-// МОДЕРНИЗИРОВАННЫЙ МНОГОКРИТЕРИАЛЬНЫЙ АВТОТЮН PLL (ВЕРСИЯ С REFDIV И CTZ-ФИЛЬТРОМ)
+// МНОГОКРИТЕРИАЛЬНЫЙ АВТОТЮН PLL (ВЕРСИЯ С REFDIV И CTZ-ФИЛЬТРОМ)
 // ============================================================================
 #define VFO_INT_PENALTY        500000000ULL // жёсткий запрет pio_int < 4
 #define VFO_SPUR_MIN_OFFSET_HZ 1000000ULL   // запретный пояс FRAC8-спура, Гц  
@@ -142,14 +124,11 @@ PllConfig pll_ceiling   = { 95,  3, 1, 380011083ULL, (uint32_t)VREG_VOLTAGE_1_30
 volatile bool clk_boosted = false;       // активация разгона
 volatile bool vfo_auto_boost = false;    // авто-разгон, вычисляется один раз на старте
 
-// --- Квадратура I/Q: один SM, 4-тактовая программа, 2 соседних пина ---  
-// базовый пин PIO-блока = GP0 = Q, следующий = GP1 = I  
-int pin_freq_out_i = 0;   // PIO base pin — физически это Q (GP0)  
-int pin_freq_out_q = 1;   // base+1 — физически это I (GP1)
 
-static bool thermal_throttled = false; // защёлка состояния троттлинга  
+
+
 static uint16_t vsel_to_mv(uint32_t vsel);  
-static float    vfo_read_core_temp_c(void);
+
 
 static uint64_t vfo_pll_metric(uint64_t clk_sys_hz, uint64_t target_mhz,  
                                VfoParameters* out = nullptr);
@@ -168,31 +147,9 @@ void vfo_clk_boost_arm(void) {
     clk_boosted = true;  
 }
 
-// Ассемблерная микропрограмма PIO для меандра (цикл из 2 тактов)  
-static const uint16_t pio_square_instructions[] = {
-    0xe001,
-    0xe000 
-};
-static const pio_program_t pio_square_program = {   
-    .instructions = pio_square_instructions,   
-    .length = 2,   
-    .origin = -1,  
-    .pio_version = 0   
-};  
+
   
-// Ассемблерная микропрограмма PIO для меандра (цикл из 4 тактов) 
-static const uint16_t pio_quad_instructions[] = {  
-    0xe001,  // set pins, 0b01: Q=1 I=0  
-    0xe003,  // set pins, 0b11: Q=1 I=1  
-    0xe002,  // set pins, 0b10: Q=0 I=1  
-    0xe000,  // set pins, 0b00: Q=0 I=0  
-};
-static const pio_program_t pio_quad_program = {  
-    .instructions = pio_quad_instructions,  
-    .length = 4,  
-    .origin = -1,  
-    .pio_version = 0  
-};  
+
 
 
 
@@ -248,6 +205,206 @@ static void __not_in_flash_func(detach_peripheral_clock)() {
 
 
 
+
+// ============================================================================
+// ГЕНЕРАТОР КВАДРАТУРНЫХ I/Q-СИГНАЛОВ ПРИЁМНИКА: 4-тактовая программа, 2 соседних пина
+// ============================================================================
+
+// Ассемблерная микропрограмма PIO для меандра (цикл из 4 тактов)
+static const uint16_t pio_quad_instructions[] = {
+    0xe001,  // set pins, 0b01: Q=1 I=0
+    0xe003,  // set pins, 0b11: Q=1 I=1
+    0xe002,  // set pins, 0b10: Q=0 I=1
+    0xe000,  // set pins, 0b00: Q=0 I=0
+};
+static const pio_program_t pio_quad_program = {
+    .instructions = pio_quad_instructions,
+    .length = 4,
+    .origin = -1,
+    .pio_version = 0
+};
+
+// --- Квадратура I/Q: один SM, 4-тактовая программа, 2 соседних пина ---  
+// базовый пин PIO-блока = GP0 = Q, следующий = GP1 = I  
+int pin_freq_out_i = 0;   // PIO base pin — физически это Q (GP0)  
+int pin_freq_out_q = 1;   // base+1 — физически это I (GP1)
+
+static unsigned int quad_offset = 0;  
+static bool quad_program_loaded = false;  
+static bool quad_active = false;          // true = SM сконфигурирована под RX-квадратуру
+
+void vfo_quadrature_start(uint32_t freq_hz);   // freq_hz = частота ПРИЁМА (LO ставится на freq−IF)  
+void vfo_quadrature_stop(uint32_t freq_hz, double step_hz);  
+uint32_t vfo_quadrature_lo_hz(void);           // фактическая частота LO после квантования clkdiv
+
+// Фактическая квантованная частота LO (для NCO)  
+static uint32_t quad_lo_actual_hz = 0;
+
+uint32_t vfo_quadrature_lo_hz(void) {
+    return quad_lo_actual_hz; 
+}
+
+// Перевести VFO в RX-режим квадратурного LO (I/Q для SDR-смесителя).  
+void vfo_quadrature_start(uint32_t freq_hz) {
+    // Целевая частота LO — ниже настраиваемой на величину ПЧ  
+    uint32_t lo_hz = (freq_hz > RX_IF_SHIFT_HZ) ? (freq_hz - RX_IF_SHIFT_HZ) : freq_hz;  
+    Serial.print("[QUAD] Целевая частота "); Serial.println(lo_hz);
+    // Дробный clkdiv: 24.8 fixed-point. Аппаратный дробный делитель PIO,    
+    // без дизеринга и без core1.    
+    // div_q8 = clk_sys*256 / (4*lo_hz)    
+    // ВАЖНО: current_clk_sys_hz здесь — кэш от последнего TX-init и может    
+    // отставать от реальной шины (наблюдалось 120 MHz vs 125 MHz), что    
+    // давало уход LO на 2.8 кГц. Берём живое значение из clock_get_hz.    
+    uint64_t clk_sys_hz = clock_get_hz(clk_sys);                    // фактическая шина  
+    uint64_t num    = clk_sys_hz * 256;    
+    uint32_t div_q8 = (uint32_t)(num / (4ull * lo_hz));    
+    if (div_q8 < (2u << 8))                    div_q8 = 2u << 8;    
+    if (div_q8 > (0xFFFFu << 8) + 0xFF)        div_q8 = (0xFFFFu << 8) + 0xFF;    
+    
+    // Фактическая частота LO: f = clk_sys_hz / (4 * div_q8/256) = num / (4*div_q8)    
+    quad_lo_actual_hz = (uint32_t)(num / (div_q8 * 4ull));
+    Serial.print("[QUAD] Фактическая частота "); Serial.println(quad_lo_actual_hz);
+
+    if (!quad_program_loaded) {  
+        quad_offset = pio_add_program(lo_pio, &pio_quad_program);  
+        quad_program_loaded = true;  
+    }  
+  
+    quad_active = false;   // взводим до завершения переконфигурации  
+  
+    // Останавливаем SM и гасим core1 — дизеринг в RX не нужен,  
+    // ядро уходит под DSP приёмника.  
+    pio_sm_set_enabled(lo_pio, lo_sm, false);  
+    multicore_reset_core1();  
+    tone_changed = false;  
+  
+    // TX-пин: SM его больше не обслуживает — уводим в input,  
+    // иначе на pin_freq_out останется защемлённый последний уровень.  
+    pio_sm_set_consecutive_pindirs(lo_pio, lo_sm, pin_freq_out, 1, false);  
+    gpio_set_dir(pin_freq_out, GPIO_IN);  
+  
+    pio_sm_config cq = pio_get_default_sm_config();  
+    sm_config_set_wrap(&cq, quad_offset + 0, quad_offset + 3);  
+    sm_config_set_set_pins(&cq, pin_freq_out_i, 2);   // Q = pin_freq_out_i + 1  
+    // Делитель в конфиге: 24.8 -> float, SDK упакует в регистр при sm_init  
+    sm_config_set_clkdiv(&cq, (float)div_q8 / 256.0f);  
+    pio_gpio_init(lo_pio, pin_freq_out_i);  
+    pio_gpio_init(lo_pio, pin_freq_out_q);  
+  
+    pio_sm_init(lo_pio, lo_sm, quad_offset, &cq); 
+    // Направление ставим ПОСЛЕДНИМ, после sm_init — пины не должны  
+    // выпускать полуинициализированные переходы в смеситель.  
+    pio_sm_set_consecutive_pindirs(lo_pio, lo_sm, pin_freq_out_i, 2, true);  
+    pio_sm_restart(lo_pio, lo_sm);          // PC -> wrap_target, чистая фаза  
+    pio_sm_set_enabled(lo_pio, lo_sm, true);  
+  
+    quad_active = true;  
+}
+
+// Вернуть VFO в штатный TX-режим (2-тактовый меандр на одном пине).  
+void vfo_quadrature_stop(uint32_t freq_hz, double step_hz) {  
+    pio_sm_set_enabled(lo_pio, lo_sm, false);  
+    // оба квадратурных пина в input до переконфигурации SM под передачу  
+    pio_sm_set_consecutive_pindirs(lo_pio, lo_sm, pin_freq_out_i, 2, false);  
+    pio_sm_set_enabled(lo_pio, lo_sm, false);
+    quad_active = false;  
+    vfo_hardware_init(freq_hz, step_hz);   // вернёт square-программу и TX-сетку  
+}
+
+void quad_test(uint32_t freq_hz) {
+    Serial.printf("[QUAD] lo_target=%lu Hz  lo_actual=%lu Hz  err=%ld Hz\n",  
+                freq_hz - 3000, vfo_quadrature_lo_hz(),  
+                (long)(freq_hz - 3000) - (long)vfo_quadrature_lo_hz());  
+    Serial.printf("[QUAD] clkdiv=0x%08lX  div=%lu.%02u  sm_cs=0x%08lX\n",  
+                (unsigned long)lo_pio->sm[lo_sm].clkdiv,  
+                (unsigned long)(lo_pio->sm[lo_sm].clkdiv >> 24),  
+                (unsigned)((lo_pio->sm[lo_sm].clkdiv >> 16) & 0xFF),  
+                (unsigned long)lo_pio->sm[lo_sm].execctrl);
+}
+
+// Этап 0 отладки квадратурного LO: дамп всего состояния PIO/SM,  
+// что генерирует фазы на GP1/GP2.  
+void vfo_quadrature_debug(void) {  
+#define QUAD_LO_PIN_I 1
+#define QUAD_LO_PIN_Q 2
+    // Реальная частота шины: меряем счётчиком, не доверяем current_clk_sys_hz  
+    uint32_t meas_clk = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_SYS) * 1000u;  
+    uint32_t cdiv   = lo_pio->sm[lo_sm].clkdiv;  
+  
+    Serial.printf("[LODBG] clk_sys: cached=%lu kHz  measured=%lu kHz\n",  
+                  (unsigned long)(clock_get_hz(clk_sys)/1000ULL),  
+                  (unsigned long)(meas_clk / 1000u));  
+    Serial.printf("[LODBG] PIO=%d SM=%d  clkdiv=0x%08lX (int=%lu frac=%lu)\n",  
+                  pio_get_index(lo_pio), (int)lo_sm,  
+                  (unsigned long)cdiv,  
+                  (unsigned long)(cdiv >> 16),  
+                  (unsigned long)((cdiv >> 8) & 0xFF));  
+    Serial.printf("[LODBG] SM ctrl=0x%08lX enabled=%d  execctrl=0x%08lX  shiftctrl=0x%08lX\n",  
+                  (unsigned long)lo_pio->ctrl,  
+                  (int)((lo_pio->ctrl & (1u << lo_sm)) != 0),   // <-- запятая  
+                  (unsigned long)lo_pio->sm[lo_sm].execctrl,  
+                  (unsigned long)lo_pio->sm[lo_sm].shiftctrl);
+    // Функция пинов LO — должна быть PIO (F=pio0/pio1), не SIO  
+    Serial.printf("[LODBG] GP%d func=%lu  GP%d func=%lu  pads: out_en=%d/%d\n",  
+                  QUAD_LO_PIN_I, (unsigned long)(io_bank0_hw->io[QUAD_LO_PIN_I].ctrl & IO_BANK0_GPIO0_CTRL_FUNCSEL_BITS),  
+                  QUAD_LO_PIN_Q, (unsigned long)(io_bank0_hw->io[QUAD_LO_PIN_Q].ctrl & IO_BANK0_GPIO0_CTRL_FUNCSEL_BITS),  
+                  (int)((pads_bank0_hw->io[QUAD_LO_PIN_I] & PADS_BANK0_GPIO0_OD_BITS) == 0),  
+                  (int)((pads_bank0_hw->io[QUAD_LO_PIN_Q] & PADS_BANK0_GPIO0_OD_BITS) == 0));  
+    Serial.printf("[LODBG] lo_hz cached=%lu\n",  
+                  (unsigned long)vfo_quadrature_lo_hz());  
+    Serial.printf("[QUAD] clkdiv_hw=0x%08lX execctrl=0x%08lX pinctrl=0x%08lX instr=0x%04lX\n",  
+                  (unsigned long)lo_pio->sm[lo_sm].clkdiv,  
+                  (unsigned long)lo_pio->sm[lo_sm].execctrl,  
+                  (unsigned long)lo_pio->sm[lo_sm].pinctrl,  
+                  (unsigned long)lo_pio->sm[lo_sm].instr);
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+// ============================================================================
+// ГЕНЕРАТОР ТОЧНОГО СИГНАЛА ПЕРЕДАТЧИКА: 2-тактовая программа
+// ============================================================================
+
+// Ассемблерная микропрограмма PIO для меандра (цикл из 2 тактов)  
+static const uint16_t pio_square_instructions[] = {
+    0xe001,
+    0xe000 
+};
+static const pio_program_t pio_square_program = {   
+    .instructions = pio_square_instructions,   
+    .length = 2,   
+    .origin = -1,  
+    .pio_version = 0   
+};  
 
 static void __not_in_flash_func(vfo_set_clk_sys)(const PllConfig& cfg_in, uint32_t vsel) {
     PllConfig cfg = cfg_in;  
@@ -568,7 +725,7 @@ void vfo_clk_boost_exit(void) {
                   (unsigned)vsel_to_mv((uint32_t)VREG_VOLTAGE_DEFAULT),    
                   pll_nominal.clk_sys_hz / 1000000.0 / (double)ssi_hw->baudr,    
                   (unsigned)ssi_hw->baudr,    
-                  (double)vfo_read_core_temp_c());
+                  (double)0.0);
 #endif
     clk_boosted = false;
 }
@@ -1360,7 +1517,7 @@ void vfo_hardware_init(unsigned int base_freq_hz, double step_hz) {
                       (unsigned)vsel_to_mv(selected_vsel),    
                       (double)current_clk_sys_hz / 1000000.0 / (double)ssi_hw->baudr,    
                       (unsigned)ssi_hw->baudr,    
-                      (double)vfo_read_core_temp_c());
+                      (double)0.0);
 #endif
     }
     // ========================================================================
@@ -1454,80 +1611,6 @@ static uint16_t vsel_to_mv(uint32_t vsel) {
 }
 
 
-
-extern bool rx_active;
-// === ТЕМПЕРАТУРА ЯДРА RP2040 (ADC канал 4, встроенный датчик) ===  
-// Формула из даташита RP2040: T = 27 - (V_bead - 0.706) / 0.001721  
-// СКОРРЕКТИРОВАННОЕ ПОМЕХОЗАЩИЩЕННОЕ ЧТЕНИЕ ТЕМПЕРАТУРЫ [Исправлено]
-static float vfo_read_core_temp_c(void) {
-    if (rx_active) return NAN;
-    // Восстановление clk_adc после смены clk_sys (48 МГц от PLL_USB)  
-    clock_configure(clk_adc,  
-                    CLOCKS_CLK_ADC_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,  
-                    0, 48000000u, 48000000u);
-    adc_select_input(4);  
-
-    uint32_t samples[3];
-    
-    // Делаем три последовательных замера с микросекундными паузами, 
-    // чтобы дождаться стабилизации опорного напряжения аналоговой шины
-    for(int i = 0; i < 3; i++) {
-        samples[i] = adc_read();
-        busy_wait_us(10); 
-    }
-
-    // Простейшая медианная фильтрация: выбираем среднее значение, отсекая ложные "иголки"
-    uint32_t raw;
-    if ((samples[0] <= samples[1] && samples[1] <= samples[2]) || (samples[2] <= samples[1] && samples[1] <= samples[0]))
-        raw = samples[1];
-    else if ((samples[1] <= samples[0] && samples[0] <= samples[2]) || (samples[2] <= samples[0] && samples[0] <= samples[1]))
-        raw = samples[0];
-    else
-        raw = samples[2];
-
-    float v_bead = raw * 3.3f / 4095.0f; // ADC 12 бит, VREF = 3.3 В  
-    return 27.0f - (v_bead - 0.706f) / 0.001721f;  
-}
-
-
-
- 
-void vfo_clk_thermal_guard(void) {  
-    if (!clk_boosted && !thermal_throttled) return;   
-    if (pll_ceiling.clk_sys_hz <= pll_nominal.clk_sys_hz) return; 
-  
-    float temp = vfo_read_core_temp_c();  
-  
-    if (!thermal_throttled && temp >= VFO_THROTTLE_HI_C) {  
-        // Аварийный откат на номинал
-        vfo_set_clk_sys(pll_nominal, VREG_VOLTAGE_DEFAULT);  
-        vfo_rebuild_tone_table((uint64_t)cached_base_freq_hz * 1000ULL,  
-                            (uint64_t)(cached_step_hz * 1000.0));
-        vfo_set_tone_instant(0);
-        vfo_dither_reset();         // сброс накопителей фазы MASH-дизера
-        clk_boosted = false;  
-        thermal_throttled = true;
-#if BOOST_DEBUG 
-        Serial.printf("[BOOST  ] THROTTLE: T_CPU=%.1f C >= %.0f C — откат на %lu MHz\n",  
-                      (double)temp, (double)VFO_THROTTLE_HI_C,  
-                      (unsigned long)(pll_nominal.clk_sys_hz / 1000000ULL));
-#endif
-    }  
-    else if (thermal_throttled && temp <= VFO_THROTTLE_LO_C) {  
-        // Кристалл остыл — ВОЗВРАЩАЕМ АКТИВНЫЙ ПРОФИЛЬ ТЕКУЩЕЙ СЕССИИ (pll_overclock) [Исправлено]
-        vfo_set_clk_sys(pll_overclock, pll_overclock.vsel);  
-        vfo_rebuild_tone_table((uint64_t)cached_base_freq_hz * 1000ULL,  
-                            (uint64_t)(cached_step_hz * 1000.0));
-        vfo_set_tone_instant(0);
-        vfo_dither_reset();         // сброс накопителей фазы MASH-дизера
-        clk_boosted = true;  
-        thermal_throttled = false;
-#if BOOST_DEBUG 
-        Serial.printf("[BOOST  ] RESUME: T_CPU=%.1f C — возврат на %7.3f MHz\n",  
-                      (double)temp, (double)pll_overclock.clk_sys_hz / 1000000.0);
-#endif
-    }  
-}
 
 
 
@@ -1762,7 +1845,7 @@ void __not_in_flash_func(vfo_find_max_stable_clock)(void) {
         // Flash пишется только на номинале: откат -> сохранение -> возврат на ступень.  
         uint32_t proven_hz = (uint32_t)((step_cfg.clk_sys_hz * 97ULL) / 100ULL);  
         vfo_set_clk_sys(pll_nominal, VREG_VOLTAGE_DEFAULT);  
-        persist_clock_limits(proven_hz, 0);   // 0 = не трогаем лимит PLL  
+        //persist_clock_limits(proven_hz, 0);   // 0 = не трогаем лимит PLL  
         Serial.printf("[OCTEST] flash: clk_sys_max=%lu Hz (-3%% от достигнутых %llu)\n",  
                       (unsigned long)proven_hz, step_cfg.clk_sys_hz);  
         Serial.flush();  
@@ -1855,7 +1938,7 @@ void __not_in_flash_func(vfo_test_pll_extreme_shurm)(void) {
         restore_interrupts(ints);
         // --- ВЫХОД ИЗ КРИТИЧЕСКОЙ СЕКЦИИ ---
 
-        float current_temp = vfo_read_core_temp_c();
+
         bool is_locked = (pll_sys_hw->cs & PLL_CS_LOCK_BITS) != 0;
 
         // Печать строки лога — штурмуем гигагерцы!
@@ -1865,7 +1948,7 @@ void __not_in_flash_func(vfo_test_pll_extreme_shurm)(void) {
                       (unsigned long)(clk_sys_hz / 1000000ULL),
                       is_locked ? "YES" : "LOST!",
                       sram_failed ? "FAIL" : "OK",
-                      (double)current_temp,
+                      (double)0.0,
                       (double)clk_sys_hz / 1000000.0 / (double)ssi_hw->baudr);
         Serial.flush();
 
@@ -1885,7 +1968,7 @@ void __not_in_flash_func(vfo_test_pll_extreme_shurm)(void) {
   
             // 2. Запись в dedicated-сектор (внутри: XOSC + baudr=2 на время erase/program,  
             //    возврат на текущий выход PLL_SYS после записи).  
-            persist_clock_limits(0, proven_vco);  
+            //persist_clock_limits(0, proven_vco);  
   
             Serial.printf("[ШТУРМ] flash: pll_vco_max=%lu Hz (-3%% от %llu)\n",  
                           (unsigned long)proven_vco, (unsigned long long)vco_hz);  
@@ -1984,73 +2067,6 @@ void __not_in_flash_func(vfo_dither_reset)(void) {
 
 
 
-// Перевести VFO в RX-режим квадратурного LO (I/Q для SDR-смесителя).  
-void vfo_quadrature_start(uint32_t freq_hz) {
-    // Целевая частота LO — ниже настраиваемой на величину ПЧ  
-    uint32_t lo_hz = (freq_hz > RX_IF_SHIFT_HZ) ? (freq_hz - RX_IF_SHIFT_HZ) : freq_hz;  
-    Serial.print("[QUAD] Целевая частота "); Serial.println(lo_hz);
-    // Дробный clkdiv: 24.8 fixed-point. Аппаратный дробный делитель PIO,    
-    // без дизеринга и без core1.    
-    // div_q8 = clk_sys*256 / (4*lo_hz)    
-    // ВАЖНО: current_clk_sys_hz здесь — кэш от последнего TX-init и может    
-    // отставать от реальной шины (наблюдалось 120 MHz vs 125 MHz), что    
-    // давало уход LO на 2.8 кГц. Берём живое значение из clock_get_hz.    
-    uint64_t clk_sys_hz = clock_get_hz(clk_sys);                    // фактическая шина  
-    uint64_t num    = clk_sys_hz * 256;    
-    uint32_t div_q8 = (uint32_t)(num / (4ull * lo_hz));    
-    if (div_q8 < (2u << 8))                    div_q8 = 2u << 8;    
-    if (div_q8 > (0xFFFFu << 8) + 0xFF)        div_q8 = (0xFFFFu << 8) + 0xFF;    
-    
-    // Фактическая частота LO: f = clk_sys_hz / (4 * div_q8/256) = num / (4*div_q8)    
-    quad_lo_actual_hz = (uint32_t)(num / (div_q8 * 4ull));
-    Serial.print("[QUAD] Фактическая частота "); Serial.println(quad_lo_actual_hz);
-
-    if (!quad_program_loaded) {  
-        quad_offset = pio_add_program(lo_pio, &pio_quad_program);  
-        quad_program_loaded = true;  
-    }  
-  
-    quad_active = false;   // взводим до завершения переконфигурации  
-  
-    // Останавливаем SM и гасим core1 — дизеринг в RX не нужен,  
-    // ядро уходит под DSP приёмника.  
-    pio_sm_set_enabled(lo_pio, lo_sm, false);  
-    multicore_reset_core1();  
-    tone_changed = false;  
-  
-    // TX-пин: SM его больше не обслуживает — уводим в input,  
-    // иначе на pin_freq_out останется защемлённый последний уровень.  
-    pio_sm_set_consecutive_pindirs(lo_pio, lo_sm, pin_freq_out, 1, false);  
-    gpio_set_dir(pin_freq_out, GPIO_IN);  
-  
-    pio_sm_config cq = pio_get_default_sm_config();  
-    sm_config_set_wrap(&cq, quad_offset + 0, quad_offset + 3);  
-    sm_config_set_set_pins(&cq, pin_freq_out_i, 2);   // Q = pin_freq_out_i + 1  
-    // Делитель в конфиге: 24.8 -> float, SDK упакует в регистр при sm_init  
-    sm_config_set_clkdiv(&cq, (float)div_q8 / 256.0f);  
-    pio_gpio_init(lo_pio, pin_freq_out_i);  
-    pio_gpio_init(lo_pio, pin_freq_out_q);  
-  
-    pio_sm_init(lo_pio, lo_sm, quad_offset, &cq); 
-    // Направление ставим ПОСЛЕДНИМ, после sm_init — пины не должны  
-    // выпускать полуинициализированные переходы в смеситель.  
-    pio_sm_set_consecutive_pindirs(lo_pio, lo_sm, pin_freq_out_i, 2, true);  
-    pio_sm_restart(lo_pio, lo_sm);          // PC -> wrap_target, чистая фаза  
-    pio_sm_set_enabled(lo_pio, lo_sm, true);  
-  
-    quad_active = true;  
-}
-  
- 
-// Вернуть VFO в штатный TX-режим (2-тактовый меандр на одном пине).  
-void vfo_quadrature_stop(uint32_t freq_hz, double step_hz) {  
-    pio_sm_set_enabled(lo_pio, lo_sm, false);  
-    // оба квадратурных пина в input до переконфигурации SM под передачу  
-    pio_sm_set_consecutive_pindirs(lo_pio, lo_sm, pin_freq_out_i, 2, false);  
-    pio_sm_set_enabled(lo_pio, lo_sm, false);
-    quad_active = false;  
-    vfo_hardware_init(freq_hz, step_hz);   // вернёт square-программу и TX-сетку  
-}
 
 
   
@@ -2062,55 +2078,9 @@ void __not_in_flash_func(vfo_operation_set)(bool key_down) {
 }
 
 
-void quad_test(uint32_t freq_hz) {
-    Serial.printf("[QUAD] lo_target=%lu Hz  lo_actual=%lu Hz  err=%ld Hz\n",  
-                freq_hz - 3000, vfo_quadrature_lo_hz(),  
-                (long)(freq_hz - 3000) - (long)vfo_quadrature_lo_hz());  
-    Serial.printf("[QUAD] clkdiv=0x%08lX  div=%lu.%02u  sm_cs=0x%08lX\n",  
-                (unsigned long)lo_pio->sm[lo_sm].clkdiv,  
-                (unsigned long)(lo_pio->sm[lo_sm].clkdiv >> 24),  
-                (unsigned)((lo_pio->sm[lo_sm].clkdiv >> 16) & 0xFF),  
-                (unsigned long)lo_pio->sm[lo_sm].execctrl);
-}
 
 
 
-// Этап 0 отладки квадратурного LO: дамп всего состояния PIO/SM,  
-// что генерирует фазы на GP1/GP2.  
-void vfo_quadrature_debug(void) {  
-#define QUAD_LO_PIN_I 1
-#define QUAD_LO_PIN_Q 2
-    // Реальная частота шины: меряем счётчиком, не доверяем current_clk_sys_hz  
-    uint32_t meas_clk = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_SYS) * 1000u;  
-    uint32_t cdiv   = lo_pio->sm[lo_sm].clkdiv;  
-  
-    Serial.printf("[LODBG] clk_sys: cached=%lu kHz  measured=%lu kHz\n",  
-                  (unsigned long)(clock_get_hz(clk_sys)/1000ULL),  
-                  (unsigned long)(meas_clk / 1000u));  
-    Serial.printf("[LODBG] PIO=%d SM=%d  clkdiv=0x%08lX (int=%lu frac=%lu)\n",  
-                  pio_get_index(lo_pio), (int)lo_sm,  
-                  (unsigned long)cdiv,  
-                  (unsigned long)(cdiv >> 16),  
-                  (unsigned long)((cdiv >> 8) & 0xFF));  
-    Serial.printf("[LODBG] SM ctrl=0x%08lX enabled=%d  execctrl=0x%08lX  shiftctrl=0x%08lX\n",  
-                  (unsigned long)lo_pio->ctrl,  
-                  (int)((lo_pio->ctrl & (1u << lo_sm)) != 0),   // <-- запятая  
-                  (unsigned long)lo_pio->sm[lo_sm].execctrl,  
-                  (unsigned long)lo_pio->sm[lo_sm].shiftctrl);
-    // Функция пинов LO — должна быть PIO (F=pio0/pio1), не SIO  
-    Serial.printf("[LODBG] GP%d func=%lu  GP%d func=%lu  pads: out_en=%d/%d\n",  
-                  QUAD_LO_PIN_I, (unsigned long)(io_bank0_hw->io[QUAD_LO_PIN_I].ctrl & IO_BANK0_GPIO0_CTRL_FUNCSEL_BITS),  
-                  QUAD_LO_PIN_Q, (unsigned long)(io_bank0_hw->io[QUAD_LO_PIN_Q].ctrl & IO_BANK0_GPIO0_CTRL_FUNCSEL_BITS),  
-                  (int)((pads_bank0_hw->io[QUAD_LO_PIN_I] & PADS_BANK0_GPIO0_OD_BITS) == 0),  
-                  (int)((pads_bank0_hw->io[QUAD_LO_PIN_Q] & PADS_BANK0_GPIO0_OD_BITS) == 0));  
-    Serial.printf("[LODBG] lo_hz cached=%lu\n",  
-                  (unsigned long)vfo_quadrature_lo_hz());  
-    Serial.printf("[QUAD] clkdiv_hw=0x%08lX execctrl=0x%08lX pinctrl=0x%08lX instr=0x%04lX\n",  
-                  (unsigned long)lo_pio->sm[lo_sm].clkdiv,  
-                  (unsigned long)lo_pio->sm[lo_sm].execctrl,  
-                  (unsigned long)lo_pio->sm[lo_sm].pinctrl,  
-                  (unsigned long)lo_pio->sm[lo_sm].instr);
-}
 
 
 
