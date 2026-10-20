@@ -46,9 +46,7 @@
 #include "hardware/structs/pll.h"
 #include "pico/multicore.h"
 #include "vfo_hardware.h"
-#include "file_manager.h"
-#include "si5351_driver.h"
-#include "cw_modem.h"
+
 
 
 // ДИАГНОСТИКА
@@ -2387,7 +2385,7 @@ uint8_t subband_current = 0xFF;   // кэш, чтобы не дёргать пи
   
 // Инициализация пинов ДПФ. Вызвать из setup() ПОСЛЕ read_and_parse_SET_txt()  
 // (пины приходят из конфига). Пины == -1 (NC) пропускаются.  
-void vfo_subband_init(void) {  
+void vfo_subband_init(void) {
     for (int k = 0; k < 4; k++) {  
         if (subband_pins[k] >= 0) {  
             pinMode(subband_pins[k], OUTPUT);  
