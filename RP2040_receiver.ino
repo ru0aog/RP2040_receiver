@@ -9,8 +9,8 @@
 // ------------------------------------------------------------
 // Настройки приёмника
 // ------------------------------------------------------------
-static constexpr uint32_t RX_FREQ_HZ = 3601500UL;
-static constexpr uint32_t SERIAL_BAUD = 921600UL;
+static constexpr uint32_t RX_FREQ_HZ = 3600000UL;
+static constexpr uint32_t SERIAL_BAUD = 115200UL;
 static constexpr uint16_t FFT_N = 256;
 static constexpr uint32_t RX_STATUS_INTERVAL_MS = 2000UL;
 
@@ -179,7 +179,13 @@ static void startReceiver()
 void setup()
 {
     Serial.begin(SERIAL_BAUD);
-    delay(250);
+  // ожидание коннекта - до 5 сек
+  uint32_t timeout = millis();
+  while (!Serial && (millis() - timeout < 5000)) {
+      #if defined(ARDUINO_ARCH_RP2040) && !defined(ARDUINO_ARCH_MBED)
+      TinyUSBDevice.task();
+      #endif
+  }
 
     for (uint16_t i = 0; i < FFT_N; ++i) {
         hannWindow[i] = 0.5f - 0.5f *
@@ -189,7 +195,12 @@ void setup()
     startReceiver();
 }
 
-void loop()
+void loop() {
+    ReceiverLoop();
+}
+
+
+void ReceiverLoop() 
 {
     if (!rxStarted) return;
 
