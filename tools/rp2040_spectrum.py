@@ -31,7 +31,7 @@ def parse_args():
     p.add_argument("--relative", action="store_true",
                    help="Show baseband frequency offset")
     p.add_argument("--ymin", type=float, default=-130.0)
-    p.add_argument("--ymax", type=float, default=0.0)
+    p.add_argument("--ymax", type=float, default=-20.0)
     p.add_argument("--smooth", type=float, default=0.20,
                    help="Smoothing 0..0.99")
     return p.parse_args()
@@ -79,7 +79,7 @@ class SpectrumReader:
 
     def _read_loop(self):
         in_frame = False
-        fs = 7812.5
+        fs = 1953.125
         bin_hz = fs / FFT_N
         freq = []
         db = []
@@ -187,11 +187,13 @@ def main():
 
     ax.set_title("RP2040_receiver — real-time spectrum")
     ax.set_xlabel(
-        "Frequency offset (Hz)"
+        "Frequency offset (kHz)"
         if args.relative else "RF frequency (MHz)"
     )
     ax.set_ylabel("Level (dB, firmware scale)")
     ax.set_ylim(args.ymin, args.ymax)
+    from matplotlib.ticker import MultipleLocator
+    ax.yaxis.set_major_locator(MultipleLocator(10))
     ax.grid(True, alpha=0.3)
 
     current = {
@@ -240,7 +242,7 @@ def main():
             })
 
             if args.relative:
-                x = freq
+                x = [f / 1000.0 for f in freq]
             else:
                 x = [(args.center + f) / 1e6 for f in freq]
 
@@ -251,7 +253,7 @@ def main():
             peak_marker.set_data([x[idx]], [y[idx]])
 
             if args.relative:
-                peak = f"Peak: {freq[idx]:+.1f} Hz, {y[idx]:.1f} dB"
+                peak = f"Peak: {freq[idx] / 1000.0:+.3f} kHz, {y[idx]:.1f} dB"
             else:
                 peak = (
                     f"Peak: {(args.center + freq[idx]) / 1e6:.6f} MHz, "
