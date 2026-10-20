@@ -1,33 +1,14 @@
 ﻿/**  
  * ============================================================================  
  *  vfo_hardware.cpp — Дизеринг-движок программного DDS VFO на автоматах PIO  
- *  Версия 2.23 от 2026-10-14, автор RU0AOG  
+ *  Версия 2.26 от 2026-10-20, автор RU0AOG  
  * ============================================================================ 
  *  
  *  МНОГОКРИТЕРИАЛЬНЫЙ АВТОТЮН PLL И ДВУХЪЯДЕРНЫЙ ДИЗЕРИНГ
  *  Профилирование и ASM-оптимизация Core 1
  *  
- *  ИСПОЛЬЗУЕМЫЕ БИБЛИОТЕКИ И МОДУЛИ  
- *  -------------------------------  
- *  - Raspberry Pi Pico SDK (BSD-3-Clause) 
- *  - Arduino core RP2040 (LGPL-2.1)
- *  - Сторонний код отсутствует: дизеринг-движок (MASH/FRAC-дизер,  
- *    автотюн PLL с метрикой спуров, PIO-программы) — оригинальная  
- *    разработка автора проекта.  
- *  
  *  Этот файл — часть RP2040_beacon, распространяется под GPLv3  
  *  (см. LICENSE в корне репозитория).
- *
- * Добавления и изменения:
- *  2026-10-13:
- * - добавлен квадратурный генератор
- * - убран сброс накопителей MASH-дизера при смене тона
- *  2026-10-09:
- * - Калибровка frac_spur_level_db (−21 dB)
- * - Уровень спура в метрике + FORB-арбитраж с 2⁴⁰-штрафом
- * - Ненулевая монотонная метрика позиции/уровня спура
- * - Адаптивный гейт clk·int (устранил SCAN EMPTY на 21/28 МГц)
- * - Рантайм-маска FRAC-дизера по int (вернула ближнюю зону на ВЧ)
  * ============================================================================  
  */
 
@@ -92,7 +73,7 @@ struct MetricBreakdown {
 };
 
 // ============================================================================
-// ПРОТОТИПЫ (ОБЪЯВЛЕНИЯ) ВНУТРЕННИХ ФУНКЦИЙ ФАЙЛА
+// ОБЪЯВЛЕНИЯ ФУНКЦИЙ И ПЕРЕМЕННЫХ
 // ============================================================================
 static void detach_peripheral_clock();
 static void __not_in_flash_func(vfo_set_clk_sys)(const PllConfig& cfg, uint32_t vsel);
@@ -108,63 +89,30 @@ static float frac_spur_level_db(uint16_t pio_int, uint8_t pio_frac);
 // forward declaration  
 static uint64_t frac_spur_min_off_hz(uint16_t pio_int, uint8_t pio_frac,  
                                      uint64_t clk_sys_hz);
-void vfo_clk_boost_arm(void);
-
 static void vfo_rebuild_tone_table(uint64_t base_freq_mhz, uint64_t step_mhz); 
 static vreg_voltage vsel_for(uint64_t clk_hz);
-static uint64_t vfo_base_mhz = 0;   // базовый тон сетки, мГц  
-static uint64_t vfo_step_mhz = 0;   // шаг сетки, мГц
+static uint16_t vsel_to_mv(uint32_t vsel);  
+static uint64_t vfo_pll_metric(uint64_t clk_sys_hz, uint64_t target_mhz,  
+                               VfoParameters* out = nullptr);
 
 // Глобальные профили тактирования (static полностью удалены для extern-связывания)
 // Обновляем глобальные профили тактирования (добавлен refdiv = 1 в конец каждого списка)
 PllConfig pll_nominal   = { 133, 6, 2, 133000000ULL, (uint32_t)VREG_VOLTAGE_DEFAULT, false, 1 };
-PllConfig pll_overclock = { 69,  3, 2, 138004025ULL, (uint32_t)VREG_VOLTAGE_DEFAULT, false, 1 }; 
 PllConfig pll_ceiling   = { 95,  3, 1, 380011083ULL, (uint32_t)VREG_VOLTAGE_1_30,    true,  1 };  
-
 volatile bool clk_boosted = false;       // активация разгона
 volatile bool vfo_auto_boost = false;    // авто-разгон, вычисляется один раз на старте
-
-
-
-
-static uint16_t vsel_to_mv(uint32_t vsel);  
-
-
-static uint64_t vfo_pll_metric(uint64_t clk_sys_hz, uint64_t target_mhz,  
-                               VfoParameters* out = nullptr);
-
-
-// Помощник автоматического определения напряжения ядра под частоту шины  
-static vreg_voltage vsel_for(uint64_t clk_hz) {  
-    if (clk_hz >= 250000000ULL)      return VREG_VOLTAGE_1_30; // >=250 МГц — только легальный максимум  
-    else if (clk_hz >= 200000000ULL) return VREG_VOLTAGE_1_25;  
-    else if (clk_hz > 133000000ULL)  return VREG_VOLTAGE_1_15;  
-    return VREG_VOLTAGE_DEFAULT;  
-}
-
-
-void vfo_clk_boost_arm(void) {  
-    clk_boosted = true;  
-}
-
-
-  
-
-
-
 
 // Физическое размещение массива в RAM. Секция .time_critical гарантирует нахождение в ОЗУ
 VfoParameters __attribute__((section(".time_critical.vfo_tones"))) vfo_tones[VFO_TONES_COUNT];
 
-// Доступ к глобальному состоянию усилителя мощности для манипуляции ключом CW
-extern bool dev_TX_state; 
+static inline __attribute__((always_inline)) uint32_t __not_in_flash_func(vfo_xorshift32_raw)(uint32_t state);
+static inline __attribute__((always_inline)) uint32_t __not_in_flash_func(vfo_xorshift32)();
 
 static PIO lo_pio = pio0;
 static unsigned int lo_sm = 0;
 
 static unsigned int lo_offset = 0;
 static bool pio_program_loaded = false;
-
 
 static uint8_t current_active_tone = VFO_TONE_NONE;
 static volatile bool tone_changed = false;
@@ -197,11 +145,8 @@ static double cached_step_hz = 100.0;
 static uint32_t cached_base_freq_hz = 3500000;
 
 
-  
-// Отсоединение периферийного домена clk_peri от системной шины.  
-static void __not_in_flash_func(detach_peripheral_clock)() {  
-    clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB, 48 * 1000000, 48 * 1000000);  
-}
+
+
 
 
 
@@ -209,6 +154,11 @@ static void __not_in_flash_func(detach_peripheral_clock)() {
 // ============================================================================
 // ГЕНЕРАТОР КВАДРАТУРНЫХ I/Q-СИГНАЛОВ ПРИЁМНИКА: 4-тактовая программа, 2 соседних пина
 // ============================================================================
+
+// --- Квадратура I/Q: один SM, 4-тактовая программа, 2 соседних пина ---  
+// базовый пин PIO-блока = GP0 = Q, следующий = GP1 = I  
+int pin_freq_out_i = 0;   // PIO base pin — физически это Q (GP0) - нарастает первый
+int pin_freq_out_q = 1;   // base+1 — физически это I (GP1)       - второй
 
 // Ассемблерная микропрограмма PIO для меандра (цикл из 4 тактов)
 static const uint16_t pio_quad_instructions[] = {
@@ -224,10 +174,6 @@ static const pio_program_t pio_quad_program = {
     .pio_version = 0
 };
 
-// --- Квадратура I/Q: один SM, 4-тактовая программа, 2 соседних пина ---  
-// базовый пин PIO-блока = GP0 = Q, следующий = GP1 = I  
-int pin_freq_out_i = 0;   // PIO base pin — физически это Q (GP0)  
-int pin_freq_out_q = 1;   // base+1 — физически это I (GP1)
 
 static unsigned int quad_offset = 0;  
 static bool quad_program_loaded = false;  
@@ -364,35 +310,12 @@ void vfo_quadrature_debug(void) {
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 // ============================================================================
 // ГЕНЕРАТОР ТОЧНОГО СИГНАЛА ПЕРЕДАТЧИКА: 2-тактовая программа
 // ============================================================================
+
+static uint64_t vfo_base_mhz = 0;   // базовый тон сетки, мГц  
+static uint64_t vfo_step_mhz = 0;   // шаг сетки, мГц
 
 // Ассемблерная микропрограмма PIO для меандра (цикл из 2 тактов)  
 static const uint16_t pio_square_instructions[] = {
@@ -404,7 +327,7 @@ static const pio_program_t pio_square_program = {
     .length = 2,   
     .origin = -1,  
     .pio_version = 0   
-};  
+};
 
 static void __not_in_flash_func(vfo_set_clk_sys)(const PllConfig& cfg_in, uint32_t vsel) {
     PllConfig cfg = cfg_in;  
@@ -607,8 +530,6 @@ Serial.printf("[PLL] CS=0x%08lX (refdiv=%lu)  FB=%lu  PRIM=0x%08lX\n",
 }
 
 
-
-
 void vfo_clk_boost_enter(unsigned int target_freq_hz) {  
     if (target_freq_hz == 0) {  
         clk_boosted = true;  
@@ -665,8 +586,6 @@ void vfo_clk_boost_enter(unsigned int target_freq_hz) {
     vfo_rebuild_tone_table(vfo_base_mhz, vfo_step_mhz);  
     vfo_set_tone_instant(0);  
     tone_changed = true;          // страховка для Core 1  
-
-    pll_overclock = opt;          // активный профиль для термогуарда 
   
     multicore_launch_core1(vfo_core1_entry);  
   
@@ -732,30 +651,7 @@ void vfo_clk_boost_exit(void) {
 
 
 
-// одношаговый генератор псевдослучайных чисел Xorshift32.  
-static inline __attribute__((always_inline)) uint32_t __not_in_flash_func(vfo_xorshift32_raw)(uint32_t state) {
-    state ^= state << 13;
-    state ^= state >> 17;
-    state ^= state << 5;
-    return state;
-}
 
-
-
- 
-// Одношаговый генератор псевдослучайных чисел Xorshift32  
-static inline __attribute__((always_inline)) uint32_t __not_in_flash_func(vfo_xorshift32)() {
-    uint32_t x = xorshift_state;
-    x ^= x << 13;
-    x ^= x >> 17;
-    x ^= x << 5;
-    xorshift_state = x;
-    return x;
-}
-
-
-
- 
 // Точка входа второго ядра (Core 1): бесконечный горячий цикл дизеринга.  
 static void __not_in_flash_func(vfo_core1_entry)() {
     // Локальные резидентные копии параметров тона
@@ -1478,9 +1374,7 @@ void vfo_hardware_init(unsigned int base_freq_hz, double step_hz) {
         // Если активирован BOOST — запускаем матричный поиск ЛУЧШЕЙ частоты PLL
         // строго под НОВУЮ целевую частоту в пределах стабильного потолка pll_ceiling
         target_pll = vfo_find_optimal_pll(base_freq_hz, vfo_effective_clk_max());
-        
-        // Синхронизируем рабочий профиль оверклока для Термогуарда
-        pll_overclock = target_pll;
+
     } 
     else {
         // Если буст спит — производим штатный автотюнинг в пределах номинальных 133 МГц
@@ -1505,7 +1399,6 @@ void vfo_hardware_init(unsigned int base_freq_hz, double step_hz) {
     // Теперь данные fbdiv, p1, p2 берутся из РЕАЛЬНО примененной target_pll.
     // ========================================================================
     if (clk_boosted) {
-        pll_overclock = target_pll; // Обновляем рабочий профиль для термогуарда
 #if BOOST_DEBUG 
             Serial.printf("[BOOST  ] ON   clk_sys=%7.3f MHz  refdiv=%lu  fbdiv=%3lu  p1=%lu  p2=%lu  VCO=%4lu MHz  VSEL=%4u mV  FLASH=%6.3f MHz (BAUDR=%u)  T_CPU=%5.1f C\n",    
                       (double)current_clk_sys_hz / 1000000.0,  // Выведет честные 254.007 MHz!
@@ -1612,8 +1505,173 @@ static uint16_t vsel_to_mv(uint32_t vsel) {
 
 
 
+// ============================================================================
+// ПЕРЕКЛЮЧАТЕЛЬ ДИАПАЗОННЫХ ПОЛОСОВЫХ ФИЛЬТРОВ
+// ============================================================================
+
+// Управление блоком переключаемых ДПФ перед смесителем
+typedef struct {  
+    uint32_t f_max_hz;   // диапазон действует до этой частоты включительно  
+    uint8_t  code;       // 4-битный код на subband_pins[0..3]  
+} SubbandEntry;  
+  
+static const SubbandEntry SUBBAND_TABLE[] = {  
+    {  2000000UL, 4 },   // LPF_1_2  (I4)  
+    {  4000000UL, 3 },   // LPF_2_4  (I3)  
+    {  8000000UL, 2 },   // LPF_4_8  (I2)  
+    { 16000000UL, 1 },   // LPF_8_16 (I1)  
+    { 0xFFFFFFFF, 0 },   // LPF_16_30 (I0)  
+};
+#define SUBBAND_COUNT (sizeof(SUBBAND_TABLE)/sizeof(SUBBAND_TABLE[0]))  
+  
+uint8_t subband_current = 0xFF;   // кэш, чтобы не дёргать пины зря  
+  
+// Инициализация пинов ДПФ. Вызвать из setup() ПОСЛЕ read_and_parse_SET_txt()  
+// (пины приходят из конфига). Пины == -1 (NC) пропускаются.  
+void vfo_subband_init(void) {
+    for (int k = 0; k < 4; k++) {  
+        if (subband_pins[k] >= 0) {  
+            pinMode(subband_pins[k], OUTPUT);  
+            digitalWrite(subband_pins[k], LOW);  
+        }  
+    }  
+    subband_current = 0xFF;  
+}  
+  
+// Применить код ДПФ по частоте. Идемпотентно: при повторном вызове  
+// с тем же диапазоном пины не перезаписываются (нет щелчков реле).  
+void vfo_subband_apply(uint32_t freq_hz) {  
+    uint8_t want = SUBBAND_TABLE[SUBBAND_COUNT - 1].code;  
+    for (uint8_t i = 0; i < SUBBAND_COUNT; i++) {  
+        if (freq_hz <= SUBBAND_TABLE[i].f_max_hz) {  
+            want = SUBBAND_TABLE[i].code;  
+            break;  
+        }  
+    }  
+    if (want == subband_current) return;     // диапазон не сменился  
+    subband_current = want;  
+  
+    for (int k = 0; k < 4; k++) {  
+        if (subband_pins[k] >= 0)  
+            digitalWrite(subband_pins[k], (want >> k) & 1);  
+    }  
+    Serial.printf("[BPF] f=%lu Hz -> ДПФ код=%u (pins %d,%d,%d,%d)\n",  
+                  (unsigned long)freq_hz, want,  
+                  subband_pins[0], subband_pins[1],  
+                  subband_pins[2], subband_pins[3]);  
+}
 
 
+
+
+
+// ============================================================================
+// ПРОГРАММЫ-ПОМОЩНИКИ
+// ============================================================================
+
+// Отсоединение периферийного домена clk_peri от системной шины.  
+static void __not_in_flash_func(detach_peripheral_clock)() {  
+    clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB, 48 * 1000000, 48 * 1000000);  
+}
+  
+// Синхронное управление ключом эфира (нажатие/отпускание CW-ключа).  
+void __not_in_flash_func(vfo_operation_set)(bool key_down) {
+    // 1. Управляем направлением пина генератора PIO (высокочастотный меандр)
+    if (quad_active) return;  
+    pio_sm_set_consecutive_pindirs(lo_pio, lo_sm, pin_freq_out, 1, key_down);
+}
+
+// одношаговый генератор псевдослучайных чисел Xorshift32.  
+static inline __attribute__((always_inline)) uint32_t __not_in_flash_func(vfo_xorshift32_raw)(uint32_t state) {
+    state ^= state << 13;
+    state ^= state >> 17;
+    state ^= state << 5;
+    return state;
+}
+
+// Одношаговый генератор псевдослучайных чисел Xorshift32  
+static inline __attribute__((always_inline)) uint32_t __not_in_flash_func(vfo_xorshift32)() {
+    uint32_t x = xorshift_state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    xorshift_state = x;
+    return x;
+}
+
+// Помощник автоматического определения напряжения ядра под частоту шины  
+static vreg_voltage vsel_for(uint64_t clk_hz) {  
+    if (clk_hz >= 250000000ULL)      return VREG_VOLTAGE_1_30; // >=250 МГц — только легальный максимум  
+    else if (clk_hz >= 200000000ULL) return VREG_VOLTAGE_1_25;  
+    else if (clk_hz > 133000000ULL)  return VREG_VOLTAGE_1_15;  
+    return VREG_VOLTAGE_DEFAULT;  
+}
+
+void vfo_set_narrowband(bool on) {  
+    uint32_t save = spin_lock_blocking(vfo_spin_lock);  
+    vfo_narrowband_mode = on ? 1u : 0u;  
+    spin_unlock(vfo_spin_lock, save);  
+}
+
+// Мгновенная смена активного тона частотной сетки (FSK-переход).  
+void __not_in_flash_func(vfo_set_tone_instant)(uint8_t tone_index) {
+    if (tone_index >= VFO_TONES_COUNT) return; 
+    if (tone_index == current_active_tone) return;
+
+    uint32_t save = spin_lock_blocking(vfo_spin_lock);  
+    target_pio_int   = vfo_tones[tone_index].pio_int;  
+    target_pio_frac8 = vfo_tones[tone_index].pio_frac;  
+    dds_step         = vfo_tones[tone_index].dds_step;  
+  
+    // Маску выбираем здесь же, в атомарной сессии — чтобы Core1 прочитал  
+    // консистентный снимок (int/frac/step/mask) в одном захвате лока.  
+    // Глубина FRAC-дизера по величине делителя: ±N единиц FRAC-байта  
+    // — это относительная ФМ-глубина ~mask/(256·int). На малых int  
+    // (ВЧ-диапазоны) даже ±1 поднимает ближнюю юбку — выключаем.  
+    if (vfo_narrowband_mode) {  
+        vfo_frac_dither_mask = 0x00u;  // дизер выключен — чистые линии
+    } else if (target_pio_int >= 38) {  
+        vfo_frac_dither_mask = 0x03u;  // ±3  (80 м: int 38–56)
+    } else if (target_pio_int >= 19) {  
+        vfo_frac_dither_mask = 0x01u;  // ±1  (40/30 м: int 19–37)
+    } else {  
+        vfo_frac_dither_mask = 0x00u;  // off (20 м и выше: int ≤18)
+    }
+
+    // Накопители НЕ сбрасываем: переход mark/space фазово-непрерывный,  
+    // спектрального всплеска на битовых границах RTTY больше нет.  
+    tone_changed    = true;        // ← поднимаем флаг последним    
+    spin_unlock(vfo_spin_lock, save); 
+
+#if VFO_PLL_DEBUG 
+    // в конце vfo_set_tone_instant, после spin_unlock — только под VFO_PLL_DEBUG:  
+    uint32_t d = lo_pio->sm[lo_sm].clkdiv;  
+    Serial.printf("[TONE] idx=%u applied: int=%lu frac=%lu step=0x%08lX | table: int=%u frac=%u step=0x%08lX\n",  
+        tone_index,  
+        (unsigned long)(d >> 16), (unsigned long)((d >> 8) & 0xFF),  
+        (unsigned long)dds_step,  
+        (unsigned)vfo_tones[tone_index].pio_int, (unsigned)vfo_tones[tone_index].pio_frac,  
+        (unsigned long)vfo_tones[tone_index].dds_step);
+#endif
+    current_active_tone = tone_index;
+}
+ 
+// сброс состояния MASH-дизера и накопителей фазы.  
+void __not_in_flash_func(vfo_dither_reset)(void) {  
+    uint32_t save = spin_lock_blocking(vfo_spin_lock);  
+    dds_accum_m2    = 0;  
+    m2_carry_prev   = 0;  
+    dds_accumulator = 0;  
+    dither_reset_pending = true;   // новый volatile-флаг  
+    spin_unlock(vfo_spin_lock, save);  
+}
+
+
+
+
+// ============================================================================
+// РАЗГОННЫЙ БЛОК - ПОИСК ЧАСТОТНЫХ ЛИМИТОВ ПРОЦЕССОРА
+// ============================================================================
  
 void __not_in_flash_func(vfo_find_max_stable_clock)(void) {  
     const uint64_t CLK_START_HZ = VFO_CLK_SYS_NOMINAL_HZ;  
@@ -1860,9 +1918,6 @@ void __not_in_flash_func(vfo_find_max_stable_clock)(void) {
     }  
 }
 
-
-
-
 void __not_in_flash_func(vfo_test_pll_extreme_shurm)(void) {
     // 1. ПЕРЕВОДИМ ПИТАНИЕ И СИСТЕМУ В ЭКСТРЕМАЛЬНЫЙ РЕЖИМ
     vreg_set_voltage(VREG_VOLTAGE_1_30);  
@@ -1998,141 +2053,4 @@ void __not_in_flash_func(vfo_test_pll_extreme_shurm)(void) {
     Serial.println("[СВЧ-ШТУРМ] Тест завершён. Опора сохранена на кварце.");
 }
 
-
-
-
-
-void vfo_set_narrowband(bool on) {  
-    uint32_t save = spin_lock_blocking(vfo_spin_lock);  
-    vfo_narrowband_mode = on ? 1u : 0u;  
-    spin_unlock(vfo_spin_lock, save);  
-}
-
-
- 
-// Мгновенная смена активного тона частотной сетки (FSK-переход).  
-void __not_in_flash_func(vfo_set_tone_instant)(uint8_t tone_index) {
-    if (tone_index >= VFO_TONES_COUNT) return; 
-    if (tone_index == current_active_tone) return;
-
-    uint32_t save = spin_lock_blocking(vfo_spin_lock);  
-    target_pio_int   = vfo_tones[tone_index].pio_int;  
-    target_pio_frac8 = vfo_tones[tone_index].pio_frac;  
-    dds_step         = vfo_tones[tone_index].dds_step;  
-  
-    // Маску выбираем здесь же, в атомарной сессии — чтобы Core1 прочитал  
-    // консистентный снимок (int/frac/step/mask) в одном захвате лока.  
-    // Глубина FRAC-дизера по величине делителя: ±N единиц FRAC-байта  
-    // — это относительная ФМ-глубина ~mask/(256·int). На малых int  
-    // (ВЧ-диапазоны) даже ±1 поднимает ближнюю юбку — выключаем.  
-    if (vfo_narrowband_mode) {  
-        vfo_frac_dither_mask = 0x00u;  // дизер выключен — чистые линии
-    } else if (target_pio_int >= 38) {  
-        vfo_frac_dither_mask = 0x03u;  // ±3  (80 м: int 38–56)
-    } else if (target_pio_int >= 19) {  
-        vfo_frac_dither_mask = 0x01u;  // ±1  (40/30 м: int 19–37)
-    } else {  
-        vfo_frac_dither_mask = 0x00u;  // off (20 м и выше: int ≤18)
-    }
-
-    // Накопители НЕ сбрасываем: переход mark/space фазово-непрерывный,  
-    // спектрального всплеска на битовых границах RTTY больше нет.  
-    tone_changed    = true;        // ← поднимаем флаг последним    
-    spin_unlock(vfo_spin_lock, save); 
-
-#if VFO_PLL_DEBUG 
-    // в конце vfo_set_tone_instant, после spin_unlock — только под VFO_PLL_DEBUG:  
-    uint32_t d = lo_pio->sm[lo_sm].clkdiv;  
-    Serial.printf("[TONE] idx=%u applied: int=%lu frac=%lu step=0x%08lX | table: int=%u frac=%u step=0x%08lX\n",  
-        tone_index,  
-        (unsigned long)(d >> 16), (unsigned long)((d >> 8) & 0xFF),  
-        (unsigned long)dds_step,  
-        (unsigned)vfo_tones[tone_index].pio_int, (unsigned)vfo_tones[tone_index].pio_frac,  
-        (unsigned long)vfo_tones[tone_index].dds_step);
-#endif
-    current_active_tone = tone_index;
-}
-
-
- 
-// сброс состояния MASH-дизера и накопителей фазы.  
-void __not_in_flash_func(vfo_dither_reset)(void) {  
-    uint32_t save = spin_lock_blocking(vfo_spin_lock);  
-    dds_accum_m2    = 0;  
-    m2_carry_prev   = 0;  
-    dds_accumulator = 0;  
-    dither_reset_pending = true;   // новый volatile-флаг  
-    spin_unlock(vfo_spin_lock, save);  
-}
-
-
-
-
-
-  
-// Синхронное управление ключом эфира (нажатие/отпускание CW-ключа).  
-void __not_in_flash_func(vfo_operation_set)(bool key_down) {
-    // 1. Управляем направлением пина генератора PIO (высокочастотный меандр)
-    if (quad_active) return;  
-    pio_sm_set_consecutive_pindirs(lo_pio, lo_sm, pin_freq_out, 1, key_down);
-}
-
-
-
-
-
-
-
-
-// Управление блоком переключаемых ДПФ перед смесителем
-typedef struct {  
-    uint32_t f_max_hz;   // диапазон действует до этой частоты включительно  
-    uint8_t  code;       // 4-битный код на subband_pins[0..3]  
-} SubbandEntry;  
-  
-static const SubbandEntry SUBBAND_TABLE[] = {  
-    {  2000000UL, 4 },   // LPF_1_2  (I4)  
-    {  4000000UL, 3 },   // LPF_2_4  (I3)  
-    {  8000000UL, 2 },   // LPF_4_8  (I2)  
-    { 16000000UL, 1 },   // LPF_8_16 (I1)  
-    { 0xFFFFFFFF, 0 },   // LPF_16_30 (I0)  
-};
-#define SUBBAND_COUNT (sizeof(SUBBAND_TABLE)/sizeof(SUBBAND_TABLE[0]))  
-  
-uint8_t subband_current = 0xFF;   // кэш, чтобы не дёргать пины зря  
-  
-// Инициализация пинов ДПФ. Вызвать из setup() ПОСЛЕ read_and_parse_SET_txt()  
-// (пины приходят из конфига). Пины == -1 (NC) пропускаются.  
-void vfo_subband_init(void) {
-    for (int k = 0; k < 4; k++) {  
-        if (subband_pins[k] >= 0) {  
-            pinMode(subband_pins[k], OUTPUT);  
-            digitalWrite(subband_pins[k], LOW);  
-        }  
-    }  
-    subband_current = 0xFF;  
-}  
-  
-// Применить код ДПФ по частоте. Идемпотентно: при повторном вызове  
-// с тем же диапазоном пины не перезаписываются (нет щелчков реле).  
-void vfo_subband_apply(uint32_t freq_hz) {  
-    uint8_t want = SUBBAND_TABLE[SUBBAND_COUNT - 1].code;  
-    for (uint8_t i = 0; i < SUBBAND_COUNT; i++) {  
-        if (freq_hz <= SUBBAND_TABLE[i].f_max_hz) {  
-            want = SUBBAND_TABLE[i].code;  
-            break;  
-        }  
-    }  
-    if (want == subband_current) return;     // диапазон не сменился  
-    subband_current = want;  
-  
-    for (int k = 0; k < 4; k++) {  
-        if (subband_pins[k] >= 0)  
-            digitalWrite(subband_pins[k], (want >> k) & 1);  
-    }  
-    Serial.printf("[BPF] f=%lu Hz -> ДПФ код=%u (pins %d,%d,%d,%d)\n",  
-                  (unsigned long)freq_hz, want,  
-                  subband_pins[0], subband_pins[1],  
-                  subband_pins[2], subband_pins[3]);  
-}
 
