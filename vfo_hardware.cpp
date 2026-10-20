@@ -60,7 +60,7 @@ static const int subband_pins[] = {
 
 // ДИАГНОСТИКА
 #define BOOST_DEBUG              0         // 0 — выключить отладочную печать блока разгона
-#define VFO_PLL_DEBUG            1         // 0 — выключить отладочную печать подбора кандидатов
+#define VFO_PLL_DEBUG            0         // 0 — выключить отладочную печать подбора кандидатов
 #define PLL_RUNTIME_DEBUG        0         // 0 — выключить отладочную печать блока PLL
 
 
@@ -164,9 +164,6 @@ static vreg_voltage vsel_for(uint64_t clk_hz) {
 }
 
 
-/** @brief Взвести флаг BOOST до следующего vfo_hardware_init()/boost_enter().  
- *  Используется энкодером, чтобы init выбрал оптимальный PLL-скан,  
- *  а не номинал 133 МГц. Атомарно для RP2040 (single-core write). */  
 void vfo_clk_boost_arm(void) {  
     clk_boosted = true;  
 }
@@ -243,27 +240,15 @@ static double cached_step_hz = 100.0;
 static uint32_t cached_base_freq_hz = 3500000;
 
 
-/**  
- * @brief Отсоединение периферийного домена clk_peri от системной шины.  
- *  
- * Переводит генератор периферийной тактовой частоты `clk_peri` на  
- * безопасный источник (кварцевый резонатор XOSC 12 МГц) и фактически  
- * изолирует периферию (UART, SPI, USB и т.д.) от домена `clk_sys`  
- * на время перепрограммирования `pll_sys`.  
- */
+  
+// Отсоединение периферийного домена clk_peri от системной шины.  
 static void __not_in_flash_func(detach_peripheral_clock)() {  
     clock_configure(clk_peri, 0, CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB, 48 * 1000000, 48 * 1000000);  
 }
 
 
 
-/**  
- * @brief Безопасное динамическое перепрограммирование pll_sys и напряжения ядра vreg
- *  
- * Осуществляет двухранговый сдвиг частоты и питания.
- * Дополнительно пересчитывает делитель XIP_SSI (BAUDR)
- *  
- */  
+
 static void __not_in_flash_func(vfo_set_clk_sys)(const PllConfig& cfg_in, uint32_t vsel) {
     PllConfig cfg = cfg_in;  
     if (cfg.refdiv == 0) cfg.refdiv = 1;   // защита от неинициализированного поля
@@ -548,10 +533,7 @@ void vfo_clk_boost_enter(unsigned int target_freq_hz) {
 
 
   
-/**  
- * @brief Выход из boost: возврат на pll_nominal и штатное напряжение.  
- * Понижение VREG выполняется ПОСЛЕ снижения частоты (логика в vfo_set_clk_sys).  
- */  
+
 void vfo_clk_boost_exit(void) {    
     if (!clk_boosted) return;    
     
@@ -593,13 +575,7 @@ void vfo_clk_boost_exit(void) {
 
 
 
-/**  
- * @brief Чистый одношаговый генератор псевдослучайных чисел Xorshift32.  
- *  
- * Выполняет одну итерацию алгоритма Xorshift32 Марсальи над переданным  
- * состоянием
- *  
- */
+// одношаговый генератор псевдослучайных чисел Xorshift32.  
 static inline __attribute__((always_inline)) uint32_t __not_in_flash_func(vfo_xorshift32_raw)(uint32_t state) {
     state ^= state << 13;
     state ^= state >> 17;
@@ -609,15 +585,8 @@ static inline __attribute__((always_inline)) uint32_t __not_in_flash_func(vfo_xo
 
 
 
-/**  
- * @brief Одношаговый генератор псевдослучайных чисел Xorshift32  
- *        с глобальным состоянием в ОЗУ.  
- *  
- * Выполняет одну итерацию алгоритма Xorshift32 Марсальи  
- * над глобальной переменной xorshift_state 
- * и сохраняет результат обратно в неё.  
- *  
- */
+ 
+// Одношаговый генератор псевдослучайных чисел Xorshift32  
 static inline __attribute__((always_inline)) uint32_t __not_in_flash_func(vfo_xorshift32)() {
     uint32_t x = xorshift_state;
     x ^= x << 13;
@@ -629,9 +598,8 @@ static inline __attribute__((always_inline)) uint32_t __not_in_flash_func(vfo_xo
 
 
 
-/**  
- * @brief Точка входа второго ядра (Core 1): бесконечный горячий цикл дизеринга.  
- */
+ 
+// Точка входа второго ядра (Core 1): бесконечный горячий цикл дизеринга.  
 static void __not_in_flash_func(vfo_core1_entry)() {
     // Локальные резидентные копии параметров тона
     int32_t  l_step  = 0;
@@ -857,15 +825,9 @@ static uint64_t vfo_pll_metric_verbose(uint64_t clk_sys_hz, uint64_t target_mhz,
 
 
 
-/**  
- * @brief Прецизионный расчёт параметров PIO-делителя для целевой частоты  
- *        в миллигерцах (0.001 Гц).  
- *  
- * Вычисляет делитель автомата PIO в формате fixed-point Q8.8  
- * (pio_int + pio_frac/256) для выходного меандра `f_out = clk_sys / (2 * D)`,  
- * а также 32-битный остаток ошибки `dds_step` — приращение для DDS/MASH-2  
- * дизеринга, компенсирующее остаточную дробную часть делителя.  
- */
+// Прецизионный расчёт параметров PIO-делителя для целевой частоты  
+//        в миллигерцах (0.001 Гц).  
+// Вычисляет делитель автомата PIO в формате fixed-point Q8.8  
 static VfoParameters calculate_raw_params_mhz(uint64_t clk_sys_hz, uint64_t mhz_target) {    
     // Границы КВ-диапазона в миллигерцах (1.0 .. 40.0 МГц)    
     if (mhz_target < 100000000ULL)   mhz_target = 100000000ULL;    
@@ -1316,7 +1278,7 @@ for (uint32_t refdiv = 1; refdiv <= 3; refdiv++) {
 
 
 
-// vfo_hardware.cpp — вынести блок заполнения в функцию:  
+// блок заполнения
 static void vfo_rebuild_tone_table(uint64_t base_freq_mhz, uint64_t step_mhz) {  
     for (int i = 0; i < VFO_TONES_COUNT; i++) {  
         uint64_t tone_freq_mhz = base_freq_mhz + ((uint64_t)i * step_mhz);  
@@ -1329,13 +1291,7 @@ static void vfo_rebuild_tone_table(uint64_t base_freq_mhz, uint64_t step_mhz) {
 
 
 // === ИНИЦИАЛИЗАЦИЯ И СТАРТ СИСТЕМЫ ===
-/**  
- * @brief Полная инициализация и запуск аппаратного VFO (PLL + PIO + дизеринг).  
- *  
- * Осуществляет сквозную синхронизацию частотного плана. Если предпусковой разгон  
- * функция блокирует откат частоты и настраивает подсистемы fixed-point Q8.8 делителей  
- * PIO и 32-битного DDS-остатка строго на базе высокой стабильной оверклокерской частоты.  
- */
+// Полная инициализация и запуск аппаратного VFO (PLL + PIO + дизеринг).  
 void vfo_hardware_init(unsigned int base_freq_hz, double step_hz) {
     // Жесткий перезапуск изолированного ядра перед изменением параметров таблиц тонов
     multicore_reset_core1(); 
@@ -1574,7 +1530,6 @@ void vfo_clk_thermal_guard(void) {
 }
 
 
-/*
 
  
 void __not_in_flash_func(vfo_find_max_stable_clock)(void) {  
@@ -1961,189 +1916,8 @@ void __not_in_flash_func(vfo_test_pll_extreme_shurm)(void) {
 }
 
 
-*/
 
 
-
-
-
-
-
-/*
-
-// ==== Энкодер: глобальное состояние ====  
-volatile uint32_t vfo_current_freq_hz  = VFO_ENC_TEST_FREQ_HZ; // текущая рабочая частота 
-volatile uint32_t vfo_tune_step_hz     = 500;       // глобальный шаг перестройки, Гц  
-volatile int32_t  enc_pending_steps    = 0;         // накопленные тики энкодера (ISR)  
-static bool       enc_tx_active        = false;
-
-// Антидребезг кнопки энкодера — состояние debounce-машины  
-static bool     enc_sw_last = true;   // предыдущий уровень SW (true = отпущена, INPUT_PULLUP)  
-static uint32_t enc_sw_ms   = 0;      // millis() последнего принятого перепада
-
-#define ENC_TICKS_PER_DETENT 4    // переходов квадратуры на один щелчок (полный шаг энкодера)
-
-// Таблица квадратурного декодера (Gray-code state machine).  
-// Индекс = (prev_AB << 2) | cur_AB. Значения: +1/-1 — шаг, 0 — дребезг/нет события.  
-static const int8_t enc_lut[16] = {  
-     0, -1, +1,  0,  
-    +1,  0,  0, -1,  
-    -1,  0,  0, +1,  
-     0, +1, -1,  0  
-};  
-  
-// Общий ISR для обоих пинов. Вызывается при любом изменении A или B.  
-// Только атомарные операции — никакого Serial/PLL/флэша из прерывания.  
-static void __not_in_flash_func(enc_isr)(void) {  
-    static uint8_t prev_ab = 0;  
-    uint8_t ab = (uint8_t)((gpio_get(ENC_PIN_A) << 1) | gpio_get(ENC_PIN_B));
-    int8_t d = enc_lut[(prev_ab << 2) | ab];  
-    prev_ab = ab;  
-    enc_pending_steps += d;   // накапливаем; обработает vfo_encoder_poll()
-}  
-  
-void vfo_encoder_init(void) {  
-    pinMode(ENC_PIN_A, INPUT_PULLUP);  
-    pinMode(ENC_PIN_B, INPUT_PULLUP);
-    pinMode(VFO_ENC_SW_PIN, INPUT_PULLUP); 
-    attachInterrupt(digitalPinToInterrupt(ENC_PIN_A), enc_isr, CHANGE);  
-    attachInterrupt(digitalPinToInterrupt(ENC_PIN_B), enc_isr, CHANGE);
-}  
-  
-// Вызывать из loop() каждую итерацию — само переключение частоты тяжёлое  
-// (PLL-скан + перезапуск Core 1), поэтому вынесено из ISR.  
-void vfo_encoder_poll(void) {  
-  
-    // ---------- секция 1: кнопка энкодера (toggle генерации) ----------  
-    bool sw = gpio_get(VFO_ENC_SW_PIN);  
-    uint32_t now_ms = millis();  
-  
-    if (sw != enc_sw_last && (now_ms - enc_sw_ms) > VFO_ENC_DEBOUNCE_MS) {  
-        enc_sw_ms  = now_ms;  
-        enc_sw_last = sw;  
-  
-        if (sw == 0) {                        // нажатие (INPUT_PULLUP)  
-            if (!enc_tx_active) {  
-                // ВКЛ: запуск генерации на vfo_current_freq_hz.  
-                // arm флага ДО init — иначе init возьмёт pll_nominal (133 МГц).  
-                vfo_clk_boost_arm();  
-                vfo_hardware_init(vfo_current_freq_hz, 10.0);  
-                vfo_set_tone_instant(0);  
-                vfo_operation_set(true);  
-                enc_tx_active = true;  
-
-                Serial.printf("[ENC] TX ON  %lu Hz (clk=%lu kHz)\n",  
-                              (unsigned long)vfo_current_freq_hz,  
-                              (unsigned long)(current_clk_sys_hz / 1000ULL));  
-
-                uint32_t clkdiv_now = lo_pio->sm[lo_sm].clkdiv;  
-                uint32_t meas_clk   = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_SYS) * 1000u;  
-                
-                Serial.printf("[DBG] CLKDIV=0x%08lX (int=%lu frac=%lu)  tone[0].int=%lu frac=%lu  "  
-                            "active=%d changed=%d  clk_meas=%lu kHz  CS=0x%08lX FB=%lu PRIM=0x%08lX\n",  
-                            (unsigned long)clkdiv_now,  
-                            (unsigned long)(clkdiv_now >> 16),  
-                            (unsigned long)((clkdiv_now >> 8) & 0xFF),  
-                            (unsigned long)vfo_tones[0].pio_int,  
-                            (unsigned long)vfo_tones[0].pio_frac,  
-                            (int)current_active_tone, (int)tone_changed,  
-                            (unsigned long)(meas_clk / 1000u),  
-                            (unsigned long)pll_sys_hw->cs,  
-                            (unsigned long)pll_sys_hw->fbdiv_int,  
-                            (unsigned long)pll_sys_hw->prim);  
-                
-                // Фактическая опора PLL и состояние мультиплексора clk_sys  
-                Serial.printf("[DBG2] XOSC=%u kHz  ROSC=%u kHz  clk_sys.ctrl=0x%08lX (src=%lu aux=%lu)  sys_div=0x%08lX (int=%lu)\n",  
-                            frequency_count_khz(CLOCKS_FC0_SRC_VALUE_XOSC_CLKSRC),  
-                            frequency_count_khz(CLOCKS_FC0_SRC_VALUE_ROSC_CLKSRC),  
-                            (unsigned long)clocks_hw->clk[clk_sys].ctrl,  
-                            (unsigned long)(clocks_hw->clk[clk_sys].ctrl & CLOCKS_CLK_SYS_CTRL_SRC_BITS),  
-                            (unsigned long)((clocks_hw->clk[clk_sys].ctrl & CLOCKS_CLK_SYS_CTRL_AUXSRC_BITS) >> CLOCKS_CLK_SYS_CTRL_AUXSRC_LSB),  
-                            (unsigned long)clocks_hw->clk[clk_sys].div,  
-                            (unsigned long)(clocks_hw->clk[clk_sys].div >> 8));   // INT-поле clk_sys.div: биты 8..23
-
-            } else {  
-                // ВЫКЛ: закрыть ключ, вернуть шину на номинал.  
-                vfo_operation_set(false);  
-                vfo_clk_boost_exit();         // внутри сам сбрасывает clk_boosted  
-                enc_tx_active = false;  
-                Serial.printf("[ENC] TX OFF\n");  
-            }  
-        }  
-    }  
-  
-    // ---------- секция 2: накопленные тики энкодера ----------  
-    int32_t ticks;  
-    uint32_t ints = save_and_disable_interrupts();  
-    ticks = enc_pending_steps;  
-    enc_pending_steps = 0;  
-    restore_interrupts(ints);  
-  
-    if (ticks == 0) return;  
-  
-    // Перевод тиков в детенты: на щелчок типичный энкодер даёт 4 перехода.  
-    int32_t detents = ticks / ENC_TICKS_PER_DETENT;   // ENC_TICKS_PER_DETENT = 4  
-    if (detents == 0) {  
-        // Половина/четверть щелчка — вернуть тики обратно, накапливаем дальше.  
-        ints = save_and_disable_interrupts();  
-        enc_pending_steps += ticks;  
-        restore_interrupts(ints);  
-        return;  
-    }  
-  
-    int64_t f = (int64_t)vfo_current_freq_hz +  
-                (int64_t)detents * (int64_t)vfo_tune_step_hz;  
-    if (f < 1000000LL)  f = 1000000LL;  
-    if (f > 30000000LL) f = 30000000LL;  
-    vfo_current_freq_hz = (uint32_t)f;  
-  
-    if (enc_tx_active) {  
-        // Перестройка на лету: один полный цикл init.  
-        // arm обязателен — после предыдущего boost_exit флаг снят,  
-        // и без него init уйдёт на pll_nominal = 133 МГц.  
-        vfo_clk_boost_arm();  
-        vfo_hardware_init(vfo_current_freq_hz, 10.0);  
-        vfo_set_tone_instant(0);  
-        vfo_operation_set(true);              // init мог переоткрыть/закрыть пин  
-        
-        Serial.printf("[ENC] RETUNE %lu Hz (clk=%lu kHz)\n",  
-                      (unsigned long)vfo_current_freq_hz,  
-                      (unsigned long)(current_clk_sys_hz / 1000ULL));  
-  
-        // Измеренная частота шины + фактические регистры PLL и делителя SM  
-        uint32_t clkdiv_now = lo_pio->sm[lo_sm].clkdiv;  
-        uint32_t meas_clk   = frequency_count_khz(CLOCKS_FC0_SRC_VALUE_CLK_SYS) * 1000u;  
-        uint32_t sys_ctrl   = clocks_hw->clk[clk_sys].ctrl;  
-        
-        Serial.printf("[DBG] CLKDIV=0x%08lX (int=%lu frac=%lu)  tone[0].int=%lu frac=%lu  "  
-                    "active=%d changed=%d  clk_meas=%lu kHz  CS=0x%08lX FB=%lu PRIM=0x%08lX\n",  
-                    (unsigned long)clkdiv_now,  
-                    (unsigned long)(clkdiv_now >> 16),  
-                    (unsigned long)((clkdiv_now >> 8) & 0xFF),  
-                    (unsigned long)vfo_tones[0].pio_int,  
-                    (unsigned long)vfo_tones[0].pio_frac,  
-                    (int)current_active_tone, (int)tone_changed,  
-                    (unsigned long)(meas_clk / 1000u),  
-                    (unsigned long)pll_sys_hw->cs,  
-                    (unsigned long)pll_sys_hw->fbdiv_int,  
-                    (unsigned long)pll_sys_hw->prim);  
-        
-        // Фактическая опора PLL и состояние мультиплексора clk_sys  
-        Serial.printf("[DBG2] XOSC=%u kHz  ROSC=%u kHz  clk_sys.ctrl=0x%08lX (src=%lu aux=%lu)  sys_div=0x%08lX (int=%lu)\n",  
-                    frequency_count_khz(CLOCKS_FC0_SRC_VALUE_XOSC_CLKSRC),  
-                    frequency_count_khz(CLOCKS_FC0_SRC_VALUE_ROSC_CLKSRC),  
-                    (unsigned long)clocks_hw->clk[clk_sys].ctrl,  
-                    (unsigned long)(clocks_hw->clk[clk_sys].ctrl & CLOCKS_CLK_SYS_CTRL_SRC_BITS),  
-                    (unsigned long)((clocks_hw->clk[clk_sys].ctrl & CLOCKS_CLK_SYS_CTRL_AUXSRC_BITS) >> CLOCKS_CLK_SYS_CTRL_AUXSRC_LSB),  
-                    (unsigned long)clocks_hw->clk[clk_sys].div,  
-                    (unsigned long)(clocks_hw->clk[clk_sys].div >> 8));   // INT-поле clk_sys.div: биты 8..23
-
-    }  
-    // TX выключен — частота просто обновлена; следующее нажатие  
-    // кнопки стартует на новой частоте.  
-}
-
-*/
 
 void vfo_set_narrowband(bool on) {  
     uint32_t save = spin_lock_blocking(vfo_spin_lock);  
@@ -2152,14 +1926,8 @@ void vfo_set_narrowband(bool on) {
 }
 
 
-/**  
- * @brief Мгновенная смена активного тона частотной сетки (FSK-переход).  
- *  
- * Перезагружает параметры PIO-делителя и DDS-шаг для движка дизеринга  
- * без разрыва фазы несущей: изменение применяется на следующей итерации  
- * модулятора, а не мгновенной записью в регистр `clkdiv`.  
- *  
- */
+ 
+// Мгновенная смена активного тона частотной сетки (FSK-переход).  
 void __not_in_flash_func(vfo_set_tone_instant)(uint8_t tone_index) {
     if (tone_index >= VFO_TONES_COUNT) return; 
     if (tone_index == current_active_tone) return;
@@ -2203,13 +1971,8 @@ void __not_in_flash_func(vfo_set_tone_instant)(uint8_t tone_index) {
 }
 
 
-/**  
- * @brief Полный сброс состояния MASH-дизера и накопителей фазы.  
- *  
- * Вызывается только при (пере)инициализации VFO — vfo_hardware_init(),  
- * vfo_quadrature_start(), после перестройки таблицы/clk_sys (термогуард).  
- * НЕ вызывать при манипуляции тонов внутри передачи.  
- */  
+ 
+// сброс состояния MASH-дизера и накопителей фазы.  
 void __not_in_flash_func(vfo_dither_reset)(void) {  
     uint32_t save = spin_lock_blocking(vfo_spin_lock);  
     dds_accum_m2    = 0;  
@@ -2220,19 +1983,8 @@ void __not_in_flash_func(vfo_dither_reset)(void) {
 }
 
 
-/**  
- * @brief Перевести VFO в RX-режим квадратурного LO (I/Q для SDR-смесителя).  
- *  
- * Одна SM переконфигурируется на 4-тактовую программу, выдающую код Грея  
- * на пины pin_freq_out_i / pin_freq_out_q (I/Q, сдвиг 90°).  
- * LO ставится на (freq_hz - RX_IF_SHIFT_HZ) — принимаемый сигнал ложится  
- * на +IF в базовой полосе, вне DC-пика и 1/f-шума ADC.  
- *  
- * Дизеринг ВЫКЛЮЧЕН: clkdiv пишется один раз, целочисленно, прямой записью  
- * в регистр — спектр LO чистый, без гребёнки MASH. Ошибка квантования  
- * (до ±F²·2/clk_sys) компенсируется NCO в приёмном DSP.  
- * core1 НЕ запускается — ядро полностью свободно под обработку I/Q.  
- */  
+
+// Перевести VFO в RX-режим квадратурного LO (I/Q для SDR-смесителя).  
 void vfo_quadrature_start(uint32_t freq_hz) {
     // Целевая частота LO — ниже настраиваемой на величину ПЧ  
     uint32_t lo_hz = (freq_hz > RX_IF_SHIFT_HZ) ? (freq_hz - RX_IF_SHIFT_HZ) : freq_hz;  
@@ -2289,10 +2041,8 @@ void vfo_quadrature_start(uint32_t freq_hz) {
     quad_active = true;  
 }
   
-/**  
- * @brief Вернуть VFO в штатный TX-режим (2-тактовый меандр на одном пине).  
- * Полная переинициализация — восстанавливает программу, пины и таблицу тонов.  
- */  
+ 
+// Вернуть VFO в штатный TX-режим (2-тактовый меандр на одном пине).  
 void vfo_quadrature_stop(uint32_t freq_hz, double step_hz) {  
     pio_sm_set_enabled(lo_pio, lo_sm, false);  
     // оба квадратурных пина в input до переконфигурации SM под передачу  
@@ -2303,10 +2053,8 @@ void vfo_quadrature_stop(uint32_t freq_hz, double step_hz) {
 }
 
 
-/**  
- * @brief Синхронное управление ключом эфира (нажатие/отпускание CW-ключа).  
- * Коммутирует выходной пин высокочастотного меандра @c pin_freq_out:  
- */
+  
+// Синхронное управление ключом эфира (нажатие/отпускание CW-ключа).  
 void __not_in_flash_func(vfo_operation_set)(bool key_down) {
     // 1. Управляем направлением пина генератора PIO (высокочастотный меандр)
     if (quad_active) return;  
@@ -2365,17 +2113,8 @@ void vfo_quadrature_debug(void) {
 }
 
 
-// ============================================================================  
-// Управление блоком переключаемых ДПФ перед смесителем (picorx_digi)  
-// ----------------------------------------------------------------------------  
-// Логика: по рабочей частоте выбирается один из 16 кодов, выдаваемый  
-// параллельно на 4 GPIO (двоичный код фильтра). Таблица подстроена под  
-// КВ-диапазоны; границы/коды уточни по схеме своего блока ДПФ — если там  
-// дешифратор 1-из-N или другой порядок бит, меняется только таблица.  
-// ============================================================================  
-  
-// Верхняя граница диапазона (Гц) и код на пинах поддиапазона.  
-// Порядок записей: строго по возрастанию частоты.  
+
+// Управление блоком переключаемых ДПФ перед смесителем
 typedef struct {  
     uint32_t f_max_hz;   // диапазон действует до этой частоты включительно  
     uint8_t  code;       // 4-битный код на subband_pins[0..3]  
