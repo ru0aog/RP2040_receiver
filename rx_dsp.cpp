@@ -18,10 +18,12 @@
 #include "pico/multicore.h"  
   
 // ---- Параметры тракта ----  
-#define RX_FS_IN_HZ           (RX_ADC_SAMPLE_RATE_HZ / 2.0f)    // Fs на канал  
-#define RX_DECIM_STAGES       4                                 // кол-во последовательных КИХ-фильтров (3)
-#define RX_FS_OUT_HZ          (RX_FS_IN_HZ / 16.0f)              // ~15.6 ksps при 250k  
-  
+#define RX_FS_IN_HZ           (RX_ADC_SAMPLE_RATE_HZ / 2.0f)  
+#define CIC_R                 8            // децимация CIC  
+#define CIC_N                 3            // каскадов интеграторов/гребёнок  
+#define RX_DECIM_STAGES       3            // HB-каскады: 15.6k → 7.8k → 3.9k → 1.95k  
+#define RX_FS_OUT_HZ          (RX_FS_IN_HZ / 64.0f)   // 1953.125 Гц
+
 // NCO: 32-битный фазовый аккумулятор  
 static volatile uint32_t nco_phase = 0;  
 static volatile uint32_t nco_step  = 0;     // 2^32 * f_nco / Fs_in  
@@ -42,6 +44,7 @@ static inline void nco_sincos(uint32_t ph, int16_t* s, int16_t* c) {
     *c = nco_lut[(idx + 256) & 1023];       // Извлечение косинуса. cos = sin сдвинутый на 90°  
 }  
   
+
 // ---- Half-band FIR, 15 отводов, коэффициенты для децимации на 2 ----  
 // Стандартный HB-фильтр с окном Хэмминга: в массиве нулевые элементы находятся на нечётных индексах 1, 3, 5, 9, 11 и 13. 
 // Центральный индекс - 7. Общий масштаб 1.0 = 32768
@@ -56,6 +59,7 @@ static const int16_t hb_taps[15] = {
 };
 #define HB_NTAPS 15        // 15 отводов
 
+
 typedef struct {
     int32_t d[HB_NTAPS];   // линия задержки (накопленные I или Q)  
     uint8_t w;             // указатель записи  
@@ -63,6 +67,33 @@ typedef struct {
 } hb_state_t;
 
 static hb_state_t hb_i[RX_DECIM_STAGES], hb_q[RX_DECIM_STAGES];
+// CIC R=8, N=3. Интеграторы — на входной частоте, гребёнки — на 15.6 ksps.  
+// Переполнение int32 в интеграторах — штатное (работает по модулю 2^32).  
+static int32_t cic_int_i[CIC_N],  cic_int_q[CIC_N];  
+static int32_t cic_comb_i[CIC_N], cic_comb_q[CIC_N];  
+static uint8_t cic_cnt = 0;  
+  
+// Возвращает true раз в CIC_R входных отсчётов с децимированной парой.  
+static inline bool cic_push_iq(int32_t xi, int32_t xq, int32_t* yi, int32_t* yq) {  
+    // интеграторы на полной частоте  
+    cic_int_i[0] += xi; cic_int_i[1] += cic_int_i[0]; cic_int_i[2] += cic_int_i[1];  
+    cic_int_q[0] += xq; cic_int_q[1] += cic_int_q[0]; cic_int_q[2] += cic_int_q[1];  
+  
+    if (++cic_cnt < CIC_R) return false;  
+    cic_cnt = 0;  
+  
+    // гребёнки уже на прореженной частоте  
+    int32_t ti = cic_int_i[2], tq = cic_int_q[2];  
+    for (int k = 0; k < CIC_N; ++k) {  
+        int32_t di = ti - cic_comb_i[k]; cic_comb_i[k] = ti; ti = di;  
+        int32_t dq = tq - cic_comb_q[k]; cic_comb_q[k] = tq; tq = dq;  
+    }  
+  
+    // DC-gain CIC = R^N = 512 = 2^9 → возвращаем масштаб  
+    *yi = ti >> 9;  
+    *yq = tq >> 9;  
+    return true;  
+}
 
 // реализует один шаг фильтрации и децимации (прореживания) данных через Half-Band FIR (КИХ) фильтр
 static inline bool hb_push(hb_state_t* st, int32_t x, int32_t* out) {
@@ -103,8 +134,8 @@ static inline int16_t sat16(int32_t v) {
     return (int16_t)v;
 }
 
-#define RX_OUT_SAMPLES   (RX_BLOCK_SAMPLES / 16)     // 64 пары отсчётов I/Q на блок  
-#define RX_OUT_BUFS      4                          // кол-во выходных буферов
+#define RX_OUT_SAMPLES   (RX_BLOCK_SAMPLES / 64)     // 8 пар I/Q на блок  
+#define RX_OUT_BUFS      4
 
 static int16_t out_i[RX_OUT_BUFS][RX_OUT_SAMPLES];  // выходные буферы обработанных данных I/Q
 static int16_t out_q[RX_OUT_BUFS][RX_OUT_SAMPLES];
@@ -145,13 +176,7 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
             // извлекаем текущие отсчёты из массива
             int32_t i_meas = s[2 * n];
             int32_t q_meas = s[2 * n + 1];
-/*
-//обходка DC и NCO
-    int32_t i_raw = i_meas;  
-    int32_t q_raw = q_meas;
-    int32_t i_rot = i_raw;
-    int32_t q_rot = q_raw;
-*/
+
             // Центрирование
                 // EMA с коэффициентом 1/256
                 dc_i += ((i_meas << 8) - dc_i) >> 8;
@@ -175,20 +200,33 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
                 int32_t q_rot = (q_raw * cs - i_raw * sn) >> 15;
 
             // четырёхкаскадная Half-Band фильтрация и децимация
-            int32_t vi = i_rot, vq = q_rot;  
-            bool emit = true;
-                // цепочка последовательных КИХ-фильтров (RX_DECIM_STAGES = 4)
-                for (int st = 0; st < RX_DECIM_STAGES; st++) {
+            // CIC /8 → 2 каскада HB /4 (итого /32)  
+            int32_t ci, cq;  
+            bool emit = cic_push_iq(i_rot, q_rot, &ci, &cq);  
+            int32_t vi = ci, vq = cq;  
+  
+            if (emit) {
+                for (int k = 0; k < RX_DECIM_STAGES; ++k) {
                     int32_t oi, oq;
-                    // hb_push укладывает данные в линию задержки очередного каскада
-                    bool ri = hb_push(&hb_i[st], vi, &oi);  
-                    bool rq = hb_push(&hb_q[st], vq, &oq);
-                    // Если хотя бы один из каскадов на текущем шаге вернул false (выхода нет, сработал пропуск прореживания)
-                    if (!ri || !rq) {  // флаг emit сбрасывается в false, и обработка текущего отсчета завершается
+
+                    // Обязательно вызываем оба фильтра на каждом входном отсчёте.
+                    bool emit_i = hb_push(&hb_i[k], vi, &oi);
+                    bool emit_q = hb_push(&hb_q[k], vq, &oq);
+
+                    // I и Q обязаны выдавать отсчёт одновременно.
+                    if (emit_i != emit_q) {
                         emit = false;
-                        break; }
-                    vi = oi; vq = oq;
-            // частота дискретизации на выходе каскада падает ровно в 2*2*2 = 8 раз
+                        break;
+                    }
+
+                    if (!emit_i) {
+                        emit = false;
+                        break;
+                    }
+
+                    vi = oi;
+                    vq = oq;
+                }
             }
 
             // Насыщение и запись в буфер базовой полосы
@@ -220,7 +258,9 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
 
 
 // ---- Публичный API ----  
-  
+
+//#define RX_NCO_DISABLE
+
 // запуск цифрового сигнального процессора (DSP) на втором ядре (Core 1)
 void rx_dsp_start(float f_target_hz) {  
     // Остановка ядра
@@ -234,6 +274,11 @@ void rx_dsp_start(float f_target_hz) {
     memset(out_i, 0, sizeof(out_i));
     memset(out_q, 0, sizeof(out_q));
     out_head = out_tail = 0;
+    memset(cic_int_i, 0, sizeof(cic_int_i));  
+    memset(cic_int_q, 0, sizeof(cic_int_q));  
+    memset(cic_comb_i, 0, sizeof(cic_comb_i));  
+    memset(cic_comb_q, 0, sizeof(cic_comb_q));  
+    cic_cnt = 0;
     out_dropped = 0;
     dc_i = 2048 << 8;
     dc_q = 2048 << 8;
@@ -245,7 +290,13 @@ void rx_dsp_start(float f_target_hz) {
     // и фактической частотой аппаратного генератора для цифровой подстройки
     float f_nco = f_target_hz - (float)vfo_quadrature_lo_hz();
     double step = 4294967296.0 * (double)f_nco / (double)RX_FS_IN_HZ;
-    int64_t signed_step = (int64_t)step;
+    
+    int64_t signed_step = (int64_t)step;  
+    // === DIAG: отключить NCO — сигнал останется на ПЧ +3 кГц ===  
+    #ifdef RX_NCO_DISABLE  
+    signed_step = 0;  
+    #endif  
+    // ==========================================================  
     nco_step = (uint32_t)signed_step;
     nco_phase = 0;
     // вывод диагностики

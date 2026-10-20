@@ -26,6 +26,7 @@
 #include "hardware/structs/ssi.h"
 #include "hardware/structs/pll.h"
 #include "pico/multicore.h"
+#include "pico/stdlib.h"
 #include "vfo_hardware.h"
 
 // данные из параллельного проекта
@@ -203,13 +204,23 @@ void vfo_quadrature_start(uint32_t freq_hz) {
     // давало уход LO на 2.8 кГц. Берём живое значение из clock_get_hz.    
     uint64_t clk_sys_hz = clock_get_hz(clk_sys);                    // фактическая шина  
     uint64_t num    = clk_sys_hz * 256;    
-    uint32_t div_q8 = (uint32_t)(num / (4ull * lo_hz));    
-    if (div_q8 < (2u << 8))                    div_q8 = 2u << 8;    
-    if (div_q8 > (0xFFFFu << 8) + 0xFF)        div_q8 = (0xFFFFu << 8) + 0xFF;    
-    
-    // Фактическая частота LO: f = clk_sys_hz / (4 * div_q8/256) = num / (4*div_q8)    
-    quad_lo_actual_hz = (uint32_t)(num / (div_q8 * 4ull));
-    Serial.print("[QUAD] Фактическая частота "); Serial.println(quad_lo_actual_hz);
+    // === Целочисленный делитель: дробная часть создавала периодический  
+    // джиттер фронтов LO -> спуры-частокол вокруг сигнала.  
+    // Округляем до ближайшего целого, frac-байт обнуляем. ===  
+    uint32_t div_q8 = (uint32_t)(num / (4ull * lo_hz));   // <-- эта строка нужна
+    // === Целочисленный делитель: дробная часть создавала периодический  
+    // джиттер фронтов LO -> спуры-частокол вокруг сигнала ===  
+    div_q8 = (div_q8 + 0x80u) & ~0xFFu;  
+  
+    if (div_q8 < (2u << 8))                div_q8 = 2u << 8;  
+    if (div_q8 > (0xFFFFu << 8))           div_q8 = 0xFFFFu << 8;
+  
+    // Фактическая частота LO после округления  
+    quad_lo_actual_hz = (uint32_t)(num / (div_q8 * 4ull));  
+    Serial.printf("[QUAD] Целевая %lu, целый делитель %lu, фактическая %lu\n",  
+                  (unsigned long)lo_hz,  
+                  (unsigned long)(div_q8 >> 8),  
+                  (unsigned long)quad_lo_actual_hz);
 
     if (!quad_program_loaded) {  
         quad_offset = pio_add_program(lo_pio, &pio_quad_program);  

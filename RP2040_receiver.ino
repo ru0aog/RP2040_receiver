@@ -140,11 +140,13 @@ static void serviceSpectrumSerial()
 
     if (spectrumTxBin == -2) {
         spectrumTxBin = 0;
-    } else if (spectrumTxBin >= 0 && spectrumTxBin < (int16_t)FFT_N - 1) {
-        ++spectrumTxBin;
-    } else {
-        spectrumTxPending = false;
-        spectrumTxBin = -2;
+    } else if (spectrumTxBin >= 0 && spectrumTxBin < (int16_t)FFT_N - 1) {  
+        ++spectrumTxBin;  
+    } else if (spectrumTxBin == (int16_t)FFT_N - 1) {  
+        spectrumTxBin = -1;   // следующая итерация напечатает #END  
+    } else {  
+        spectrumTxPending = false;  
+        spectrumTxBin = -2;  
     }
 }
 
@@ -187,6 +189,11 @@ void setup()
       TinyUSBDevice.task();
       #endif
   }
+
+// clk_sys = 129.333 МГц (VCO 1164 МГц / 9) — при этой частоте делитель  
+// квадратурного LO для 3.6 МГц выходит целым (D=9), джиттера нет.  
+// pll_usb (48 МГц) не трогаем: ADC и USB работают как раньше.  
+set_sys_clock_pll(1164UL * 1000 * 1000, 3, 3);
 
     for (uint16_t i = 0; i < FFT_N; ++i) {
         hannWindow[i] = 0.5f - 0.5f *
