@@ -47,7 +47,16 @@
 #include "pico/multicore.h"
 #include "vfo_hardware.h"
 
+// данные из параллельного проекта
 
+int pin_freq_out = 0;
+
+// GPIO управления ДПФ (значения подставить из конфигурации)
+static const int subband_pins[] = {
+    2, 3, 4, -1
+};
+
+// ----------------
 
 // ДИАГНОСТИКА
 #define BOOST_DEBUG              0         // 0 — выключить отладочную печать блока разгона
@@ -2224,7 +2233,7 @@ void __not_in_flash_func(vfo_dither_reset)(void) {
  * (до ±F²·2/clk_sys) компенсируется NCO в приёмном DSP.  
  * core1 НЕ запускается — ядро полностью свободно под обработку I/Q.  
  */  
-void vfo_quadrature_start(uint32_t freq_hz) {  
+void vfo_quadrature_start(uint32_t freq_hz) {
     // Целевая частота LO — ниже настраиваемой на величину ПЧ  
     uint32_t lo_hz = (freq_hz > RX_IF_SHIFT_HZ) ? (freq_hz - RX_IF_SHIFT_HZ) : freq_hz;  
     Serial.print("[QUAD] Целевая частота "); Serial.println(lo_hz);

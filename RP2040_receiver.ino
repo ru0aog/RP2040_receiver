@@ -1,212 +1,228 @@
-﻿
-#include <Arduino.h>
+﻿#include <Arduino.h>
 #include <math.h>
+#include <stdio.h>
+#include <string.h>
 
-// ============================================================
-// RP2040_receiver.ino
-// Назначение:
-//   1. Запустить приём при включении.
-//   2. Получать блоки комплексных IQ.
-//   3. Считать FFT.
-//   4. Выдавать спектр в Serial.
-// ============================================================
+#include "vfo_hardware.h"
+#include <Adafruit_TinyUSB.h>
 
-static constexpr uint32_t SERIAL_BAUD = 921600;
+// ------------------------------------------------------------
+// Настройки приёмника
+// ------------------------------------------------------------
+static constexpr uint32_t RX_FREQ_HZ = 3601500UL;
+static constexpr uint32_t SERIAL_BAUD = 921600UL;
 static constexpr uint16_t FFT_N = 256;
+static constexpr uint32_t RX_STATUS_INTERVAL_MS = 2000UL;
 
-// Частота децимированного IQ из существующего rx_dsp.
-static constexpr float FS_HZ = 15625.0f;
+static float fftRe[FFT_N];
+static float fftIm[FFT_N];
+static float hannWindow[FFT_N];
+static float spectrumDb[FFT_N];
 
-// Выдавать один спектр каждые 100 мс.
-static constexpr uint32_t SPECTRUM_PERIOD_MS = 100;
+static uint16_t fftPos = 0;
+static bool rxStarted = false;
+static bool spectrumTxPending = false;
+static int16_t spectrumTxBin = -2; // -2 = заголовок, -1 = #END, 0..255 = bins
+static uint32_t lastStatusMs = 0;
 
-// Буферы FFT.
-static float re[FFT_N];
-static float im[FFT_N];
-static float windowFn[FFT_N];
-
-static uint16_t fillCount = 0;
-static uint32_t lastSpectrumMs = 0;
+// API DSP (объявлены также в vfo_hardware.h).
+extern void rx_dsp_start(float f_target_hz);
+extern bool rx_dsp_get_output(const int16_t** i, const int16_t** q, uint8_t* n);
+extern void rx_dsp_release_output(void);
+extern float rx_dsp_fs_out(void);
 
 // ------------------------------------------------------------
-// Подключение к rx_dsp.
-//
-// Заменить эти две функции вызовами реального API проекта.
-// Не запускать второй ADC, если rx_dsp уже управляет им.
+// Radix-2 FFT, N=256
 // ------------------------------------------------------------
-
-bool receiverBegin()
+static void fft256(float* re, float* im)
 {
-  // TODO:
-  // Запустить существующий rx_dsp и приём ADC/DMA.
-  //
-  // Например, здесь должны быть вызовы инициализации
-  // из rx_dsp.h / rx_dsp.cpp.
-  //
-  // Вернуть true, когда приём запущен.
-  return false;
-}
+    uint16_t j = 0;
 
-bool receiverReadIQ(int16_t &iSample, int16_t &qSample)
-{
-  // TODO:
-  // Получить следующую пару IQ из rx_dsp.
-  //
-  // Если API выдаёт блоки:
-  //   rx_dsp_get_output(&i, &q, &n);
-  // нужно сохранять текущие указатели и индекс блока,
-  // а после обработки вызывать rx_dsp_release_output().
-  //
-  // Вернуть true, если получен новый отсчёт.
-  return false;
-}
+    for (uint16_t i = 1; i < FFT_N; ++i) {
+        uint16_t bit = FFT_N >> 1;
+        while (j & bit) {
+            j ^= bit;
+            bit >>= 1;
+        }
+        j ^= bit;
 
-// ------------------------------------------------------------
-// FFT: bit reversal + radix-2 Cooley–Tukey.
-// ------------------------------------------------------------
-
-void fft256(float *r, float *x)
-{
-  uint16_t j = 0;
-
-  for (uint16_t i = 1; i < FFT_N; ++i) {
-    uint16_t bit = FFT_N >> 1;
-
-    while (j & bit) {
-      j ^= bit;
-      bit >>= 1;
+        if (i < j) {
+            float t = re[i]; re[i] = re[j]; re[j] = t;
+            t = im[i]; im[i] = im[j]; im[j] = t;
+        }
     }
 
-    j ^= bit;
+    for (uint16_t len = 2; len <= FFT_N; len <<= 1) {
+        const float angle = -2.0f * PI / (float)len;
+        const float wrStep = cosf(angle);
+        const float wiStep = sinf(angle);
 
-    if (i < j) {
-      float t = r[i];
-      r[i] = r[j];
-      r[j] = t;
+        for (uint16_t base = 0; base < FFT_N; base += len) {
+            float wr = 1.0f;
+            float wi = 0.0f;
 
-      t = x[i];
-      x[i] = x[j];
-      x[j] = t;
+            for (uint16_t k = 0; k < len / 2; ++k) {
+                const uint16_t a = base + k;
+                const uint16_t b = a + len / 2;
+
+                const float vr = re[b] * wr - im[b] * wi;
+                const float vi = re[b] * wi + im[b] * wr;
+
+                re[b] = re[a] - vr;
+                im[b] = im[a] - vi;
+                re[a] += vr;
+                im[a] += vi;
+
+                const float nextWr = wr * wrStep - wi * wiStep;
+                wi = wr * wiStep + wi * wrStep;
+                wr = nextWr;
+            }
+        }
     }
-  }
-
-  for (uint16_t len = 2; len <= FFT_N; len <<= 1) {
-    const float angle = -2.0f * PI / len;
-    const float wlenR = cosf(angle);
-    const float wlenI = sinf(angle);
-
-    for (uint16_t base = 0; base < FFT_N; base += len) {
-      float wr = 1.0f;
-      float wi = 0.0f;
-
-      for (uint16_t k = 0; k < len / 2; ++k) {
-        const uint16_t a = base + k;
-        const uint16_t b = a + len / 2;
-
-        const float vr = r[b] * wr - x[b] * wi;
-        const float vi = r[b] * wi + x[b] * wr;
-
-        const float ur = r[a];
-        const float ui = x[a];
-
-        r[a] = ur + vr;
-        x[a] = ui + vi;
-        r[b] = ur - vr;
-        x[b] = ui - vi;
-
-        const float nextWr = wr * wlenR - wi * wlenI;
-        wi = wr * wlenI + wi * wlenR;
-        wr = nextWr;
-      }
-    }
-  }
 }
 
 // ------------------------------------------------------------
-// Подготовка и печать спектра.
-// Вход: комплексные IQ.
+// Рассчитать спектр и сохранить уровни в порядке от -Fs/2 до +Fs/2.
 // ------------------------------------------------------------
-
-void processIQ(int16_t iSample, int16_t qSample)
+static void calculateSpectrum()
 {
-  // Периодическое окно Hann.
-  const float scale = 1.0f / 32768.0f;
+    fft256(fftRe, fftIm);
 
-  re[fillCount] = (float)iSample * scale * windowFn[fillCount];
-  im[fillCount] = (float)qSample * scale * windowFn[fillCount];
+    for (uint16_t k = 0; k < FFT_N; ++k) {
+        const uint16_t b = (uint16_t)((k + FFT_N / 2) % FFT_N);
+        const float mag = sqrtf(fftRe[b] * fftRe[b] + fftIm[b] * fftIm[b]);
+        const float normalized = mag / (float)FFT_N;
+        spectrumDb[k] = 20.0f * log10f(normalized + 1.0e-12f);
+    }
 
-  ++fillCount;
-
-  if (fillCount < FFT_N) {
-    return;
-  }
-
-  fft256(re, im);
-
-  // Комплексный IQ: спектр отображается от -Fs/2 до +Fs/2.
-  // Перестановка половин нужна для удобного вывода.
-  Serial.println("BEGIN");
-
-  for (uint16_t outBin = 0; outBin < FFT_N; ++outBin) {
-    const uint16_t bin = (outBin + FFT_N / 2) % FFT_N;
-
-    const float mag = sqrtf(
-      re[bin] * re[bin] + im[bin] * im[bin]
-    );
-
-    const float db = 20.0f * log10f(mag + 1.0e-12f);
-    const float freq =
-      ((float)outBin - FFT_N / 2) * FS_HZ / FFT_N;
-
-    Serial.print(freq, 1);
-    Serial.print(',');
-    Serial.println(db, 2);
-  }
-
-  Serial.println("END");
-
-  fillCount = 0;
+    if (!spectrumTxPending) {
+        spectrumTxPending = true;
+        spectrumTxBin = -2;
+    }
 }
 
 // ------------------------------------------------------------
+// Неблокирующий вывод CSV. Формат кадра:
+// #BEGIN,Fs_Hz,bin_Hz
+// frequency_Hz,level_dB
+// ... 256 строк ...
+// #END
+// ------------------------------------------------------------
+static void serviceSpectrumSerial()
+{
+    if (!spectrumTxPending) return;
+
+    char line[64];
+    const float fs = rx_dsp_fs_out();
+    const float binHz = fs / (float)FFT_N;
+    int len = 0;
+
+    if (spectrumTxBin == -2) {
+        len = snprintf(line, sizeof(line), "#BEGIN,%.2f,%.4f\n",
+                       (double)fs, (double)binHz);
+    } else if (spectrumTxBin >= 0 && spectrumTxBin < (int16_t)FFT_N) {
+        const int16_t shiftedBin = (int16_t)spectrumTxBin - (int16_t)(FFT_N / 2);
+        const float freqHz = (float)shiftedBin * binHz;
+        len = snprintf(line, sizeof(line), "%.2f,%.2f\n",
+                       (double)freqHz, (double)spectrumDb[spectrumTxBin]);
+    } else {
+        len = snprintf(line, sizeof(line), "#END\n");
+    }
+
+    if (len <= 0 || len >= (int)sizeof(line)) {
+        spectrumTxPending = false;
+        return;
+    }
+    if (Serial.availableForWrite() < len) return;
+
+    Serial.write((const uint8_t*)line, (size_t)len);
+
+    if (spectrumTxBin == -2) {
+        spectrumTxBin = 0;
+    } else if (spectrumTxBin >= 0 && spectrumTxBin < (int16_t)FFT_N - 1) {
+        ++spectrumTxBin;
+    } else {
+        spectrumTxPending = false;
+        spectrumTxBin = -2;
+    }
+}
+
+// ------------------------------------------------------------
+// Запуск RX
+// ------------------------------------------------------------
+static void startReceiver()
+{
+    Serial.println("# Initializing receiver");
+
+    vfo_subband_init();
+    vfo_subband_apply(RX_FREQ_HZ);
+
+    // LO будет настроен на RX_FREQ_HZ - RX_IF_SHIFT_HZ.
+    // Функция сбрасывает Core 1, поэтому вызывается до запуска DSP.
+    vfo_quadrature_start(RX_FREQ_HZ);
+
+    // Запускаем ADC/DMA перед DSP.
+    rx_capture_start();
+
+    // Последним запускаем DSP на Core 1.
+    // В текущем rx_dsp_entry() DC/NCO-коррекция закомментирована:
+    // FFT показывает спектр после фильтрации/децимации без цифрового переноса.
+    rx_dsp_start((float)RX_FREQ_HZ);
+
+    Serial.printf("# RX_STARTED,target_hz=%lu,lo_actual_hz=%lu,fs_out_hz=%.2f\n",
+                  (unsigned long)RX_FREQ_HZ,
+                  (unsigned long)vfo_quadrature_lo_hz(),
+                  (double)rx_dsp_fs_out());
+    rxStarted = true;
+}
 
 void setup()
 {
-  Serial.begin(SERIAL_BAUD);
+    Serial.begin(SERIAL_BAUD);
+    delay(250);
 
-  // Не ждать подключения Serial: приём должен стартовать сразу.
-  for (uint16_t n = 0; n < FFT_N; ++n) {
-    windowFn[n] =
-      0.5f - 0.5f * cosf(2.0f * PI * n / (FFT_N - 1));
-  }
+    for (uint16_t i = 0; i < FFT_N; ++i) {
+        hannWindow[i] = 0.5f - 0.5f *
+            cosf(2.0f * PI * (float)i / (float)(FFT_N - 1));
+    }
 
-  delay(50);
-
-  Serial.println("# RP2040 receiver starting");
-
-  if (!receiverBegin()) {
-    Serial.println("# ERROR: connect receiverBegin() to rx_dsp");
-    return;
-  }
-
-  Serial.println("# RX STARTED");
+    startReceiver();
 }
 
 void loop()
 {
-  static bool rxStarted = false;
+    if (!rxStarted) return;
 
-  // После ошибки инициализации не пытаемся читать несуществующий поток.
-  if (!rxStarted) {
-    // В текущем каркасе receiverBegin() вызывается в setup().
-    // Успешный запуск отмечается отдельным флагом в рабочей версии.
-    return;
-  }
+    // Обрабатываем максимум один DSP-блок за итерацию, затем обслуживаем Serial.
+    const int16_t* iBuf = nullptr;
+    const int16_t* qBuf = nullptr;
+    uint8_t n = 0;
 
-  int16_t iSample;
-  int16_t qSample;
+    if (rx_dsp_get_output(&iBuf, &qBuf, &n)) {
+        for (uint8_t i = 0; i < n; ++i) {
+            fftRe[fftPos] = ((float)iBuf[i] / 32768.0f) * hannWindow[fftPos];
+            fftIm[fftPos] = ((float)qBuf[i] / 32768.0f) * hannWindow[fftPos];
 
-  while (receiverReadIQ(iSample, qSample)) {
-    processIQ(iSample, qSample);
-  }
+            ++fftPos;
+            if (fftPos >= FFT_N) {
+                fftPos = 0;
+                // Пока предыдущий кадр отправляется, новый кадр пропускаем.
+                if (!spectrumTxPending) {
+                    calculateSpectrum();
+                }
+            }
+        }
+        rx_dsp_release_output();
+    }
+
+    serviceSpectrumSerial();
+
+    // Статистика печатается только между спектральными кадрами, чтобы не
+    // вклинивать строку #STATUS внутрь блока #BEGIN...#END.
+    const uint32_t now = millis();
+    if (!spectrumTxPending && now - lastStatusMs >= RX_STATUS_INTERVAL_MS) {
+        lastStatusMs = now;
+        Serial.printf("#STATUS,capture_dropped=%lu\n",
+                      (unsigned long)rx_capture_dropped());
+    }
 }
