@@ -16,7 +16,7 @@ import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
 
 
-FFT_N = 256
+FFT_N = 1024
 
 
 def parse_args():
@@ -79,7 +79,7 @@ class SpectrumReader:
 
     def _read_loop(self):
         in_frame = False
-        fs = 15625.0
+        fs = 7812.5
         bin_hz = fs / FFT_N
         freq = []
         db = []
