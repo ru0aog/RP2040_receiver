@@ -20,9 +20,38 @@ static constexpr float LP_A1 = -0.4317f;
 static constexpr float LP_A2 = 0.2050f;
 */
 
-// Chebyshev I, N=2, рябь 0.5 дБ, fc=3 кГц, Fs=15625
-static const float LP_B0 = 0.2668f, LP_B1 = 0.5336f, LP_B2 = 0.2668f;  
-static const float LP_A1 = -0.2054f, LP_A2 = 0.2728f;
+// ============================================================
+// Простейший НЧ-фильтр первого порядка
+// Fs = 44100 Гц, Fc примерно 5000 Гц
+// ============================================================
+
+namespace RxAudioPostFilter {
+
+static constexpr float ALPHA = 0.5095f;
+
+static float state = 0.0f;
+
+inline void reset()
+{
+    state = 0.0f;
+}
+
+inline float process(float input)
+{
+    state += ALPHA * (input - state);
+    return state;
+}
+
+} // namespace RxAudioPostFilter
+
+// Chebyshev I, N=2, ripple=0.5 dB
+// Fs = 15625 Hz, Fc = 3500 Hz
+static const float LP_B0 = 0.3060f;
+static const float LP_B1 = 0.6120f;
+static const float LP_B2 = 0.3060f;
+static const float LP_A1 = 0.0130f;
+static const float LP_A2 = 0.2110f;
+
 
 static float lp_x1 = 0.0f;
 static float lp_x2 = 0.0f;
@@ -159,17 +188,19 @@ static float agc_peak = 4096.0f;
 static inline int16_t agc_limit(float x) {
     const float ax = fabsf(x);
 
+    // Детектор пиков (атака и спад)
     if (ax > agc_peak) {
         agc_peak += (ax - agc_peak) * 0.0625f;
     } else {
         agc_peak += (ax - agc_peak) * 0.0002f;
     }
-
-    if (agc_peak < 256.0f) {
-        agc_peak = 256.0f;
+    // Защита от разгона усиления в паузах (минимальный порог)
+    // Поднимите выше 2048.0f, если тихие звуки всё ещё слишком сильно усиливаются
+    if (agc_peak < 256.0f) {  // 256.0f  максимальное усиление 96 крат
+        agc_peak = 256.0f;    // 2048.0f максимальное усиление 12 крат
     }
-
-    float g = x * 24576.0f / agc_peak;
+    float g = x * 24576.0f / agc_peak;  // потолок усиления 24576.0f = -2,5 дБ
+    // Жесткий лимитер на крайний случай
     if (g > 32767.0f)  g = 32767.0f;
     if (g < -32768.0f) g = -32768.0f;
     return (int16_t)g;
@@ -297,10 +328,12 @@ static bool next_sample(int16_t* out) {
     if (rs_phase >= 44100) {  
         rs_phase -= 44100;  
         rs_advance_pending = true;  
-    }  
+    }
   
     // включаем АРУ (требуется усиление +20 дБ для выравнивания с АЦП)
     *out = agc_limit(y);
+    //*out = agc_limit(RxAudioPostFilter::process(y));
+    //*out = RxAudioPostFilter::process(y);
 
     return true;  
 #endif
@@ -312,6 +345,7 @@ static int16_t pcm_buffer[192 * 2];  // до 192 stereo frames
 void rx_audio_init(void) {
     // Сброс состояний фильтров и демодулятора.
     lp_x1 = lp_x2 = lp_y1 = lp_y2 = 0.0f;
+    RxAudioPostFilter::reset();
 
     // Стираем ТОЛЬКО рабочие буферы данных, массив коэффициентов hilb_h не трогаем!
     memset(hilb_buf, 0, sizeof(hilb_buf));
