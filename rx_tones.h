@@ -18,3 +18,8 @@ float rx_tones_freq_hz(int ch);
 float rx_tones_power(int ch);  
 // Медиана мощности по кадру (шумовой пол)  
 float rx_tones_median(void);
+
+extern void rtty_frame(void);   // или через rx_rtty.h  
+
+// скормить кадр мощностей декодерам (вызывается на каждый кадр ~22 мс)  
+extern void rx_rtty_frame(void); 

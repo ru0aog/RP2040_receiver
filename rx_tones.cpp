@@ -11,7 +11,7 @@
 #include <math.h>  
 #include "rx_tones.h"  
   
-#define FRAME_LEN   48      // отсчётов на кадр (~24.6 мс при Fs=1953)  
+#define FRAME_LEN   43      // 43/1953 = 22.02 мс = бит RTTY-45
 #define EDGE_SKIP   25      // крайних каналов от Найквиста не делаем (~48 Гц)  
 #define THRESH_DB   9.0f    // порог над медианой  
   
@@ -91,9 +91,9 @@ static float median_of(float* a, int n) {
   
 void rx_tones_frame(void) {  
     for (int ch = 0; ch < n_ch; ch++)  
-        power[ch] = z_re[ch]*z_re[ch] + z_im[ch]*z_im[ch];  
-  
-    median_p = median_of(power, n_ch) + 1e-9f;  
+        power[ch] = z_re[ch]*z_re[ch] + z_im[ch]*z_im[ch];
+    median_p = median_of(power, n_ch) + 1e-9f;
+  /*
     float thresh = median_p * powf(10.0f, THRESH_DB / 10.0f);  
     float f_lo = -0.5f * fs_hz * 0.9f;  
     float step = fs_hz / 500.0f;  
@@ -109,11 +109,14 @@ void rx_tones_frame(void) {
             float snr = 10.0f * log10f(power[ch] / median_p);  
             Serial.printf("#TONE,ch=%d,freq=%.1f,snr=%.1f\n", ch, f, snr);  
         } else if (!peak && tone_get_on(ch) && power[ch] < thresh * 0.5f) {  
-            // гистерезис: снятие флага при падении ниже порог-3дБ  
             tone_set_on(ch, false);  
         }  
-    }  
-}  
+    }
+  */
+    rx_rtty_frame();  
+}
+
+
   
 float rx_tones_freq_hz(int ch) {  
     return -0.5f * fs_hz * 0.9f + ch * (fs_hz / 500.0f);  
