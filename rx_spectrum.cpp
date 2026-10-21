@@ -7,14 +7,37 @@
  */  
 
 #include "rx_spectrum.h"
-#include "rx_capture.cpp"
 
 #include <Arduino.h>
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
 
+static constexpr uint16_t FFT_N = 1024;  
+static constexpr uint32_t RX_STATUS_INTERVAL_MS = 2000UL;  
+static constexpr float FFT_WINDOW_GAIN = 0.5f;  
+  
+static float fftRe[FFT_N], fftIm[FFT_N], hannWindow[FFT_N], spectrumDb[FFT_N];  
+static uint16_t fftPos = 0;  
+static bool rxStarted = false;  
+static bool spectrumTxPending = false;  
+static int16_t spectrumTxBin = -2;  
+static uint32_t lastStatusMs = 0;  
+  
+// API DSP
+extern bool  rx_dsp_get_output(const int16_t** i, const int16_t** q, uint8_t* n);  
+extern void  rx_dsp_release_output(void);  
+extern float rx_dsp_fs_out(void);  
+extern uint32_t rx_capture_dropped(void);
 
+
+void rx_spectrum_init(void) {  
+    for (uint16_t i = 0; i < FFT_N; ++i)  
+        hannWindow[i] = 0.5f - 0.5f * cosf(2.0f * PI * (float)i / (float)(FFT_N - 1));  
+}  
+void rx_spectrum_set_started(bool v) { rxStarted = v; }  
+const float* rx_spectrum_db(void)  { return spectrumDb; }  
+float rx_spectrum_bin_hz(void)     { return rx_dsp_fs_out() / (float)FFT_N; }
 
 
 // ------------------------------------------------------------
