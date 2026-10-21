@@ -10,6 +10,7 @@
 // Входная частота аудиоветви DSP: 15625 Гц.
 // Выход USB-аудио: 44100 Гц, stereo, signed 16-bit PCM.
 
+/*
 // ---- LPF Butterworth-подобный biquad, Fs=15625 Гц ----
 // Коэффициенты сохранены из исходного файла.
 static constexpr float LP_B0 = 0.1933f;
@@ -17,6 +18,11 @@ static constexpr float LP_B1 = 0.3866f;
 static constexpr float LP_B2 = 0.1933f;
 static constexpr float LP_A1 = -0.4317f;
 static constexpr float LP_A2 = 0.2050f;
+*/
+
+// Chebyshev I, N=2, рябь 0.5 дБ, fc=3 кГц, Fs=15625
+static const float LP_B0 = 0.2668f, LP_B1 = 0.5336f, LP_B2 = 0.2668f;  
+static const float LP_A1 = -0.2054f, LP_A2 = 0.2728f;
 
 static float lp_x1 = 0.0f;
 static float lp_x2 = 0.0f;
@@ -54,7 +60,6 @@ static int32_t prev_q = 0;
 #define HILB_N 31
 #define HILB_M ((HILB_N - 1) / 2)  // 15 отсчётов групповой задержки
 
-static float hilb_h[HILB_N] = {};
 static float hilb_buf[HILB_N] = {};
 static int hilb_idx = 0;
 
@@ -65,28 +70,34 @@ static int i_del_idx = 0;
 
 static float am_dc = 0.0f;
 
+// Заранее рассчитанные коэффициенты Hilbert FIR (31 taps, Hamming window)
+// Сдвиг фазы строго нормирован. Четные отсчеты равны 0.
+static const float hilb_h[HILB_N] = {
+    -0.0053f,  0.0f, -0.0176f,  0.0f, -0.0423f,  0.0f, -0.0864f,  0.0f,
+    -0.1652f,  0.0f, -0.3401f,  0.0f, -0.9531f,  0.0f,  0.0000f,  0.0f,
+     0.9531f,  0.0f,  0.3401f,  0.0f,  0.1652f,  0.0f,  0.0864f,  0.0f,
+     0.0423f,  0.0f,  0.0176f,  0.0f,  0.0053f,  0.0f,  0.0053f
+};
+
+// Функция инициализации теперь просто очищает буферы
 static void hilb_init(void) {
-    for (int k = 0; k < HILB_N; ++k) {
-        const int n = k - HILB_M;
-        float h = 0.0f;
-
-        // Идеальный импульсный отклик преобразователя Гильберта.
-        if ((n & 1) != 0) {
-            h = 2.0f / (3.14159265358979323846f * (float)n);
-        }
-
-        // Окно Hamming.
-        const float w = 0.54f - 0.46f *
-            cosf(6.2831853071795864769f * (float)k / (float)(HILB_N - 1));
-        hilb_h[k] = h * w;
-    }
+    memset(hilb_buf, 0, sizeof(hilb_buf));
+    memset(i_del, 0, sizeof(i_del));
 }
 
 // Подаёт одну пару I/Q (15625 Гц), возвращает один демодулированный отсчёт.
 static inline float demod_sample(int32_t i, int32_t q) {
-    // Задержка I на 15 отсчётов для согласования с Hilbert FIR.
+    // Записываем текущий I в буфер
     i_del[i_del_idx] = (float)i;
-    const float i_d = i_del[(i_del_idx + 1) % (HILB_M + 1)];
+
+    // Берем отсчет, который был записан ровно HILB_M шагов назад
+    int del_read_idx = i_del_idx - HILB_M;
+    if (del_read_idx < 0) {
+        del_read_idx += (HILB_M + 1);
+    }
+    const float i_d = i_del[del_read_idx];
+
+    // Инкремент индекса записи
     i_del_idx = (i_del_idx + 1) % (HILB_M + 1);
 
     // Q через Hilbert FIR.
@@ -102,11 +113,21 @@ static inline float demod_sample(int32_t i, int32_t q) {
     float dem = 0.0f;
 
     switch (DEMOD_MODE) {
-case DEMOD_USB:
-case DEMOD_LSB:
-case DEMOD_CW:
-    dem = (float)i;
-    break;
+        case DEMOD_USB:
+            // USB = I_delayed - H(Q)
+            //dem = i_d - hq;
+            dem = i;
+            break;
+
+        case DEMOD_LSB:
+            // LSB = I_delayed + H(Q)
+            dem = i_d + hq;
+            break;
+
+        case DEMOD_CW:
+            // Для CW обычно используют USB или LSB (например, USB)
+            dem = i_d - hq; 
+            break;
 
         case DEMOD_AM: {
             const float fi = (float)i;
@@ -202,6 +223,7 @@ static bool get_demod_input(float* out) {
     ++pos;
 
     *out = lp_filter(demod_sample(i, q));
+    //*out = demod_sample(i, q);// LPF обойдён: сырой выход демодулятора
     return true;
 }
 
@@ -268,24 +290,19 @@ static bool next_sample(int16_t* out) {
         rs_advance_pending = false;
     }
 
-    const float frac = (float)rs_phase / 44100.0f;
-    const float y = rs_x0 + (rs_x1 - rs_x0) * frac;
+    const float frac = (float)rs_phase / 44100.0f;  
+    const float y = rs_x0 + (rs_x1 - rs_x0) * frac;  
+  
+    rs_phase += 15625;  
+    if (rs_phase >= 44100) {  
+        rs_phase -= 44100;  
+        rs_advance_pending = true;  
+    }  
+  
+    // включаем АРУ (требуется усиление +20 дБ для выравнивания с АЦП)
+    *out = agc_limit(y);
 
-    // Продвигаем фазу только после успешной подготовки и выдачи отсчёта.
-    rs_phase += 15625;
-    if (rs_phase >= 44100) {
-        rs_phase -= 44100;
-        rs_advance_pending = true;
-    }
-
-    // Ограничение уровня. Для включения АРУ замените эту строку на:
-    // *out = agc_limit(y);
-    float clipped = y;
-    if (clipped > 32767.0f)  clipped = 32767.0f;
-    if (clipped < -32768.0f) clipped = -32768.0f;
-    *out = (int16_t)clipped;
-
-    return true;
+    return true;  
 #endif
 }
 
@@ -296,7 +313,7 @@ void rx_audio_init(void) {
     // Сброс состояний фильтров и демодулятора.
     lp_x1 = lp_x2 = lp_y1 = lp_y2 = 0.0f;
 
-    memset(hilb_h, 0, sizeof(hilb_h));
+    // Стираем ТОЛЬКО рабочие буферы данных, массив коэффициентов hilb_h не трогаем!
     memset(hilb_buf, 0, sizeof(hilb_buf));
     memset(i_del, 0, sizeof(i_del));
     hilb_idx = 0;
@@ -321,7 +338,7 @@ void rx_audio_init(void) {
     rs_advance_pending = false;
 
     memset(pcm_buffer, 0, sizeof(pcm_buffer));
-    hilb_init();
+    hilb_init(); // Очистит буферы еще раз (для надежности)
 
     if (!TinyUSBDevice.isInitialized()) {
         TinyUSBDevice.begin(0);
@@ -334,6 +351,7 @@ void rx_audio_init(void) {
 
     usb_out.begin(cfg);
 }
+
 
 // Вызывать регулярно из loop(). Не вызывать параллельно из таймера:
 // у USB-потока и ресемплера должен быть один потребитель.

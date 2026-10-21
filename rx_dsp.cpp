@@ -19,10 +19,10 @@
   
 // ---- Параметры тракта ----  
 #define RX_FS_IN_HZ           (RX_ADC_SAMPLE_RATE_HZ / 2.0f)  
-#define CIC_R                 8            // децимация CIC  
-#define CIC_N                 3            // каскадов интеграторов/гребёнок  
-#define RX_DECIM_STAGES       3            // HB-каскады: 15.6k → 7.8k → 3.9k → 1.95k  
-#define RX_FS_OUT_HZ          (RX_FS_IN_HZ / 64.0f)   // 1953.125 Гц
+#define CIC_R                 2            // децимация CIC: 125k → 62.5k    
+#define CIC_N                 3            // каскадов интеграторов/гребёнок    
+#define RX_DECIM_STAGES       2            // HB-каскады: 62.5k → 31.25k → 15.625k    
+#define RX_FS_OUT_HZ          (RX_FS_IN_HZ / 8.0f)    // 15625 Гц
 
 // NCO: 32-битный фазовый аккумулятор  
 static volatile uint32_t nco_phase = 0;  
@@ -96,9 +96,9 @@ static inline bool cic_push_iq(int32_t xi, int32_t xq, int32_t* yi, int32_t* yq)
         int32_t dq = tq - cic_comb_q[k]; cic_comb_q[k] = tq; tq = dq;  
     }  
   
-    // DC-gain CIC = R^N = 512 = 2^9 → возвращаем масштаб  
-    *yi = ti >> 9;  
-    *yq = tq >> 9;  
+// DC-gain CIC = R^N = 2^3 = 8 → возвращаем масштаб    
+    *yi = ti >> 3;    
+    *yq = tq >> 3;
     return true;  
 }
 
@@ -142,7 +142,7 @@ static inline int16_t sat16(int32_t v) {
     return (int16_t)v;
 }
 
-#define RX_OUT_SAMPLES   (RX_BLOCK_SAMPLES / 64)     // 8 пар I/Q на блок  
+#define RX_OUT_SAMPLES   (RX_BLOCK_SAMPLES / 8)      // 64 пары I/Q на блок
 #define RX_OUT_BUFS      4
 
 static int16_t out_i[RX_OUT_BUFS][RX_OUT_SAMPLES];  // выходные буферы обработанных данных I/Q
@@ -218,28 +218,11 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
                 int32_t i_rot = (i_raw * cs + q_raw * sn) >> 15;
                 int32_t q_rot = (q_raw * cs - i_raw * sn) >> 15;
 
-            // четырёхкаскадная Half-Band фильтрация и децимация
-            // CIC /8 → 2 каскада HB /4 (итого /32)  
-            int32_t ci, cq;  
-            bool emit = cic_push_iq(i_rot, q_rot, &ci, &cq);
-
-            // отвод аудио-базбенда на частоте CIC (15.625 ksps)  
-            if (emit) {  
-                uint8_t anext = (uint8_t)((aud_head + 1) % RX_AUD_BUFS);  
-                if (anext != aud_tail) {  
-                    aud_i[aud_head][aud_wr_n] = sat16(ci);  
-                    aud_q[aud_head][aud_wr_n] = sat16(cq);  
-                    if (++aud_wr_n >= RX_AUD_SAMPLES) {  
-                        __dmb();  
-                        aud_head = anext;  
-                        aud_wr_n = 0;  
-                    }  
-                } else {  
-                    aud_dropped++;  
-                }  
-            }
-
-            int32_t vi = ci, vq = cq;  
+ 
+            // CIC /2 → 2 каскада HB /2 (итого /8) → 15.625 ksps  
+            int32_t ci, cq;    
+            bool emit = cic_push_iq(i_rot, q_rot, &ci, &cq);  
+            int32_t vi = ci, vq = cq; 
   
             if (emit) {
                 for (int k = 0; k < RX_DECIM_STAGES; ++k) {
@@ -267,12 +250,27 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
 
             // Насыщение и запись в буфер базовой полосы
             // Если фильтры выдали отсчет (emit == true), выходная очередь не полна, и мы не вылезли за размер блока (64 отсчета)
-            if (emit && !queue_full && n_out < RX_OUT_SAMPLES) {
-                // данные проходят через функцию ограничения sat16 (защита от клиппинга)
-                // и записываются в выходной буфер out_i/out_q под текущим индексом n_out
-                out_i[wr][n_out] = sat16(vi);
-                out_q[wr][n_out] = sat16(vq);
-                n_out++;
+            if (emit) {  
+                // аудио-базбенд: та же точка 15.625 ksps, после двух HB  
+                uint8_t anext = (uint8_t)((aud_head + 1) % RX_AUD_BUFS);    
+                if (anext != aud_tail) {    
+                    aud_i[aud_head][aud_wr_n] = sat16(vi);    
+                    aud_q[aud_head][aud_wr_n] = sat16(vq);    
+                    if (++aud_wr_n >= RX_AUD_SAMPLES) {    
+                        __dmb();    
+                        aud_head = anext;    
+                        aud_wr_n = 0;    
+                    }    
+                } else {    
+                    aud_dropped++;    
+                }  
+  
+                // очередь спектра/декодеров — тот же сигнал  
+                if (!queue_full && n_out < RX_OUT_SAMPLES) {  
+                    out_i[wr][n_out] = sat16(vi);  
+                    out_q[wr][n_out] = sat16(vq);  
+                    n_out++;  
+                }  
             }
         }
         // После окончания внутреннего цикла 
@@ -444,7 +442,7 @@ void rx_dsp_release_audio(void) {
 }  
   
 float rx_dsp_audio_fs(void) {  
-    return RX_FS_IN_HZ / (float)CIC_R;   // 15625.0 Гц  
+    return RX_FS_OUT_HZ;                 // 15625.0 Гц — теперь с выхода HB-цепочки
 }
 
 
