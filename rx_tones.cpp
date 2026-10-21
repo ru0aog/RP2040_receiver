@@ -14,9 +14,7 @@
 #include "rx_tones.h"  
 #include "rx_rtty.h"  
   
-#define FRAME_LEN   9       // 9/1953 = 4.6 мс ≈ 1/5 бита RTTY-45  
-#define EDGE_SKIP   25      // крайних каналов от Найквиста не делаем (~48 Гц)  
-#define THRESH_DB   9.0f    // порог над медианой (для детектора #TONE, сейчас выкл.)  
+#define FRAME_LEN   9       // 9/1953 = 4.6 мс ≈ 1/5 бита RTTY-45
   
 static float   fs_hz      = 1953.125f;  
 static int     n_ch       = 0;         // фактическое число каналов  

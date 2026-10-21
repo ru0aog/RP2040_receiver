@@ -94,9 +94,11 @@ static bool rtty_acquire(void) {
     float need = med * powf(10.0f, LOCK_SNR_DB / 10.0f);  
   
     int n = rx_tones_nch();  
-    // разнос в каналах (шаг ~3.906 Гц): 140 Гц -> ~36, 200 Гц -> ~52  
-    int d_lo = (int)(SHIFT_MIN_HZ / (1953.125f / 500.0f));  
-    int d_hi = (int)(SHIFT_MAX_HZ / (1953.125f / 500.0f)) + 1;  
+    // разнос в каналах — по фактическому шагу сетки (не привязан к Fs=1953)  
+    float step_hz = rx_tones_freq_hz(1) - rx_tones_freq_hz(0);  
+    int d_lo = (int)(SHIFT_MIN_HZ / step_hz);  
+    int d_hi = (int)(SHIFT_MAX_HZ / step_hz) + 1;  
+    if (d_lo < 1) d_lo = 1;  
   
     int   best_lo = -1, best_hi = -1;  
     float best_p  = 0.0f;  
@@ -152,10 +154,15 @@ void rx_rtty_frame(void) {
   
     // фронт -> сдвигаем фазу к фронту (PLL)  
     if (lvl != prev_level) {  
+        // если бит был почти закрыт (уже есть голоса в центре) —  
+        // сначала закрываем его, иначе бит потеряется  
+        if (mid_count > 0) {  
+            rtty_bit(mid_votes * 2 > mid_count);  
+        }  
         bit_phase = 0; mid_votes = 0; mid_count = 0;  
         cur_bit = lvl;  
     }  
-    prev_level = lvl;  
+    prev_level = lvl; 
   
     // центр бита — majority vote  
     if (bit_phase >= CENTER_LO && bit_phase <= CENTER_HI) {  
