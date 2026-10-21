@@ -51,33 +51,32 @@ static bool next_sample(int16_t* out) {
     *out = (int16_t)(10000.0f * sinf(6.2831853f * (ph >> 24) / 256.0f));  
     return true;  
 #else  
-    // Код демодулятора с шагом ресемплинга из 15625 Гц в 44100 Гц
+    // Ресемплер 15625 -> 44100: на каждый выходной отсчёт  
+    // продвигаем входную фазу на 15625/44100  
     for (;;) {  
-        if (pos >= cur_n) {  
-            if (cur_n) rx_dsp_release_audio();  
-            if (!rx_dsp_get_audio(&bi, &bq, &cur_n)) return false;  
-            pos = 0;  
-        }  
-        int32_t i = bi[pos], q = bq[pos];  
-        pos++;  
-  
-        int32_t d = i * prev_q - q * prev_i;  
-        prev_i = i; prev_q = q;  
-        cur = lp_filter((float)(d >> 8));  
-  
-        // Ресемплинг: шаг 44100 Гц
-        acc += 44100;  
-        if (acc >= 15625) {  
-            acc -= 15625;  
-            float frac = (float)acc / 15625.0f;  
-            float y = rs_prev + (cur - rs_prev) * frac;  
+        // пока не накоплена позиция выхода — тянем входные I/Q  
+        while (acc >= 44100) {  
+            acc -= 44100;  
+            if (pos >= cur_n) {  
+                if (cur_n) rx_dsp_release_audio();  
+                if (!rx_dsp_get_audio(&bi, &bq, &cur_n)) return false;  
+                pos = 0;  
+            }  
+            int32_t i = bi[pos], q = bq[pos];  
+            pos++;  
+            int32_t d = i * prev_q - q * prev_i;  
+            prev_i = i; prev_q = q;  
             rs_prev = cur;  
-            *out = agc_limit(y);  
-            return true;  
+            cur = lp_filter((float)(d >> 8));  
         }  
-        rs_prev = cur;  
+        // выдать один выходной отсчёт, линейная интерполяция  
+        float frac = (float)acc / 44100.0f;          // позиция между rs_prev и cur  
+        float y = rs_prev + (cur - rs_prev) * frac;  
+        acc += 15625;  
+        *out = agc_limit(y);  
+        return true;  
     }  
-#endif  
+#endif
 }  
   
 static USBAudioStream usb_out;
@@ -117,10 +116,20 @@ void rx_audio_init(void) {
 
     // Запускаем аппаратный таймер на интервал 2000 микросекунд (2 мс)
     // Он будет вызывать audio_timer_callback в фоне независимо от loop()
-    add_repeating_timer_us(-2000, audio_timer_callback, NULL, &audio_timer);
+    // add_repeating_timer_us(-2000, audio_timer_callback, NULL, &audio_timer);
 }  
   
 void rx_audio_poll(void) {  
-    // Метод пустой! Вся отправка теперь работает по строгим прерываниям таймера,
-    // что полностью убирает цифровой хрип и рассинхронизацию.
+    for (;;) {  
+        int avail_frames = usb_out.availableForWrite() / 4;  
+        if (avail_frames <= 0) break;  
+        if (avail_frames > 192) avail_frames = 192;  
+  
+        int frames = 0; int16_t s;  
+        while (frames < avail_frames && next_sample(&s)) {  
+            pcm_buffer[frames*2] = s; pcm_buffer[frames*2+1] = s; frames++;  
+        }  
+        if (frames) usb_out.write((uint8_t*)pcm_buffer, frames * 4);  
+        if (frames < avail_frames) break;   // источник пуст — выходим  
+    }  
 }
