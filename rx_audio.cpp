@@ -40,7 +40,7 @@ static uint8_t cur_n = 0, pos = 0;
 static uint32_t acc = 0;  
 static float rs_prev = 0, cur = 0;  
   
-#define TEST_SINE   1   // 1 = тестовый ТОН (работает внутри SDR), 0 = ДЕМОДУЛЯТОР ЭФИРА  
+#define TEST_SINE   0   // 1 = тестовый ТОН (работает внутри SDR), 0 = ДЕМОДУЛЯТОР ЭФИРА  
   
 // выдать один PCM-отсчёт int16; false = данных нет  
 static bool next_sample(int16_t* out) {  
@@ -64,16 +64,19 @@ static bool next_sample(int16_t* out) {
             }  
             int32_t i = bi[pos], q = bq[pos];  
             pos++;  
-            int32_t d = i * prev_q - q * prev_i;  
-            prev_i = i; prev_q = q;  
+            // int32_t d = i * prev_q - q * prev_i;  
+            // prev_i = i; prev_q = q;  
             rs_prev = cur;  
-            cur = lp_filter((float)(d >> 8));  
+            // cur = lp_filter((float)(d >> 8));
+            cur = lp_filter((float)i * 4.0f);
         }  
         // выдать один выходной отсчёт, линейная интерполяция  
         float frac = (float)acc / 44100.0f;          // позиция между rs_prev и cur  
         float y = rs_prev + (cur - rs_prev) * frac;  
         acc += 15625;  
-        *out = agc_limit(y);  
+        // *out = agc_limit(y);  // АРУ
+        *out = (int16_t)constrain(y, -32768, 32767); // ограничение
+
         return true;  
     }  
 #endif
@@ -120,6 +123,13 @@ void rx_audio_init(void) {
 }  
   
 void rx_audio_poll(void) {  
+    static uint32_t t = 0;  
+    if (millis() - t > 1000) {  
+        t = millis();  
+        const int16_t *i, *q; uint8_t n;  
+        bool has = rx_dsp_get_audio(&i, &q, &n);   // peek без release  
+        Serial.printf("[AUD] q=%d n=%d i0=%d\n", (int)has, (int)n, has ? i[0] : 0);  
+    }  
     for (;;) {  
         int avail_frames = usb_out.availableForWrite() / 4;  
         if (avail_frames <= 0) break;  
