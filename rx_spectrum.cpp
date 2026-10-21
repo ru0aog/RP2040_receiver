@@ -7,6 +7,7 @@
  */  
 
 #include "rx_spectrum.h"
+#include "rx_tones.h"
 
 #include <Arduino.h>
 #include <math.h>
@@ -16,6 +17,7 @@
 static constexpr uint16_t FFT_N = 1024;  
 static constexpr uint32_t RX_STATUS_INTERVAL_MS = 2000UL;  
 static constexpr float FFT_WINDOW_GAIN = 0.5f;  
+static constexpr bool SPECTRUM_TX_ENABLE = false;   // выдача спектра в COM отключена
   
 static float fftRe[FFT_N], fftIm[FFT_N], hannWindow[FFT_N], spectrumDb[FFT_N];  
 static uint16_t fftPos = 0;  
@@ -168,22 +170,25 @@ void FFT_to_COM()
     const int16_t* qBuf = nullptr;
     uint8_t n = 0;
 
-    if (rx_dsp_get_output(&iBuf, &qBuf, &n)) {
-        for (uint8_t i = 0; i < n; ++i) {
-            fftRe[fftPos] = ((float)iBuf[i] / 32768.0f) * hannWindow[fftPos];
-            fftIm[fftPos] = ((float)qBuf[i] / 32768.0f) * hannWindow[fftPos];
-
-            ++fftPos;
-            if (fftPos >= FFT_N) {
-                fftPos = 0;
-                // Пока предыдущий кадр отправляется, новый кадр пропускаем.
-                if (!spectrumTxPending) {
-                    calculateSpectrum();
-                }
-            }
+    if (rx_dsp_get_output(&iBuf, &qBuf, &n)) {  
+            for (uint8_t i = 0; i < n; ++i) {  
+                rx_tones_sample(iBuf[i], qBuf[i]);   // банк Гёрцеля, на каждый отсчёт  
+      
+                fftRe[fftPos] = ((float)iBuf[i] / 32768.0f) * hannWindow[fftPos];  
+                fftIm[fftPos] = ((float)qBuf[i] / 32768.0f) * hannWindow[fftPos];  
+      
+                ++fftPos;  
+                if (fftPos >= FFT_N) {  
+                    fftPos = 0;  
+                    // Выдача спектра отключена: FFT считается только если включено.  
+                    if (SPECTRUM_TX_ENABLE && !spectrumTxPending) {  
+                        calculateSpectrum(); 
+                    }  
+                }  
+            }  
+            rx_dsp_release_output();  
+            rx_tones_frame();                      // кадр банка после обработанного блока  
         }
-        rx_dsp_release_output();
-    }
 
     serviceSpectrumSerial();
 

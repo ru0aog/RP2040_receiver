@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "rx_tones.h"
 #include "vfo_hardware.h"
 #include "rx_spectrum.h"
 #include <Adafruit_TinyUSB.h>
@@ -27,9 +28,11 @@ static void startReceiver()
     // Запускаем ADC/DMA перед DSP.
     rx_capture_start();
 
-    // Последним запускаем DSP на Core 1.
-    // NCO в rx_dsp компенсирует ПЧ-сдвиг ~+7.4 кГц
-    rx_dsp_start((float)RX_FREQ_HZ);
+    // Последним запускаем DSP на Core 1.  
+    // NCO в rx_dsp компенсирует ПЧ-сдвиг ~+7.4 кГц  
+    rx_dsp_start((float)RX_FREQ_HZ);  
+  
+    rx_tones_init(rx_dsp_fs_out());   // банк Гёрцеля: Fs=1953 -> ~500 каналов, шаг ~3.9 Гц  
 
     Serial.printf("# RX_STARTED,target_hz=%lu,lo_actual_hz=%lu,fs_out_hz=%.2f\n",
                   (unsigned long)RX_FREQ_HZ,
