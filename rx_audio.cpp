@@ -21,7 +21,73 @@ static inline float lp_filter(float x) {
 // ---- NBFM demod + AGC ----  
 static int32_t prev_i = 0, prev_q = 0;  
 static float agc_peak = 4096.0f;  
+
+// ---- Режим демодулятора ----  
+#define DEMOD_USB  0  
+#define DEMOD_LSB  1  
+#define DEMOD_AM   2  
+#define DEMOD_FM   3  
+#define DEMOD_CW   4
+
+#define DEMOD_MODE  DEMOD_USB      // выбор мода  
   
+// ---- Hilbert-FIR N=31 на Fs=15625 (коэффициенты считаются в init) ----  
+#define HILB_N    31  
+#define HILB_M    ((HILB_N-1)/2)   // 15 — задержка компенсации I-канала  
+  
+static float hilb_h[HILB_N];  
+static float hilb_buf[HILB_N];     // кольцевой буфер истории Q  
+static int   hilb_idx = 0;  
+static float i_del[HILB_N];    // линия задержки I  
+static int   i_del_idx = 0;  
+static float am_dc = 0;            // DC-блок для AM-огибающей  
+  
+static void hilb_init(void) {  
+    for (int k = 0; k < HILB_N; ++k) {  
+        int n = k - HILB_M;  
+        float h = 0.0f;  
+        if ((n & 1) != 0)                      // только нечётные отсчёты от центра  
+            h = 2.0f / (3.14159265f * n);  
+        float w = 0.54f - 0.46f * cosf(6.2831853f * k / (HILB_N - 1));  // Hamming  
+        hilb_h[k] = h * w;  
+    }  
+}  
+  
+// Подаём входную пару I/Q (Fs=15625), возвращаем демодулированный НЧ-отсчёт  
+static inline float demod_sample(int32_t i, int32_t q) {  
+// задержка I на (N-1)/2 = 15 отсчётов (компенсация групповой задержки Hilbert)  
+        i_del[i_del_idx] = (float)i;  
+        i_del_idx = (i_del_idx + 1) % HILB_M;  
+        float i_d = i_del[i_del_idx];
+  
+    // Q через Hilbert-FIR  
+    hilb_buf[hilb_idx] = (float)q;  
+    hilb_idx = (hilb_idx + 1) % HILB_N;  
+    float hq = 0.0f;  
+    for (int k = 0; k < HILB_N; ++k)  
+        hq += hilb_h[k] * hilb_buf[(hilb_idx + k) % HILB_N];  
+  
+    float dem;  
+    switch (DEMOD_MODE) {  
+        case DEMOD_USB: dem = i_d - hq; break; // верхняя боковая  
+        case DEMOD_LSB: dem = i_d + hq; break; // нижняя  
+        case DEMOD_CW:  dem = i_d - hq; break; // CW = узкая USB (фильтр сузить при желании)  
+        case DEMOD_AM: {  
+            float env = sqrtf((float)i * i + (float)q * q);  
+            am_dc += (env - am_dc) * 0.001f;   // медленный DC-блок  
+            dem = env - am_dc;  
+            break;  
+        }  
+        default: { // DEMOD_FM — как было  
+            int32_t d = i * prev_q - q * prev_i;  
+            prev_i = i; prev_q = q;  
+            dem = (float)(d >> 8);  
+            break;  
+        }  
+    }  
+    return dem;  
+}
+
 static inline int16_t agc_limit(float x) {  
     float ax = fabsf(x);  
     if (ax > agc_peak) agc_peak += (ax - agc_peak) * 0.0625f;  
@@ -38,7 +104,11 @@ static const int16_t* bi = nullptr;
 static const int16_t* bq = nullptr;  
 static uint8_t cur_n = 0, pos = 0;  
 static uint32_t acc = 0;  
-static float rs_prev = 0, cur = 0;  
+static float rs_prev = 0, cur = 0;
+// USB BFO: частота биений — переносит верхнюю боковую в аудио  
+#define USB_BFO_HZ  1400.0f  
+static uint32_t bfo_ph = 0;  
+static const uint32_t BFO_STEP = (uint32_t)(((uint64_t)USB_BFO_HZ * 4294967296.0) / 15625.0);
   
 #define TEST_SINE   0   // 1 = тестовый ТОН (работает внутри SDR), 0 = ДЕМОДУЛЯТОР ЭФИРА  
   
@@ -64,12 +134,9 @@ static bool next_sample(int16_t* out) {
             }  
             int32_t i = bi[pos], q = bq[pos];  
             pos++;  
-            // int32_t d = i * prev_q - q * prev_i;  
-            // prev_i = i; prev_q = q;  
             rs_prev = cur;  
-            // cur = lp_filter((float)(d >> 8));
-            cur = lp_filter((float)i * 4.0f);
-        }  
+            cur = lp_filter(demod_sample(i, q));  
+        }
         // выдать один выходной отсчёт, линейная интерполяция  
         float frac = (float)acc / 44100.0f;          // позиция между rs_prev и cur  
         float y = rs_prev + (cur - rs_prev) * frac;  
@@ -114,7 +181,8 @@ void rx_audio_init(void) {
     auto cfg = usb_out.defaultConfig(TX_MODE);  
     cfg.sample_rate     = 44100;  
     cfg.channels        = 2;  
-    cfg.bits_per_sample = 16;  
+    cfg.bits_per_sample = 16;
+    hilb_init();
     usb_out.begin(cfg);  
 
     // Запускаем аппаратный таймер на интервал 2000 микросекунд (2 мс)
