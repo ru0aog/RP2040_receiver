@@ -44,6 +44,7 @@ static void startReceiver()
 
 void setup()
 {
+    rx_audio_init();
     Serial.begin(SERIAL_BAUD);
   // ожидание коннекта - до 5 сек
   uint32_t timeout = millis();
@@ -58,7 +59,6 @@ void setup()
     // pll_usb (48 МГц) не трогаем: ADC и USB работают как раньше.  
     set_sys_clock_pll(1164UL * 1000 * 1000, 3, 3);
     rx_spectrum_init();
-    rx_audio_init();
     startReceiver();
 }
 

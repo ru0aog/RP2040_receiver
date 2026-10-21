@@ -51,13 +51,16 @@ public:
     }  
   
     int peek() override { return -1; }  
-  
+
+int available() override { return 512; }
+/*
     int available() override {  
         // байт доступен, если есть недочитанный PCM или очередь базбенда не пуста  
         if (pcm_pos < pcm_len) return pcm_len - pcm_pos;  
         const int16_t *i, *q; uint8_t n;  
         return rx_dsp_get_audio(&i, &q, &n) ? 512 : 0;  
-    }  
+    }
+*/
   
     size_t write(uint8_t) override { return 1; }  
   
@@ -83,7 +86,16 @@ private:
         *b = ((const uint8_t*)&pcm_sample)[pcm_pos++];  
         return true;  
     }  
-  
+
+
+bool fillSample() {  
+    static uint32_t phase = 0;  
+    phase += (uint32_t)(((uint64_t)440 << 32) / 16000);  
+    pcm_sample = (int16_t)(12000.0f * sinf(6.2831853f * (phase >> 24) / 256.0f));  
+    pcm_len = 2;  
+    return true;  
+}
+/*
     bool fillSample() {  
         for (;;) {  
             if (pos >= cur_n) {  
@@ -110,7 +122,9 @@ private:
             }  
             rs_prev = cur;  
         }  
-    }  
+    }
+
+    */
   
     const int16_t* bi = nullptr;  
     const int16_t* bq = nullptr;  
