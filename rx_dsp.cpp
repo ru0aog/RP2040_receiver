@@ -153,6 +153,17 @@ static volatile uint32_t out_dropped = 0;           // диагностика п
 static int32_t dc_i = 2048 << 8;
 static int32_t dc_q = 2048 << 8;
 
+// ---- Аудио-базбенд: I/Q с выхода CIC (15.625 ksps), до HB-каскадов ----  
+#define RX_AUD_SAMPLES   64        // пар I/Q в слоте  
+#define RX_AUD_BUFS      8  
+  
+static int16_t aud_i[RX_AUD_BUFS][RX_AUD_SAMPLES];  
+static int16_t aud_q[RX_AUD_BUFS][RX_AUD_SAMPLES];  
+static volatile uint8_t  aud_head = 0;   // пишет только core1  
+static volatile uint8_t  aud_tail = 0;   // читает только core0  
+static volatile uint32_t aud_dropped = 0;  
+static uint8_t aud_wr_n = 0;             // заполнение текущего слота
+
 // бесконечный изолированный рабочий цикл ядра Core 1
 // цифровой преобразователь частоты вниз (DDC — Digital Down Converter)
 static void __not_in_flash_func(rx_dsp_entry)(void) {  
@@ -210,7 +221,24 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
             // четырёхкаскадная Half-Band фильтрация и децимация
             // CIC /8 → 2 каскада HB /4 (итого /32)  
             int32_t ci, cq;  
-            bool emit = cic_push_iq(i_rot, q_rot, &ci, &cq);  
+            bool emit = cic_push_iq(i_rot, q_rot, &ci, &cq);
+
+            // отвод аудио-базбенда на частоте CIC (15.625 ksps)  
+            if (emit) {  
+                uint8_t anext = (uint8_t)((aud_head + 1) % RX_AUD_BUFS);  
+                if (anext != aud_tail) {  
+                    aud_i[aud_head][aud_wr_n] = sat16(ci);  
+                    aud_q[aud_head][aud_wr_n] = sat16(cq);  
+                    if (++aud_wr_n >= RX_AUD_SAMPLES) {  
+                        __dmb();  
+                        aud_head = anext;  
+                        aud_wr_n = 0;  
+                    }  
+                } else {  
+                    aud_dropped++;  
+                }  
+            }
+
             int32_t vi = ci, vq = cq;  
   
             if (emit) {
@@ -290,6 +318,10 @@ void rx_dsp_start(float f_target_hz) {
     memset(out_i, 0, sizeof(out_i));
     memset(out_q, 0, sizeof(out_q));
     out_head = out_tail = 0;
+
+    aud_head = aud_tail = aud_wr_n = 0;  
+    aud_dropped = 0;
+
     memset(cic_int_i, 0, sizeof(cic_int_i));  
     memset(cic_int_q, 0, sizeof(cic_int_q));  
     memset(cic_comb_i, 0, sizeof(cic_comb_i));  
@@ -394,6 +426,28 @@ void rx_dsp_stop(void) {
     out_head = out_tail = 0;
     out_dropped = 0;
 }
+
+// ---- Аудио-базбенд: читатель core0 ----  
+bool rx_dsp_get_audio(const int16_t** i, const int16_t** q, uint8_t* n) {  
+    uint8_t tail = aud_tail;  
+    if (tail == aud_head) return false;  
+    __dmb();  
+    *i = aud_i[tail];  
+    *q = aud_q[tail];  
+    *n = RX_AUD_SAMPLES;  
+    return true;  
+}  
+  
+void rx_dsp_release_audio(void) {  
+    __dmb();  
+    aud_tail = (uint8_t)((aud_tail + 1) % RX_AUD_BUFS);  
+}  
+  
+float rx_dsp_audio_fs(void) {  
+    return RX_FS_IN_HZ / (float)CIC_R;   // 15625.0 Гц  
+}
+
+
 
 
 

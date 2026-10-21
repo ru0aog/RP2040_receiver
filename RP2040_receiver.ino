@@ -6,6 +6,7 @@
 #include "rx_tones.h"
 #include "vfo_hardware.h"
 #include "rx_spectrum.h"
+#include "rx_audio.h"
 #include <Adafruit_TinyUSB.h>
 
 static constexpr uint32_t RX_FREQ_HZ = 3600000UL;
@@ -56,12 +57,14 @@ void setup()
     // квадратурного LO для 3.6 МГц выходит целым (D=9), джиттера нет.  
     // pll_usb (48 МГц) не трогаем: ADC и USB работают как раньше.  
     set_sys_clock_pll(1164UL * 1000 * 1000, 3, 3);
-    rx_spectrum_init();   // до startReceiver() 
+    rx_spectrum_init();
+    rx_audio_init();
     startReceiver();
 }
 
 void loop() {
-    FFT_to_COM();
+    rx_audio_poll();  
+    //FFT_to_COM();
 }
 
 

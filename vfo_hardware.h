@@ -50,6 +50,10 @@ bool  rx_dsp_get_output(const int16_t** i, const int16_t** q, uint8_t* n);
 void  rx_dsp_release_output(void);  
 float rx_dsp_fs_out(void);
 
+bool  rx_dsp_get_audio(const int16_t** i, const int16_t** q, uint8_t* n);  
+void  rx_dsp_release_audio(void);  
+float rx_dsp_audio_fs(void);
+
 void     vfo_quadrature_start(uint32_t freq_hz);  
 void     vfo_quadrature_stop(uint32_t freq_hz, double step_hz);  
 uint32_t vfo_quadrature_lo_hz(void);   // фактическая квантованная частота LO (для NCO)
