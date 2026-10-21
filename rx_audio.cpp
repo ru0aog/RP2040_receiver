@@ -47,7 +47,7 @@ static bool next_sample(int16_t* out) {
 #if TEST_SINE  
     static uint32_t ph = 0;  
     // Генерируем синус 440 Гц, но пересчитанный под частоту шага 44100 Гц!
-    ph += (uint32_t)(((uint64_t)440 << 32) / 44100);  
+    ph += (uint32_t)(((uint64_t)1000 << 32) / 44100);  
     *out = (int16_t)(10000.0f * sinf(6.2831853f * (ph >> 24) / 256.0f));  
     return true;  
 #else  
@@ -84,38 +84,24 @@ static USBAudioStream usb_out;
 static struct repeating_timer audio_timer;
 
 // Буфер для отправки одного ровного стерео-пакета
-static int16_t pcm_buffer[128];  
+static int16_t pcm_buffer[192 * 2];   // до 192 стерео-фреймов
 
 // Аппаратный колбек таймера — вызывается строго каждые 2 миллисекунды
-bool __not_in_flash_func(audio_timer_callback)(struct repeating_timer *t) {
-    int avail_bytes = usb_out.availableForWrite();  
-    int avail_samples = avail_bytes / 4; // Стерео отсчет = 4 байта
-
-    // Каждые 2 мс для частоты 44100 Гц нам нужно выдать ~88 Стерео-отсчетов.
-    // Выдаем фиксированную пачку по 64 отсчета (128 значений int16), если в USB есть место
-    if (avail_samples >= 64) {
-        int idx = 0;
-        while (idx < 64) {
-            int16_t mono_sample = 0;
-            if (!next_sample(&mono_sample)) {
-                break;
-            }
-            // Превращаем моно в стерео для ПК
-            pcm_buffer[idx++] = mono_sample; // Левый канал
-            pcm_buffer[idx++] = mono_sample; // Правый канал
-        }
-        
-        if (idx > 0) {
-            usb_out.write((uint8_t*)pcm_buffer, idx * 2);
-        }
-    } else {
-        // Если USB буфер полон, всё равно продвигаем генерацию "вхолостую" для стабильности
-        int16_t dummy;
-        for (int i = 0; i < 32; i++) {
-            next_sample(&dummy);
-        }
-    }
-    return true; // Продолжать работу таймера
+bool __not_in_flash_func(audio_timer_callback)(struct repeating_timer *t) {  
+    int avail_frames = usb_out.availableForWrite() / 4;  
+    if (avail_frames <= 0) return true;  
+  
+    if (avail_frames > 192) avail_frames = 192;  
+  
+    int frames = 0;  
+    int16_t s;  
+    while (frames < avail_frames && next_sample(&s)) {  
+        pcm_buffer[frames * 2]     = s;  
+        pcm_buffer[frames * 2 + 1] = s;  
+        frames++;  
+    }  
+    if (frames) usb_out.write((uint8_t*)pcm_buffer, frames * 4);  
+    return true;  
 }
 
 void rx_audio_init(void) {  
