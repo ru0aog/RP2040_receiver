@@ -29,21 +29,33 @@
 ```mermaid  
 flowchart TD  
     subgraph Core1["Core 1 — Реал-тайм DSP тракт"]  
-        ADC["ADC + DMA<br/>(ping-pong ~250 ksps)"] --> DC["DC-remove фильтр<br/>(EMA)"]  
-        DC --> NCO["NCO комплексный сдвиг<br/>ПЧ ~+7.4 кГц"]  
-        NCO --> CIC["CIC Фильтр<br/>(Децимация /2)"]  
-        CIC --> HB["2 × Half-band FIR<br/>фильтра"]  
-        HB --> Q["SPSC-очередь<br/>(Поток 15.625 ksps)"]  
+        ADC["ADC + DMA<br/>(ping-pong ~250 ksps)"]  
+        DC["DC-remove фильтр<br/>(EMA)"]  
+        NCO["NCO комплексный сдвиг<br/>ПЧ ~+7.4 кГц"]  
+        CIC["CIC Фильтр<br/>(Децимация /2)"]  
+        HB["2 × Half-band FIR<br/>фильтра"]  
+        Q1["SPSC-очередь<br/>(Поток 15.625 ksps)"]  
+
+        ADC --> DC  
+        DC --> NCO  
+        NCO --> CIC  
+        CIC --> HB  
+        HB --> Q1  
     end  
 
     subgraph Core0["Core 0 — Arduino & Вывод данных"]  
-        Q --> DEC["Декодеры мод<br/>(CW / RTTY / Olivia / MFSK)"]  
-        Q --> FFT["1024-FFT спектр<br/>→ Вывод в Serial"]  
-        Q --> AF["NBFM + AGC + SRC<br/>→ USB Audio (TinyUSB)"]  
+        DEC["Декодеры мод<br/>(CW / RTTY / Olivia / MFSK)"]  
+        FFT["1024-FFT спектр<br/>→ Вывод в Serial"]  
+        AF["NBFM + AGC + SRC<br/>→ USB Audio (TinyUSB)"]  
     end  
+
+    Q1 --> DEC  
+    Q1 --> FFT  
+    Q1 --> AF  
 
     LO["Квадратурный LO<br/>(clk_sys делитель D=9)"] --> ADC
 ```
+
 
 ---
 
