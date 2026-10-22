@@ -49,6 +49,11 @@ void  rx_dsp_set_nco_hz(float f_hz);        // AFC
 bool  rx_dsp_get_output(const int16_t** i, const int16_t** q, uint8_t* n);  
 void  rx_dsp_release_output(void);  
 float rx_dsp_fs_out(void);
+  
+// Перестройка приёмного тракта на лету (CAT/FLDigi):  
+// малая отстройка — сдвиг NCO, большая — полная переустановка LO.  
+void     rx_retune(uint32_t freq_hz);  
+uint32_t rx_current_hz(void);               // текущая частота приёма, Гц
 
 bool  rx_dsp_get_audio(const int16_t** i, const int16_t** q, uint8_t* n);  
 void  rx_dsp_release_audio(void);  
