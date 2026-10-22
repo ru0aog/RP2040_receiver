@@ -6,6 +6,8 @@
 #include "rx_audio.h"  
 #include "AudioTools.h"  
 #include "AudioTools/Communication/USB/USBAudioStream.h"  
+
+#define DEMOD_MODE DEMOD_USB  
   
 // Входная частота аудиоветви DSP: 15625 Гц.  
 // Выход USB-аудио: 44100 Гц, stereo, signed 16-bit PCM.  
@@ -93,8 +95,6 @@ static int32_t prev_q = 0;
 #define DEMOD_FM   3  
 #define DEMOD_CW   4  
   
-#define DEMOD_MODE DEMOD_USB  
-  
 // ---- Hilbert FIR: 31 taps, Fs=15625 Гц ----  
 #define HILB_N 31  
 #define HILB_M ((HILB_N - 1) / 2)  // 15 отсчётов групповой задержки  
@@ -109,14 +109,14 @@ static int i_del_idx = 0;
   
 static float am_dc = 0.0f;  
   
-// Заранее рассчитанные коэффициенты Hilbert FIR (31 taps, Hamming window)  
-// Сдвиг фазы строго нормирован. Четные отсчеты равны 0.  
+// Hilbert FIR, 31 taps, Fs=15625, окно Хэмминга, усиление полосы ~1.0.  
+// Антисимметричный, центр (idx 15) = 0, максимум на смещении ±1 (idx 14/16).  
 static const float hilb_h[HILB_N] = {  
-    -0.0053f,  0.0f, -0.0176f,  0.0f, -0.0423f,  0.0f, -0.0864f,  0.0f,  
-    -0.1652f,  0.0f, -0.3401f,  0.0f, -0.9531f,  0.0f,  0.0000f,  0.0f,  
-     0.9531f,  0.0f,  0.3401f,  0.0f,  0.1652f,  0.0f,  0.0864f,  0.0f,  
-     0.0423f,  0.0f,  0.0176f,  0.0f,  0.0053f,  0.0f,  0.0053f  
-};  
+    -0.00340f, 0.0f, -0.00588f, 0.0f, -0.01340f, 0.0f, -0.02820f, 0.0f,  
+    -0.05350f, 0.0f, -0.09800f, 0.0f, -0.19350f, 0.0f, -0.63030f, 0.0f,  
+     0.63030f, 0.0f,  0.19350f, 0.0f,  0.09800f, 0.0f,  0.05350f, 0.0f,  
+     0.02820f, 0.0f,  0.01340f, 0.0f,  0.00588f, 0.0f,  0.00340f  
+};
   
 // Функция инициализации теперь просто очищает буферы  
 static void hilb_init(void) {  
@@ -152,10 +152,11 @@ static inline float demod_sample(int32_t i, int32_t q) {
     float dem = 0.0f;  
   
     switch (DEMOD_MODE) {  
-        case DEMOD_USB:  
+        case DEMOD_USB:
+            dem = i_d - hq;   // фазовый метод: верхняя боковая 
             // USB = I_delayed - H(Q)  
             //dem = i_d - hq;  
-            dem = i;  
+            // dem = i;  
             break;  
   
         case DEMOD_LSB:  

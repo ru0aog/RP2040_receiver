@@ -22,16 +22,22 @@ static uint8_t cat_len = 0;
 // Для сброса мусорного байта при открытии порта терминалом.  
 static bool cat_prev_dtr = false;  
   
-// Режим Kenwood: 6 = FSK (RTTY). Используется только в ответе IF.  
-static const char CAT_MODE = '6';  
+// Изменяем режим Kenwood: '2' = USB (стандарт для цифровых видов во FLDigi)
+static const char CAT_MODE = '2'; 
   
 // ---- Ответы ------------------------------------------------------------------  
   
-static void cat_send(const char* s) {  
-    Serial.printf("# CAT_TX <%s>\n", s);   // DEBUG: что мы ответили, убрать после отладки  
+static void cat_send(const char* s) {
+    Serial.printf("# CAT_TX <%s>\n", s);
+
+    for (size_t i = 0; i < strlen(s); i++) {
+        Serial.printf("%02X ", (uint8_t)s[i]);
+    }
+    Serial.println();
+
     CatSerial.write((const uint8_t*)s, strlen(s));
-    CatSerial.flush();   // не держать ответ в USB-буфере (таймаут FLDigi ~50 мс)  
-}  
+    CatSerial.flush();
+}
   
 // FA + 11 цифр частоты + ';'  
 static void cat_reply_fa(void) {  
@@ -63,14 +69,31 @@ static void cat_reply_fa(void) {
 //   поз 35-36 P14 tone №           "00"  
 //   поз 37    P15 shift            "0"  
 //   поз 38    ";"  
-static void cat_reply_if(void) {  
-    char out[40];  
-    snprintf(out, sizeof(out),  
-             "IF%011lu0000+00000000000%c0000000;",  
-             (unsigned long)rx_current_hz(),  
-             CAT_MODE);  
-    cat_send(out);   // тело строго 38 байт, без пробелов  
+static void cat_reply_if(void) {
+    char out_buf[48];
+    
+    // Добавлен ровно ОДИН ноль в конец перед точкой с запятой.
+    // Теперь строка содержит строго 38 символов.
+    // Позиция моды '2' осталась на правильном 30-м месте.
+    snprintf(out_buf, sizeof(out_buf), "IF00000000000       -00300   20000000;");
+    
+    // Накладываем частоту поверх нулей шаблона (индексы 2..12)
+    uint32_t temp_freq = rx_current_hz(); 
+    for (int i = 12; i >= 2; i--) {
+        out_buf[i] = '0' + (temp_freq % 10);
+        temp_freq /= 10;
+    }
+    
+    cat_send(out_buf);
 }
+
+
+
+
+
+
+
+
   
 static void cat_reply_id(void) {  
     cat_send("ID019;");   // 019 = Kenwood TS-2000  
@@ -86,32 +109,32 @@ static void cat_execute(const char* cmd) {
     size_t n = strlen(cmd);  
     if (n < 2) { cat_reply_err(); return; }  
   
-    // FA — частота VFO A  
+    // FA — управление частотой
     if (cmd[0] == 'F' && cmd[1] == 'A') {  
-        if (n == 2) {               // "FA" — чтение  
-            cat_reply_fa();  
-        } else if (n == 13) {       // "FA" + 11 цифр — установка  
-            bool digits = true;  
-            for (int i = 2; i < 13; i++)  
-                if (cmd[i] < '0' || cmd[i] > '9') { digits = false; break; }  
-            if (!digits) { cat_reply_err(); return; }  
+        if (n == 2) { cat_reply_fa(); } 
+        else if (n == 13) {  
             uint32_t hz = (uint32_t)strtoul(cmd + 2, nullptr, 10);  
-            rx_retune(hz);          // set-FA ответа не требует  
-        } else {  
-            cat_reply_err();  
-        }  
+            rx_retune(hz);  
+        } else { cat_reply_err(); }  
         return;  
     }  
   
-    // IF — статусная строка (FLDigi опрашивает ею частоту)  
+    // IF — запрос статуса
     if (cmd[0] == 'I' && cmd[1] == 'F' && n == 2) { cat_reply_if(); return; }  
   
-    // ID — идентификация  
+    // ID — идентификация
     if (cmd[0] == 'I' && cmd[1] == 'D' && n == 2) { cat_reply_id(); return; }  
+
+    // ЗАГЛУШКА ДЛЯ TS-480 PTT: 
+    // FLDigi при старте шлет "TX1;" для переключения на передачу. 
+    // Нам нужно просто проигнорировать этот запрос (ничего не отвечать), чтобы порт не падал.
+    if (cmd[0] == 'T' && cmd[1] == 'X' && cmd[2] == '1' && n == 3) { return; }
+    if (cmd[0] == 'R' && cmd[1] == 'X' && n == 2) { return; }
   
-    // Неизвестная команда  
+    // На все остальные неизвестные команды шлем ошибку
     cat_reply_err();  
-}  
+}
+
   
 // ---- Публичный API -----------------------------------------------------------  
   
