@@ -7,7 +7,7 @@
 #include "AudioTools.h"  
 #include "AudioTools/Communication/USB/USBAudioStream.h"  
 
-#define DEMOD_MODE DEMOD_USB  
+#define DEMOD_MODE DEMOD_CW  
   
 // Входная частота аудиоветви DSP: 15625 Гц.  
 // Выход USB-аудио: 44100 Гц, stereo, signed 16-bit PCM.  
@@ -166,7 +166,7 @@ static inline float demod_sample(int32_t i, int32_t q) {
   
         case DEMOD_CW:  
             // Для CW обычно используют USB или LSB (например, USB)  
-            dem = i_d - hq;   
+            dem = i;  
             break;  
   
         case DEMOD_AM: {  
@@ -201,14 +201,15 @@ static inline int16_t agc_limit(float x) {
   
     // Детектор пиков (атака и спад)  
     if (ax > agc_peak) {  
-        agc_peak += (ax - agc_peak) * 0.0625f;  
+        // agc_peak += (ax - agc_peak) * 0.0625f;  
+        agc_peak += (ax - agc_peak) * 0.01f; 
     } else {  
         agc_peak += (ax - agc_peak) * 0.0002f;  
     }  
     // Защита от разгона усиления в паузах (минимальный порог)  
     // Поднимите выше 2048.0f, если тихие звуки всё ещё слишком сильно усиливаются  
-    if (agc_peak < 256.0f) {  // 256.0f  максимальное усиление 96 крат  
-        agc_peak = 256.0f;    // 2048.0f максимальное усиление 12 крат  
+    if (agc_peak < 2048.0f) {  // 256.0f  максимальное усиление 96 крат  
+        agc_peak = 2048.0f;    // 2048.0f максимальное усиление 12 крат  
     }  
     float g = x * 24576.0f / agc_peak;  // потолок усиления 24576.0f = -2,5 дБ  
     // Жесткий лимитер на крайний случай  
@@ -264,8 +265,8 @@ static bool get_demod_input(float* out) {
     const int32_t q = bq[pos];  
     ++pos;  
   
-    *out = lp_filter(demod_sample(i, q));  
-    //*out = demod_sample(i, q);// LPF обойдён: сырой выход демодулятора  
+    //*out = lp_filter(demod_sample(i, q));  
+    *out = demod_sample(i, q);// LPF обойдён: сырой выход демодулятора  
     return true;  
 }  
   
@@ -448,13 +449,13 @@ static bool next_frame(int16_t* l, int16_t* r) {
         rs_advance_pending = true;  
     }  
   
-    // включаем АРУ (требуется усиление +20 дБ для выравнивания с АЦП)  
+// включаем АРУ (требуется усиление +20 дБ для выравнивания с АЦП)  
     const int16_t s = agc_limit(y);  
     //const int16_t s = agc_limit(RxAudioPostFilter::process(y));  
     //const int16_t s = (int16_t)RxAudioPostFilter::process(y);  
     *l = s;  
     *r = s;  
-    return true;  
+    return true;
 #endif  
 }  
   
