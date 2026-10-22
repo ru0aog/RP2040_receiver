@@ -1,9 +1,10 @@
 // ============================================================================  
-// rx_rtty.cpp — декодер RTTY-45 (45.45 бод, shift ~170 Гц, Baudot)  
-// Вход: кадры мощностей банка rx_tones (кадр 9 отсчётов = 4.6 мс ≈ 1/5 бита).  
-// Бодовая синхронизация (PLL): бит = SUBS кадров, решение — majority vote  
-// по кадрам в центре бита; фронт mark/space сдвигает фазу.  
-// Автопоиск пары тонов: разнос 140..200 Гц, оба >= медиана + 10 дБ.  
+// rx_rtty.cpp — декодер RTTY-45 (45.45 бод, shift ~170 Гц, Baudot/ITA2)  
+// Вход: кадры мощностей mark/space из rx_mf (~5 кадров на бит).  
+// Бит-автомат портирован из FLDigi (rtty.cxx): свободно идущий счётчик  
+// символов + конечный автомат IDLE→START→DATA→STOP с проверкой стоп-бита.  
+// Решение уровня кадра: lvl = (pm > ps). Детекция присутствия сигнала —  
+// по плавающему опорному пику ref_peak и порогу thr = ref_peak/4.  
 // ============================================================================  
   
 #include <Arduino.h>  
@@ -11,34 +12,34 @@
 #include "rx_rtty.h"  
   
 // ---------- параметры ----------  
-#define LOCK_SNR_DB   10.0f   // оба тона должны быть выше медианы  
-#define SHIFT_MIN_HZ  140.0f  
-#define SHIFT_MAX_HZ  200.0f  
+#define RTTY_BITS      5          // информационных бит ITA2  
+#define SUBS_PER_BIT   5.0f       // кадров на бит (как frame_div в rx_mf)  
   
-// Бодовая сетка: бит 45.45 бод = 22.02 мс; кадр = 9 отсчётов @1953.125 Гц  
-// 5 кадров = 45 отсчётов = 23.04 мс (ошибка ~4.6%/бит гасится PLL по фронтам).  
-#define SUBS        5     // кадров на бит  
-#define CENTER_LO   2     // majority vote по кадрам 2..3 (центр бита)  
-#define CENTER_HI   3  
+// Детекция присутствия сигнала по опорному пику.  
+#define MF_MIN_PEAK    1000.0f    // абсолютный порог «есть сигнал»  
+#define MF_THR_FRAC    0.25f      // порог = ref_peak * этой доли  
+#define MF_ATTACK      0.25f      // быстрый подъём опорного пика  
+#define MF_DECAY       0.01f      // медленный спад  
   
-// watchdog потери сигнала: оба тона < med*4 непрерывно ~1 с -> разлочка  
-#define LOST_FRAMES 220  
+// Диагностика в Serial (0 = выкл). На Core 1 Serial блокирующий —  
+// держите делитель большим и выключайте после отладки.  
+#define MF_DIAG        1  
+#define MF_DIAG_DIV    256  
   
-// mark/space-каналы: -1 = не залочены  
-static int ch_mark  = -1;  
-static int ch_space = -1;  
+// ---------- состояние автомата ----------  
+enum rx_state_t { RX_IDLE, RX_START, RX_DATA, RX_STOP };  
+static rx_state_t rxstate   = RX_IDLE;  
+static float      symbollen = SUBS_PER_BIT;   // длина бита в кадрах  
+static float      counter   = 0.0f;           // счётчик до следующей точки решения  
+static int        bitcntr   = 0;              // индекс принятого бита (0..RTTY_BITS-1)  
+static uint8_t    rxdata    = 0;              // накопленные биты (LSB-first)  
   
-// ---------- бодовый автомат ----------  
-static int  bit_phase  = 0;    // кадр внутри текущего бита (0..SUBS-1)  
-static int  mid_votes  = 0;    // mark-голоса в центре бита  
-static int  mid_count  = 0;  
-static bool cur_bit    = true; // оценка текущего бита (по фронту)  
-static bool prev_level = true; // уровень предыдущего кадра (для поиска фронтов)  
+// ---------- детекция сигнала ----------  
+static float ref_peak = 0.0f;  
+static bool  present  = false;  
   
-// ---------- сборка символа ----------  
-static uint8_t bit_frame  = 0;  // принятые биты (LSB-first)  
-static uint8_t bit_cnt    = 0;  // 0 = ждём старт; 1..5 = данные; >=6 = стоп  
-static uint8_t shift_ltrs = 1;  // 1 = LTRS, 0 = FIGS  
+// ---------- сборка символа / сдвиг ----------  
+static uint8_t shift_ltrs = 1;   // 1 = LTRS, 0 = FIGS  
   
 // Бодо по ITA2. Индекс 27 = FIGS-сдвиг, 31 = LTRS-сдвиг (обрабатываются отдельно).  
 static const char bodo_ltrs[32] = {  
@@ -50,9 +51,6 @@ static const char bodo_figs[32] = {
     '5','"',')','2','#','6','0','1','9','?','&', 27,'.','/',';', 31  
 };  
   
-static void rtty_reset_char(void) { bit_frame = 0; bit_cnt = 0; }  
-static void rtty_reset_pll(void)  { bit_phase = 0; mid_votes = 0; mid_count = 0; }  
-  
 static void rtty_emit(uint8_t code) {  
     code &= 31;  
     if (code == 27) { shift_ltrs = 0; return; }   // FIGS  
@@ -61,97 +59,90 @@ static void rtty_emit(uint8_t code) {
     if (c && c != 27 && c != 31) Serial.write(c);  
 }  
   
-// вызывается один раз на закрытый бит (bit: true = mark, false = space)  
-static void rtty_bit(bool bit) {  
-    if (bit_cnt == 0) {                      // ждём старт-бит (space)  
-        if (!bit) { bit_frame = 0; bit_cnt = 1; }  
-        return;  
-    }  
-    if (bit_cnt <= 5) {                      // 5 информационных бит, LSB first  
-        bit_frame |= (bit ? 1 : 0) << (bit_cnt - 1);  
-        bit_cnt++;  
-        return;  
-    }  
-    // стоп-бит: mark закрывает символ; длина не проверяется  
-    // (поддерживаются стопы 1 и 1.5 бита; дидл в mark просто ждёт space-фронта)  
-    if (bit) {  
-        rtty_emit(bit_frame);  
-        rtty_reset_char();  
-    } else {  
-        // сломанный стоп — ресинхронизация, ждём новый space-фронт  
-        rtty_reset_char();  
-        rtty_reset_pll();  
-    }  
+// ---------- инициализация ----------  
+// fs_hz не используется напрямую (счётчик в кадрах), но принимаем его,  
+// чтобы точка вызова (rx_mf_init) не зависела от внутренней единицы.  
+void rx_rtty_init(float fs_hz) {  
+    (void)fs_hz;  
+    rxstate   = RX_IDLE;  
+    symbollen = SUBS_PER_BIT;  
+    counter   = 0.0f;  
+    bitcntr   = 0;  
+    rxdata    = 0;  
+    ref_peak  = 0.0f;  
+    present   = false;  
+    shift_ltrs = 1;  
 }  
   
- 
-// ---------- кадр: уровни mark/space + бодовый PLL ----------  
-// Порог присутствия сигнала — от медленного EMA шумового пола (слабейший тон).  
-#define SNR_LIN   10.0f     // ~10 дБ над шумом  
-  
-#define MF_DIAG 1
-#define LOST_FRAMES 220      // ~1 c при ~226 кадр/с  
-static float ref_peak    = 1.0f;  
-static bool  sig_present = false;  
-static int lost_cnt = 0;  
-  
+// ---------- кадр: уровни mark/space ----------  
+// Вызывается один раз на кадр из rx_mf_sample (frame_div отсчётов на кадр).  
 void rx_rtty_frame_levels(float pm, float ps) {  
-    float stronger = (pm > ps) ? pm : ps;  
-    // пик по сильному тону: быстрый подъём, медленный спад  
-    if (stronger > ref_peak) ref_peak += (stronger - ref_peak) * 0.25f;  
-    else                     ref_peak += (stronger - ref_peak) * 0.001f;  
-    // присутствие: сильный тон в пределах ~6 дБ от пика и выше абс. пола  
-    float thr = ref_peak * 0.25f;  
-    bool present = (stronger > thr) && (ref_peak > 1.0e3f);  
+    // --- опорный пик и порог присутствия ---  
+    const float mx = (pm > ps) ? pm : ps;  
+    if (mx > ref_peak) ref_peak += MF_ATTACK * (mx - ref_peak);  
+    else               ref_peak += MF_DECAY  * (mx - ref_peak);  
+  
+    const float thr = ref_peak * MF_THR_FRAC;  
+    present = (ref_peak > MF_MIN_PEAK) && (mx > thr);  
+  
+    const bool bit = (pm > ps);   // true = mark(1), false = space(0)  
   
 #if MF_DIAG  
-    static uint16_t d = 0;  
-    if (++d >= 64) { d = 0;  
-        Serial.printf("#MF pm=%.0f ps=%.0f peak=%.0f thr=%.0f pres=%d lvl=%d\n",  
-                       (double)pm,(double)ps,(double)ref_peak,(double)thr,  
-                       present,(pm>ps));  
+    static uint32_t dbg = 0;  
+    if (++dbg >= MF_DIAG_DIV) {  
+        dbg = 0;  
+        Serial.printf("#MF pm=%ld ps=%ld peak=%ld thr=%ld pres=%d lvl=%d\n",  
+                      (long)pm, (long)ps, (long)ref_peak, (long)thr,  
+                      present, bit);  
     }  
 #endif  
   
-
+    // Нет сигнала -> держим автомат в покое.  
     if (!present) {  
-        // короткий провал не трогаем — сбрасываем автомат только  
-        // после длительного (≈1 с) отсутствия сигнала  
-        if (sig_present && ++lost_cnt >= LOST_FRAMES) {  
-            rtty_reset_char();  
-            rtty_reset_pll();  
-            sig_present = false;  
-            lost_cnt = 0;  
-            prev_level = true;  
+        rxstate = RX_IDLE;  
+        bitcntr = 0;  
+        rxdata  = 0;  
+        return;  
+    }  
+  
+    // --- бит-автомат (портирован из FLDigi rtty.cxx) ---  
+    switch (rxstate) {  
+  
+    case RX_IDLE:  
+        // ждём фронт mark->space (начало старт-бита)  
+        if (!bit) {  
+            rxstate = RX_START;  
+            counter = symbollen * 0.5f;   // идём к СЕРЕДИНЕ старт-бита  
         }  
-        return;                 // на провале просто ждём, фазу/символ храним  
-    }  
-    lost_cnt = 0;  
-    sig_present = true;
+        break;  
   
-    bool lvl = (pm > ps);                    // уровень этого кадра  
-  
-    // фронт -> сдвигаем фазу к фронту (PLL)  
-    if (lvl != prev_level) {  
-        if (mid_count > 0) {  
-            rtty_bit(mid_votes * 2 > mid_count);  
+    case RX_START:  
+        if ((counter -= 1.0f) <= 0.0f) {  
+            if (!bit) {                   // в центре всё ещё space -> валидный старт  
+                rxstate = RX_DATA;  
+                counter = symbollen;  
+                bitcntr = 0;  
+                rxdata  = 0;  
+            } else {  
+                rxstate = RX_IDLE;        // ложный старт (шумовой фронт)  
+            }  
         }  
-        bit_phase = 0; mid_votes = 0; mid_count = 0;  
-        cur_bit = lvl;  
-    }  
-    prev_level = lvl;  
+        break;  
   
-    // центр бита — majority vote  
-    if (bit_phase >= CENTER_LO && bit_phase <= CENTER_HI) {  
-        mid_votes += lvl ? 1 : 0;  
-        mid_count++;  
-    }  
+    case RX_DATA:  
+        if ((counter -= 1.0f) <= 0.0f) {  
+            rxdata |= (bit ? 1 : 0) << bitcntr;   // LSB-first  
+            bitcntr++;  
+            counter = symbollen;  
+            if (bitcntr >= RTTY_BITS) rxstate = RX_STOP;  
+        }  
+        break;  
   
-    if (++bit_phase >= SUBS) {  
-        bool bit = (mid_count > 0) ? (mid_votes * 2 > mid_count) : cur_bit;  
-        rtty_bit(bit);  
-        bit_phase = 0; mid_votes = 0; mid_count = 0;  
-        cur_bit = lvl;  
+    case RX_STOP:  
+        if ((counter -= 1.0f) <= 0.0f) {  
+            if (bit) rtty_emit(rxdata);   // стоп = mark -> символ валиден  
+            rxstate = RX_IDLE;  
+        }  
+        break;  
     }  
 }
-

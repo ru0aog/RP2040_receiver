@@ -43,7 +43,8 @@ void rx_mf_init(float fs, float center_hz, float shift_hz) {
     frame_div = (int)(fs_hz / RTTY_BAUD / (float)SUBS_PER_BIT + 0.5f);  
     if (frame_div < 1) frame_div = 1;  
     frame_cnt = 0;  
-}  
+    rx_rtty_init(fs_hz);          // автомат теперь тактируется каждым отсчётом  
+} 
   
 static inline float tone_push(tone_t* t, float xi, float xq) {  
     // снос в DC: y = x * osc  
@@ -75,12 +76,15 @@ void rx_mf_sample(int16_t xi, int16_t xq) {
     (void)xq;                 // одноканальный режим (как FLDigi): берём только I  
     float fi = (float)xi;  
     float pm = tone_push(&t_mark,  fi, 0.0f);  
-    float ps = tone_push(&t_space, fi, 0.0f);
+    float ps = tone_push(&t_space, fi, 0.0f);  
   
+    // Декодер тактируется КАЖДЫМ отсчётом (как FLDigi: счётчик по symbollen).  
+    rx_rtty_frame_levels(pm, ps);  
+  
+    // Ренормализация фазора — реже, раз в frame_div отсчётов.  
     if (++frame_cnt >= frame_div) {  
         frame_cnt = 0;  
         tone_renorm(&t_mark);  
         tone_renorm(&t_space);  
-        rx_rtty_frame_levels(pm, ps);  
     }  
 }
