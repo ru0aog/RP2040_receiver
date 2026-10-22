@@ -61,9 +61,29 @@ void rx_retune(uint32_t freq_hz)
     if (delta > -7000 && delta < 7000) {  
         // Остаёмся на том же LO, двигаем только цифровой гетеродин.  
         rx_dsp_set_nco_hz((float)freq_hz - (float)lo_hz);  
-        current_rx_hz = freq_hz;  
+        current_rx_hz = freq_hz;
+        
+        if (delta > -7000 && delta < 7000) {  
+            rx_dsp_set_nco_hz((float)freq_hz - (float)lo_hz);  
+            current_rx_hz = freq_hz;  
+            Serial.printf("# RX_NCO,target_hz=%lu,lo_hz=%lu,nco_hz=%ld\n",  
+                        (unsigned long)freq_hz, (unsigned long)lo_hz,  
+                        (long)freq_hz - (long)lo_hz);  
+        } else {  
+            rx_full_tune(freq_hz);  
+        }
     } else {  
-        rx_full_tune(freq_hz);  
+        rx_full_tune(freq_hz);
+
+        if (delta > -7000 && delta < 7000) {  
+            rx_dsp_set_nco_hz((float)freq_hz - (float)lo_hz);  
+            current_rx_hz = freq_hz;  
+            Serial.printf("# RX_NCO,target_hz=%lu,lo_hz=%lu,nco_hz=%ld\n",  
+                        (unsigned long)freq_hz, (unsigned long)lo_hz,  
+                        (long)freq_hz - (long)lo_hz);  
+        } else {  
+            rx_full_tune(freq_hz);  
+        }
     }  
 }  
   

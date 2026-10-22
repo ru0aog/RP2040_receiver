@@ -23,9 +23,9 @@
   
 // Диагностика в Serial (0 = выкл). На Core 1 Serial блокирующий —  
 // держите делитель большим и выключайте после отладки.  
-#define MF_DIAG        1  
+#define MF_DIAG        0  
 #define MF_DIAG_DIV    256  
-  
+ 
 // ---------- состояние автомата ----------  
 enum rx_state_t { RX_IDLE, RX_START, RX_DATA, RX_STOP };  
 static rx_state_t rxstate   = RX_IDLE;  
