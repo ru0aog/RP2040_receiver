@@ -72,9 +72,10 @@ static inline void tone_renorm(tone_t* t) {
 }  
   
 void rx_mf_sample(int16_t xi, int16_t xq) {  
-    float fi = (float)xi, fq = (float)xq;  
-    float pm = tone_push(&t_mark,  fi, fq);  
-    float ps = tone_push(&t_space, fi, fq);  
+    (void)xq;                 // одноканальный режим (как FLDigi): берём только I  
+    float fi = (float)xi;  
+    float pm = tone_push(&t_mark,  fi, 0.0f);  
+    float ps = tone_push(&t_space, fi, 0.0f);
   
     if (++frame_cnt >= frame_div) {  
         frame_cnt = 0;  
