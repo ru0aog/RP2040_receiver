@@ -7,6 +7,14 @@
 #include "AudioTools.h"  
 #include "AudioTools/Communication/USB/USBAudioStream.h"  
 
+  
+// ---- Демодулятор ----  
+#define DEMOD_USB  0  
+#define DEMOD_LSB  1  
+#define DEMOD_AM   2  
+#define DEMOD_FM   3  
+#define DEMOD_CW   4  
+
 #define DEMOD_MODE DEMOD_CW  
   
 // Фиксированное усиление сырых I/Q перед упаковкой в PCM.  
@@ -83,13 +91,6 @@ static inline float lp_filter(float x) {
 // ---- FM discriminator state ----  
 static int32_t prev_i = 0;  
 static int32_t prev_q = 0;  
-  
-// ---- Демодулятор ----  
-#define DEMOD_USB  0  
-#define DEMOD_LSB  1  
-#define DEMOD_AM   2  
-#define DEMOD_FM   3  
-#define DEMOD_CW   4  
   
 // ---- Hilbert FIR: 31 taps, Fs=15625 Гц ----  
 #define HILB_N 31  
