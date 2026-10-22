@@ -9,18 +9,14 @@
 
 #define DEMOD_MODE DEMOD_CW  
   
-// Входная частота аудиоветви DSP: 15625 Гц.  
-// Выход USB-аудио: 44100 Гц, stereo, signed 16-bit PCM.  
-  
-// ============================================================  
-// Режимы вывода (compile-time)  
-// ============================================================  
-#define TEST_SINE   0   // тестовый синус 1000 Гц в оба канала  
-// Тестовый режим: сырые I/Q в стерео (I=левый, Q=правый), без демодуляции,  
-// фильтров и АРУ. Для проверки NCO, DC-смещения ADC и дисбаланса квадратур.  
-#define RAW_IQ_OUT  0  
 // Фиксированное усиление сырых I/Q перед упаковкой в PCM.  
 #define RAW_IQ_GAIN 16  
+  
+// ---- Runtime-состояние режима вывода ----  
+// Стартовый режим — сырые I/Q (как раньше при RAW_IQ_OUT=1).  
+static volatile uint8_t rx_mode     = RX_MODE_RAW_IQ;  
+static volatile uint8_t demod_mode  = DEMOD_USB;   // боковая для RX_MODE_SSB  
+static volatile bool    mode_changed = false;      // запрос на сброс ресемплера
   
 /*  
 // ---- LPF Butterworth-подобный biquad, Fs=15625 Гц ----  
@@ -150,8 +146,8 @@ static inline float demod_sample(int32_t i, int32_t q) {
     }  
   
     float dem = 0.0f;  
-  
-    switch (DEMOD_MODE) {  
+
+    switch (demod_mode) {
         case DEMOD_USB:
             dem = i_d - hq;   // фазовый метод: верхняя боковая 
             // USB = I_delayed - H(Q)  
@@ -270,7 +266,6 @@ static bool get_demod_input(float* out) {
     return true;  
 }  
   
-#if RAW_IQ_OUT  
 // Забирает следующую пару I/Q без демодуляции и фильтрации.  
 // Та же логика освобождения блока, что и в get_demod_input.  
 static bool get_iq_input(float* i_out, float* q_out) {  
@@ -312,7 +307,7 @@ static bool get_iq_input(float* i_out, float* q_out) {
     ++pos;  
     return true;  
 }  
-#endif  
+
   
 // ---- Ресемплер 15625 -> 44100 Гц ----  
 // rs_phase — дробная позиция между rs_x0 и rs_x1, в единицах 1/44100.  
@@ -326,7 +321,7 @@ static bool rs_started = false;
 static uint8_t rs_init_count = 0;  
 static bool rs_advance_pending = false;  
   
-#if RAW_IQ_OUT  
+
 // Второй канал (Q) ресемплера. Фаза rs_phase общая для I и Q,  
 // чтобы каналы не разъехались во времени.  
 static float rs_q0 = 0.0f;  
@@ -338,103 +333,101 @@ static inline int16_t raw_iq_clip(float x) {
     if (g < -32768.0f) g = -32768.0f;  
     return (int16_t)g;  
 }  
-#endif  
-  
+
+
 static bool next_frame(int16_t* l, int16_t* r) {  
     if (l == nullptr || r == nullptr) {  
         return false;  
     }  
   
-#if TEST_SINE  
-    // Тестовый синус 1000 Гц при выходной частоте 44100 Гц.  
-    static uint32_t ph = 0;  
-    ph += (uint32_t)(((uint64_t)1000 << 32) / 44100);  
-    const float s = 10000.0f *  
-        sinf(6.2831853071795864769f * (float)(ph >> 24) / 256.0f);  
-    *l = (int16_t)s;  
-    *r = (int16_t)s;  
-    return true;  
+    // Запрос смены режима: сбрасываем ресемплер и отпускаем удерживаемый блок,  
+    // чтобы стерео(2 канала) и моно(1 канал) не перемешались в интерполяторе.  
+    if (mode_changed) {  
+        mode_changed      = false;  
+        rs_started        = false;  
+        rs_init_count     = 0;  
+        rs_advance_pending = false;  
+        rs_phase          = 0;  
+        if (cur_n != 0) {  
+            rx_dsp_release_audio();  
+            cur_n = 0;  
+            pos   = 0;  
+            bi    = nullptr;  
+            bq    = nullptr;  
+        }  
+        return false;   // один пустой кадр на переключении — несущественно  
+    }  
   
-#elif RAW_IQ_OUT  
-    // Сырые I/Q, общая фаза, линейная интерполяция 15625 -> 44100 на оба канала.  
+    if (rx_mode == RX_MODE_TEST) {  
+        // Тестовый синус 1000 Гц при выходной частоте 44100 Гц.  
+        static uint32_t ph = 0;  
+        ph += (uint32_t)(((uint64_t)1000 << 32) / 44100);  
+        const float s = 10000.0f *  
+            sinf(6.2831853071795864769f * (float)(ph >> 24) / 256.0f);  
+        *l = (int16_t)s;  
+        *r = (int16_t)s;  
+        return true;  
+    }  
+  
+    if (rx_mode == RX_MODE_RAW_IQ) {  
+        // Сырые I/Q, общая фаза, линейная интерполяция 15625 -> 44100 на оба канала.  
+        if (!rs_started) {  
+            if (rs_init_count == 0) {  
+                if (!get_iq_input(&rs_x0, &rs_q0)) return false;  
+                rs_init_count = 1;  
+            }  
+            if (rs_init_count == 1) {  
+                if (!get_iq_input(&rs_x1, &rs_q1)) return false;  
+                rs_init_count = 2;  
+            }  
+            rs_phase = 0;  
+            rs_advance_pending = false;  
+            rs_started = true;  
+        }  
+  
+        if (rs_advance_pending) {  
+            float next_i, next_q;  
+            if (!get_iq_input(&next_i, &next_q)) return false;  
+            rs_x0 = rs_x1;  
+            rs_x1 = next_i;  
+            rs_q0 = rs_q1;  
+            rs_q1 = next_q;  
+            rs_advance_pending = false;  
+        }  
+  
+        const float frac = (float)rs_phase / 44100.0f;  
+        const float yi = rs_x0 + (rs_x1 - rs_x0) * frac;  
+        const float yq = rs_q0 + (rs_q1 - rs_q0) * frac;  
+  
+        rs_phase += 15625;  
+        if (rs_phase >= 44100) {  
+            rs_phase -= 44100;  
+            rs_advance_pending = true;  
+        }  
+  
+        *l = raw_iq_clip(yi);  // I -> левый  
+        *r = raw_iq_clip(yq);  // Q -> правый  
+        return true;  
+    }  
+  
+    // RX_MODE_SSB: демодулированный моно.  
     if (!rs_started) {  
         if (rs_init_count == 0) {  
-            if (!get_iq_input(&rs_x0, &rs_q0)) {  
-                return false;  
-            }  
+            if (!get_demod_input(&rs_x0)) return false;  
             rs_init_count = 1;  
         }  
-  
         if (rs_init_count == 1) {  
-            if (!get_iq_input(&rs_x1, &rs_q1)) {  
-                return false;  
-            }  
+            if (!get_demod_input(&rs_x1)) return false;  
             rs_init_count = 2;  
         }  
-  
         rs_phase = 0;  
         rs_advance_pending = false;  
         rs_started = true;  
     }  
   
-    if (rs_advance_pending) {  
-        float next_i, next_q;  
-        if (!get_iq_input(&next_i, &next_q)) {  
-            return false;  
-        }  
-  
-        rs_x0 = rs_x1;  
-        rs_x1 = next_i;  
-        rs_q0 = rs_q1;  
-        rs_q1 = next_q;  
-        rs_advance_pending = false;  
-    }  
-  
-    const float frac = (float)rs_phase / 44100.0f;  
-    const float yi = rs_x0 + (rs_x1 - rs_x0) * frac;  
-    const float yq = rs_q0 + (rs_q1 - rs_q0) * frac;  
-  
-    rs_phase += 15625;  
-    if (rs_phase >= 44100) {  
-        rs_phase -= 44100;  
-        rs_advance_pending = true;  
-    }  
-  
-    *l = raw_iq_clip(yi);  // I -> левый  
-    *r = raw_iq_clip(yq);  // Q -> правый  
-    return true;  
-  
-#else  
-    // Первоначально нужны два входных отсчёта для интерполяции.  
-    if (!rs_started) {  
-        if (rs_init_count == 0) {  
-            if (!get_demod_input(&rs_x0)) {  
-                return false;  
-            }  
-            rs_init_count = 1;  
-        }  
-  
-        if (rs_init_count == 1) {  
-            if (!get_demod_input(&rs_x1)) {  
-                return false;  
-            }  
-            rs_init_count = 2;  
-        }  
-  
-        rs_phase = 0;  
-        rs_advance_pending = false;  
-        rs_started = true;  
-    }  
-  
-    // Если предыдущий выходной отсчёт пересёк границу входного периода,  
-    // сначала получаем следующий входной отсчёт. При нехватке данных состояние  
-    // не теряется, и следующий вызов повторит эту операцию.  
     if (rs_advance_pending) {  
         float next_x;  
-        if (!get_demod_input(&next_x)) {  
-            return false;  
-        }  
-  
+        if (!get_demod_input(&next_x)) return false;  
         rs_x0 = rs_x1;  
         rs_x1 = next_x;  
         rs_advance_pending = false;  
@@ -449,15 +442,12 @@ static bool next_frame(int16_t* l, int16_t* r) {
         rs_advance_pending = true;  
     }  
   
-// включаем АРУ (требуется усиление +20 дБ для выравнивания с АЦП)  
     const int16_t s = agc_limit(y);  
-    //const int16_t s = agc_limit(RxAudioPostFilter::process(y));  
-    //const int16_t s = (int16_t)RxAudioPostFilter::process(y);  
     *l = s;  
     *r = s;  
-    return true;
-#endif  
+    return true;  
 }  
+
   
 static USBAudioStream usb_out;  
 static int16_t pcm_buffer[192 * 2];  // до 192 stereo frames  
@@ -490,10 +480,10 @@ void rx_audio_init(void) {
     rs_started = false;  
     rs_init_count = 0;  
     rs_advance_pending = false;  
-#if RAW_IQ_OUT  
+
     rs_q0 = 0.0f;  
     rs_q1 = 0.0f;  
-#endif  
+    mode_changed = false;
   
     memset(pcm_buffer, 0, sizeof(pcm_buffer));  
     hilb_init(); // Очистит буферы еще раз (для надежности)  
@@ -545,3 +535,15 @@ void rx_audio_poll(void) {
         }  
     }  
 }
+
+void rx_audio_set_mode(uint8_t mode) {  
+    if (mode > RX_MODE_TEST) return;  
+    if (mode != rx_mode) {  
+        rx_mode = mode;  
+        mode_changed = true;   // next_frame сбросит ресемплер  
+    }  
+}  
+uint8_t rx_audio_get_mode(void) { return rx_mode; }  
+  
+void rx_audio_set_demod(uint8_t demod) { demod_mode = demod; }  
+uint8_t rx_audio_get_demod(void) { return demod_mode; }
