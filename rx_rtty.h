@@ -1,5 +1,5 @@
 #pragma once  
   
-// Скормить кадр мощностей RTTY-декодеру  
-// (вызывается из rx_tones на каждый кадр ~4.6 мс).  
-void rx_rtty_frame(void);
+// Кадр уровней mark/space от согласованных фильтров (rx_mf).  
+// pm, ps — мощности тонов (|z|^2). Вызывается ~5 раз на бит.  
+void rx_rtty_frame_levels(float pm, float ps);

@@ -8,7 +8,6 @@
   
 #include <Arduino.h>  
 #include <math.h>  
-#include "rx_tones.h"  
 #include "rx_rtty.h"  
   
 // ---------- параметры ----------  
@@ -86,83 +85,38 @@ static void rtty_bit(bool bit) {
     }  
 }  
   
-// ---------- автопоиск пары mark/space ----------  
-// Два канала с P >= медиана*LOCK_SNR, разнос 140..200 Гц.  
-// Нижний = space, верхний = mark (стандарт: mark выше по частоте).  
-static bool rtty_acquire(void) {  
-    float med  = rx_tones_median();  
-    float need = med * powf(10.0f, LOCK_SNR_DB / 10.0f);  
+ 
+// ---------- кадр: уровни mark/space + бодовый PLL ----------  
+// Порог присутствия сигнала — от медленного EMA шумового пола (слабейший тон).  
+#define SNR_LIN   10.0f     // ~10 дБ над шумом  
   
-    int n = rx_tones_nch();  
-    // разнос в каналах — по фактическому шагу сетки (не привязан к Fs=1953)  
-    float step_hz = rx_tones_freq_hz(1) - rx_tones_freq_hz(0);  
-    int d_lo = (int)(SHIFT_MIN_HZ / step_hz);  
-    int d_hi = (int)(SHIFT_MAX_HZ / step_hz) + 1;  
-    if (d_lo < 1) d_lo = 1;  
+static float noise_ema   = 1.0f;  
+static bool  sig_present = false;  
   
-    int   best_lo = -1, best_hi = -1;  
-    float best_p  = 0.0f;  
+void rx_rtty_frame_levels(float pm, float ps) {  
+    float weaker = (pm < ps) ? pm : ps;  
+    noise_ema += (weaker - noise_ema) * 0.002f;   // медленный трекинг шума  
+    float thr = noise_ema * SNR_LIN + 1e-6f;  
   
-    for (int lo = 25; lo < n - 25 - d_lo; lo++) {  
-        if (rx_tones_power(lo) < need) continue;  
-        int hi_max = lo + d_hi;  
-        if (hi_max > n - 25) hi_max = n - 25;  
-        for (int hi = lo + d_lo; hi < hi_max; hi++) {  
-            if (rx_tones_power(hi) < need) continue;  
-            float pp = rx_tones_power(lo) + rx_tones_power(hi);  
-            if (pp > best_p) { best_p = pp; best_lo = lo; best_hi = hi; }  
-        }  
-    }  
-    if (best_lo < 0) return false;  
-  
-    ch_space = best_lo;  
-    ch_mark  = best_hi;  
-    Serial.printf("#RTTY_LOCK,space=%.0f,mark=%.0f,delta=%.0f\n",  
-                  (double)rx_tones_freq_hz(ch_space),  
-                  (double)rx_tones_freq_hz(ch_mark),  
-                  (double)(rx_tones_freq_hz(ch_mark) - rx_tones_freq_hz(ch_space)));  
-    rtty_reset_char();  
-    rtty_reset_pll();  
-    shift_ltrs = 1;  
-    lost_cnt = 0;  
-    prev_level = true;  
-    return true;  
-}  
-  
-// ---------- кадр: уровень + бодовый PLL ----------  
-void rx_rtty_frame(void) {  
-    if (ch_mark < 0) { rtty_acquire(); return; }  
-  
-    float pm  = rx_tones_power(ch_mark);  
-    float ps  = rx_tones_power(ch_space);  
-    float med = rx_tones_median();  
-  
-    // watchdog: оба тона пропали ~1 с -> разлочка  
-    if (pm < med * 4.0f && ps < med * 4.0f) {  
-        if (++lost_cnt >= LOST_FRAMES) {  
-            ch_mark = ch_space = -1;  
-            lost_cnt = 0;  
-            rtty_reset_char();  
-            rtty_reset_pll();  
-            Serial.println("#RTTY_LOST");  
-        }  
+    bool present = (pm > thr) || (ps > thr);  
+    if (!present) {  
+        if (sig_present) { rtty_reset_char(); rtty_reset_pll(); sig_present = false; }  
+        prev_level = true;  
         return;  
     }  
-    lost_cnt = 0;  
+    sig_present = true;  
   
     bool lvl = (pm > ps);                    // уровень этого кадра  
   
     // фронт -> сдвигаем фазу к фронту (PLL)  
     if (lvl != prev_level) {  
-        // если бит был почти закрыт (уже есть голоса в центре) —  
-        // сначала закрываем его, иначе бит потеряется  
         if (mid_count > 0) {  
             rtty_bit(mid_votes * 2 > mid_count);  
         }  
         bit_phase = 0; mid_votes = 0; mid_count = 0;  
         cur_bit = lvl;  
     }  
-    prev_level = lvl; 
+    prev_level = lvl;  
   
     // центр бита — majority vote  
     if (bit_phase >= CENTER_LO && bit_phase <= CENTER_HI) {  
@@ -171,10 +125,10 @@ void rx_rtty_frame(void) {
     }  
   
     if (++bit_phase >= SUBS) {  
-        // бит закрыт: решаем по голосам в центре, иначе по значению на фронте  
         bool bit = (mid_count > 0) ? (mid_votes * 2 > mid_count) : cur_bit;  
         rtty_bit(bit);  
         bit_phase = 0; mid_votes = 0; mid_count = 0;  
         cur_bit = lvl;  
     }  
 }
+
