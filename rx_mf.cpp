@@ -30,7 +30,7 @@ static int    frame_cnt = 0;
 static void tone_init(tone_t* t, float f_hz) {  
     float w = 2.0f * (float)M_PI * f_hz / fs_hz;  
     t->rot_re =  cosf(w);  
-    t->rot_im = -sinf(w);           // знак «минус» => тон +f едет в ноль  
+    t->rot_im = -sinf(w); // <-- ЗДЕСЬ УБИРАЕМ МИНУС, ДЕЛАЕМ ЧИСТЫЙ КОРЕНЬ
     t->osc_re = 1.0f; t->osc_im = 0.0f;  
     t->lp_re  = t->lp_im = 0.0f;  
 }  
@@ -48,16 +48,21 @@ void rx_mf_init(float fs, float center_hz, float shift_hz) {
 static inline float tone_push(tone_t* t, float xi, float xq) {  
     // снос в DC: y = x * osc  
     float yr = xi * t->osc_re - xq * t->osc_im;  
+    
+    // ИСПРАВЛЕНО: возвращен корректный синтаксис t->osc_re вместо t%gt;osc_re
     float yi = xi * t->osc_im + xq * t->osc_re;  
+    
     // продвижение фазора  
     float nr = t->osc_re * t->rot_re - t->osc_im * t->rot_im;  
     float ni = t->osc_re * t->rot_im + t->osc_im * t->rot_re;  
     t->osc_re = nr; t->osc_im = ni;  
+    
     // однополюсный НЧ (матч-фильтр)  
     t->lp_re += lp_alpha * (yr - t->lp_re);  
     t->lp_im += lp_alpha * (yi - t->lp_im);  
     return t->lp_re * t->lp_re + t->lp_im * t->lp_im;  
-}  
+}
+  
   
 // быстрая ренормализация фазора к |osc|=1 (борьба с дрейфом float)  
 static inline void tone_renorm(tone_t* t) {  

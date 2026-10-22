@@ -27,7 +27,6 @@
 // mark/space-каналы: -1 = не залочены  
 static int ch_mark  = -1;  
 static int ch_space = -1;  
-static int lost_cnt = 0;  
   
 // ---------- бодовый автомат ----------  
 static int  bit_phase  = 0;    // кадр внутри текущего бита (0..SUBS-1)  
@@ -90,21 +89,45 @@ static void rtty_bit(bool bit) {
 // Порог присутствия сигнала — от медленного EMA шумового пола (слабейший тон).  
 #define SNR_LIN   10.0f     // ~10 дБ над шумом  
   
-static float noise_ema   = 1.0f;  
+#define MF_DIAG 1
+#define LOST_FRAMES 220      // ~1 c при ~226 кадр/с  
+static float ref_peak    = 1.0f;  
 static bool  sig_present = false;  
+static int lost_cnt = 0;  
   
 void rx_rtty_frame_levels(float pm, float ps) {  
-    float weaker = (pm < ps) ? pm : ps;  
-    noise_ema += (weaker - noise_ema) * 0.002f;   // медленный трекинг шума  
-    float thr = noise_ema * SNR_LIN + 1e-6f;  
+    float stronger = (pm > ps) ? pm : ps;  
+    // пик по сильному тону: быстрый подъём, медленный спад  
+    if (stronger > ref_peak) ref_peak += (stronger - ref_peak) * 0.25f;  
+    else                     ref_peak += (stronger - ref_peak) * 0.001f;  
+    // присутствие: сильный тон в пределах ~6 дБ от пика и выше абс. пола  
+    float thr = ref_peak * 0.25f;  
+    bool present = (stronger > thr) && (ref_peak > 1.0e3f);  
   
-    bool present = (pm > thr) || (ps > thr);  
-    if (!present) {  
-        if (sig_present) { rtty_reset_char(); rtty_reset_pll(); sig_present = false; }  
-        prev_level = true;  
-        return;  
+#if MF_DIAG  
+    static uint16_t d = 0;  
+    if (++d >= 64) { d = 0;  
+        Serial.printf("#MF pm=%.0f ps=%.0f peak=%.0f thr=%.0f pres=%d lvl=%d\n",  
+                       (double)pm,(double)ps,(double)ref_peak,(double)thr,  
+                       present,(pm>ps));  
     }  
-    sig_present = true;  
+#endif  
+  
+
+    if (!present) {  
+        // короткий провал не трогаем — сбрасываем автомат только  
+        // после длительного (≈1 с) отсутствия сигнала  
+        if (sig_present && ++lost_cnt >= LOST_FRAMES) {  
+            rtty_reset_char();  
+            rtty_reset_pll();  
+            sig_present = false;  
+            lost_cnt = 0;  
+            prev_level = true;  
+        }  
+        return;                 // на провале просто ждём, фазу/символ храним  
+    }  
+    lost_cnt = 0;  
+    sig_present = true;
   
     bool lvl = (pm > ps);                    // уровень этого кадра  
   

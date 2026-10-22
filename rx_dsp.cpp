@@ -252,18 +252,22 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
             // Насыщение и запись в буфер базовой полосы
             // Если фильтры выдали отсчет (emit == true), выходная очередь не полна, и мы не вылезли за размер блока (64 отсчета)
             if (emit) {  
+            #if RTTY_DECODE  
+                // декодёр RTTY питается на Core 1 — без потерь блоков очереди out  
+                rx_mf_sample(sat16(vi), sat16(vq));  
+            #endif  
                 // аудио-базбенд: та же точка 15.625 ksps, после двух HB  
-                uint8_t anext = (uint8_t)((aud_head + 1) % RX_AUD_BUFS);    
-                if (anext != aud_tail) {    
-                    aud_i[aud_head][aud_wr_n] = sat16(vi);    
-                    aud_q[aud_head][aud_wr_n] = sat16(vq);    
-                    if (++aud_wr_n >= RX_AUD_SAMPLES) {    
-                        __dmb();    
-                        aud_head = anext;    
-                        aud_wr_n = 0;    
-                    }    
-                } else {    
-                    aud_dropped++;    
+                uint8_t anext = (uint8_t)((aud_head + 1) % RX_AUD_BUFS);  
+                if (anext != aud_tail) {  
+                    aud_i[aud_head][aud_wr_n] = sat16(vi);  
+                    aud_q[aud_head][aud_wr_n] = sat16(vq);  
+                    if (++aud_wr_n >= RX_AUD_SAMPLES) {  
+                        __dmb();  
+                        aud_head = anext;  
+                        aud_wr_n = 0;  
+                    }  
+                } else {  
+                    aud_dropped++;  
                 }  
   
                 // очередь спектра/декодеров — тот же сигнал  
