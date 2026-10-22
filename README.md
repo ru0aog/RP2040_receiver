@@ -26,23 +26,23 @@
 
 Проект задействует **оба ядра RP2040**. Взаимодействие между ядрами реализовано через асинхронные lock-free SPSC-очереди (Single Producer Single Consumer) с аппаратными барьерами памяти `__dmb()`.
 
-```mermaid
-flowchart TD
-    subgraph Core1["Core 1 — Реал-тайм DSP тракт"]
-        ADC["ADC + DMA\n(ping-pong ~250 ksps)"] --> DC["DC-remove фильтр\n(EMA)"]
-        DC --> NCO["NCO комплексный сдвиг\nПЧ ~+7.4 кГц"]
-        NCO --> CIC["CIC Фильтр\n(Децимация /2)"]
-        CIC --> HB["2 × Half-band FIR\nФильтра"]
-        HB --> Q["SPSC-очередь\n(Поток 15.625 ksps)"]
-    end
+```mermaid  
+flowchart TD  
+    subgraph Core1["Core 1 — Реал-тайм DSP тракт"]  
+        ADC["ADC + DMA<br/>(ping-pong ~250 ksps)"] --> DC["DC-remove фильтр<br/>(EMA)"]  
+        DC --> NCO["NCO комплексный сдвиг<br/>ПЧ ~+7.4 кГц"]  
+        NCO --> CIC["CIC Фильтр<br/>(Децимация /2)"]  
+        CIC --> HB["2 × Half-band FIR<br/>фильтра"]  
+        HB --> Q["SPSC-очередь<br/>(Поток 15.625 ksps)"]  
+    end  
 
-    subgraph Core0["Core 0 — Arduino & Вывод данных"]
-        Q --> DEC["Декодеры мод\n(CW / RTTY / Olivia / MFSK)"]
-        Q --> FFT["1024-FFT спектр\n→ Вывод в Serial"]
-        Q --> AF["NBFM + AGC + SRC\n→ USB Audio (TinyUSB)"]
-    end
+    subgraph Core0["Core 0 — Arduino & Вывод данных"]  
+        Q --> DEC["Декодеры мод<br/>(CW / RTTY / Olivia / MFSK)"]  
+        Q --> FFT["1024-FFT спектр<br/>→ Вывод в Serial"]  
+        Q --> AF["NBFM + AGC + SRC<br/>→ USB Audio (TinyUSB)"]  
+    end  
 
-    LO["Квадратурный LO\n(clk_sys делитель D=9)"] --> ADC
+    LO["Квадратурный LO<br/>(clk_sys делитель D=9)"] --> ADC
 ```
 
 ---
