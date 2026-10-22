@@ -41,7 +41,13 @@ jobs:
       # Установка запустится только если кэш НЕ был найден
       if: steps.arduino-cache.outputs.cache-hit != 'true'
       run: |
+        # 1. Установка официальной зависимости через менеджер библиотек
         arduino-cli lib install "Adafruit TinyUSB Library"
+        
+        # 2. Создаем директорию для библиотек, если её еще нет, и клонируем arduino-audio-tools
+        mkdir -p ~/Arduino/libraries
+        cd ~/Arduino/libraries
+        git clone https://github.com
 
     - name: Compile Sketch
       run: |
