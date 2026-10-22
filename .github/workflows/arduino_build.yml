@@ -47,7 +47,11 @@ jobs:
         # 2. Создаем директорию для библиотек, если её еще нет, и клонируем arduino-audio-tools
         mkdir -p ~/Arduino/libraries
         cd ~/Arduino/libraries
+        if [ ! -d "arduino-audio-tools" ]; then
         git clone https://github.com/pschatzmann/arduino-audio-tools
+        else
+          echo "Библиотека arduino-audio-tools уже присутствует."
+        fi
 
     - name: Compile Sketch
       run: |
