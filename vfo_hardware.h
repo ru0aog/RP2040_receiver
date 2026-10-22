@@ -53,6 +53,7 @@ float rx_dsp_fs_out(void);
 uint32_t rx_dsp_out_dropped(void);  
 uint32_t rx_dsp_aud_dropped(void);  
 uint32_t rx_dsp_load_permille(void);
+uint8_t  rx_dsp_aud_fill(void);   // заполнение очереди aud для адаптивного ресемплинга
 
 // Перестройка приёмного тракта на лету (CAT/FLDigi):  
 // малая отстройка — сдвиг NCO, большая — полная переустановка LO.  

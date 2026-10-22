@@ -476,7 +476,16 @@ bool rx_dsp_get_audio(const int16_t** i, const int16_t** q, uint8_t* n) {
 void rx_dsp_release_audio(void) {  
     __dmb();  
     aud_tail = (uint8_t)((aud_tail + 1) % RX_AUD_BUFS);  
-}  
+}
+
+// Число заполненных слотов очереди aud (0..RX_AUD_BUFS-1).  
+// Читатель — core0; значение приблизительное (head пишет core1), но  
+// для медленной подстройки ресемплера этого достаточно.  
+uint8_t rx_dsp_aud_fill(void) {  
+    uint8_t head = aud_head;  
+    uint8_t tail = aud_tail;  
+    return (uint8_t)((head - tail) % RX_AUD_BUFS);  
+}
   
 float rx_dsp_audio_fs(void) {  
     return RX_FS_OUT_HZ;                 // 15625.0 Гц — теперь с выхода HB-цепочки

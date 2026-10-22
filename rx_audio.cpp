@@ -315,13 +315,16 @@ static bool get_iq_input(float* i_out, float* q_out) {
 // На каждом выходном отсчёте фаза увеличивается на 15625.  
 // Если фаза пересекает 44100, на следующем вызове нужно сдвинуть входную  
 // пару на один отсчёт. Отложенный сдвиг сохраняется при временно пустой очереди.  
-static uint32_t rs_phase = 0;  
 static float rs_x0 = 0.0f;  
 static float rs_x1 = 0.0f;  
 static bool rs_started = false;  
 static uint8_t rs_init_count = 0;  
 static bool rs_advance_pending = false;  
-  
+
+static float rs_phase = 0.0f;  
+// Адаптивный шаг ресемплера. Номинал 15625 (отношение 15625/44100).  
+// Подстраивается по заполнению aud-очереди в rx_audio_poll().  
+static float rs_step = 15625.0f;
 
 // Второй канал (Q) ресемплера. Фаза rs_phase общая для I и Q,  
 // чтобы каналы не разъехались во времени.  
@@ -396,15 +399,15 @@ static bool next_frame(int16_t* l, int16_t* r) {
             rs_advance_pending = false;  
         }  
   
-        const float frac = (float)rs_phase / 44100.0f;  
+        const float frac = rs_phase / 44100.0f;  
         const float yi = rs_x0 + (rs_x1 - rs_x0) * frac;  
         const float yq = rs_q0 + (rs_q1 - rs_q0) * frac;  
-  
-        rs_phase += 15625;  
-        if (rs_phase >= 44100) {  
-            rs_phase -= 44100;  
+    
+        rs_phase += rs_step;  
+        if (rs_phase >= 44100.0f) {  
+            rs_phase -= 44100.0f;  
             rs_advance_pending = true;  
-        }  
+        }
   
         *l = raw_iq_clip(yi);  // I -> левый  
         *r = raw_iq_clip(yq);  // Q -> правый  
@@ -434,14 +437,14 @@ static bool next_frame(int16_t* l, int16_t* r) {
         rs_advance_pending = false;  
     }  
   
-    const float frac = (float)rs_phase / 44100.0f;  
+    const float frac = rs_phase / 44100.0f;  
     const float y = rs_x0 + (rs_x1 - rs_x0) * frac;  
   
-    rs_phase += 15625;  
-    if (rs_phase >= 44100) {  
-        rs_phase -= 44100;  
+    rs_phase += rs_step;  
+    if (rs_phase >= 44100.0f) {  
+        rs_phase -= 44100.0f;  
         rs_advance_pending = true;  
-    }  
+    }
   
     const int16_t s = agc_limit(y);  
     *l = s;  
@@ -475,7 +478,8 @@ void rx_audio_init(void) {
     cur_n = 0;  
     pos = 0;  
   
-    rs_phase = 0;  
+    rs_phase = 0.0f;  
+    rs_step  = 15625.0f;
     rs_x0 = 0.0f;  
     rs_x1 = 0.0f;  
     rs_started = false;  
@@ -504,7 +508,21 @@ void rx_audio_init(void) {
   
 // Вызывать регулярно из loop(). Не вызывать параллельно из таймера:  
 // у USB-потока и ресемплера должен быть один потребитель.  
-void rx_audio_poll(void) {  
+void rx_audio_poll(void) {
+    // --- Адаптивная подстройка темпа выдачи под часы USB-хоста ---  
+    // Держим backlog очереди aud около середины (TARGET).  
+    // Середина aud-очереди (глубина RX_AUD_BUFS=8 в rx_dsp.cpp).  
+    // Литерал, т.к. сам макрос RX_AUD_BUFS в rx_audio.cpp не виден.  
+    const float   TARGET = 4.0f; // TARGET = (float)(RX_AUD_BUFS / 2);  // ≈4 при RX_AUD_BUFS=8
+    const float   K      = 6.0f;      // крутизна подстройки (Гц на слот)  
+    const float   LIMIT  = 60.0f;     // макс. отклонение шага, Гц (~0.4%)  
+    const uint8_t fill   = rx_dsp_aud_fill();  
+  
+    float adj = K * ((float)fill - TARGET);  
+    if (adj >  LIMIT) adj =  LIMIT;  
+    if (adj < -LIMIT) adj = -LIMIT;  
+    rs_step = 15625.0f + adj;   // backlog велик → шаг больше → входы читаются чаще  
+  
     for (;;) {  
         int avail_frames = usb_out.availableForWrite() / 4;  
         if (avail_frames <= 0) {  
