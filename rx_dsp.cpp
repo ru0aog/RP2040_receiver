@@ -233,6 +233,7 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
         // Начало полезной работы: засекаем время обработки блока.  
         const uint32_t t_busy_start = time_us_32();
         // данные из DMA пришли
+    #if RTTY_DECODE 
         uint8_t wr        = out_head;                           // индекс текущего свободного буфера выходной очереди
         uint8_t next_head = (uint8_t)((wr + 1) % RX_OUT_BUFS);  // следующий шаг кольцевого буфера
         // Если очередь полна (queue_full == true), код не останавливает работу. 
@@ -240,6 +241,7 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
         // цифрового гетеродина и фильтров, но результат в конце будет просто сброшен в мусорку.
         bool    queue_full = (next_head == out_tail);
         uint8_t n_out = 0;
+    #endif
         // устанавливаем указатель
         const volatile int16_t* s = (const volatile int16_t*)blk;
         // DMA_SIZE_16: каждое 32-битное слово FIFO = пара отсчётов  
@@ -344,6 +346,7 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
         // функция rx_capture_release() сообщает DMA-движку на Core 0,
         // что входной буфер blk полностью обработан и его можно использовать повторно
         rx_capture_release();
+    #if RTTY_DECODE
         // Если выходная очередь была переполнена, инкрементируется диагностический счетчик потерь out_dropped
         if (queue_full) {  
             out_dropped++;            // блок выхода потерян, вход обработан  
@@ -354,6 +357,7 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
             __dmb();                  // данные блока видимы до публикации head  
             out_head = next_head;
         }
+    #endif
         // Конец полезной работы: накапливаем время обработки блока.  
         busy_us_acc += (time_us_32() - t_busy_start);  
   

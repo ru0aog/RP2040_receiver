@@ -22,12 +22,30 @@
 // SSB верхняя → rx_dsp_set_demod(RXD_DEMOD_USB);
 // SSB нижняя → rx_dsp_set_demod(RXD_DEMOD_LSB).
 
+
+
 // ---- Runtime-состояние режима вывода ----  
 // Стартовый режим — сырые I/Q (как раньше при RAW_IQ_OUT=1).  
 static volatile uint8_t rx_mode     = RX_MODE_SSB;   // старт сразу в SSB-моно  // rx_mode     = RX_MODE_RAW_IQ;  
 static volatile uint8_t demod_mode  = DEMOD_USB;   // боковая для RX_MODE_SSB  
 static volatile bool    mode_changed = false;      // запрос на сброс ресемплера
+
+// хелпер: перевести (rx_mode, demod_mode) в режим Core 1  
+static void push_demod_to_core1(void) {  
+    if (rx_mode == RX_MODE_SSB) {  
+        rx_dsp_set_demod(demod_mode == DEMOD_LSB ? RXD_DEMOD_LSB : RXD_DEMOD_USB);  
+    } else {  
+        rx_dsp_set_demod(RXD_DEMOD_RAW);   // сырой I/Q и тест  
+    }  
+}  
   
+void rx_audio_set_mode(uint8_t mode) {  
+    if (mode > RX_MODE_TEST) return;  
+    if (mode != rx_mode) { rx_mode = mode; mode_changed = true; }  
+    push_demod_to_core1();  
+}  
+void rx_audio_set_demod(uint8_t demod) { demod_mode = demod; push_demod_to_core1(); }
+
 /*  
 // ---- LPF Butterworth-подобный biquad, Fs=15625 Гц ----  
 // Коэффициенты сохранены из исходного файла.  

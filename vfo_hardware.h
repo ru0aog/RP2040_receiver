@@ -55,6 +55,12 @@ uint32_t rx_dsp_aud_dropped(void);
 uint32_t rx_dsp_load_permille(void);
 uint8_t  rx_dsp_aud_fill(void);   // заполнение очереди aud для адаптивного ресемплинга
 
+// Демодулятор на Core 1 (USB-аудио):  
+#define RXD_DEMOD_RAW 0  
+#define RXD_DEMOD_USB 1  
+#define RXD_DEMOD_LSB 2  
+void rx_dsp_set_demod(uint8_t mode);
+
 // Перестройка приёмного тракта на лету (CAT/FLDigi):  
 // малая отстройка — сдвиг NCO, большая — полная переустановка LO.  
 void     rx_retune(uint32_t freq_hz);  
