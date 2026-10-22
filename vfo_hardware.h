@@ -60,6 +60,11 @@ uint8_t  rx_dsp_aud_fill(void);   // заполнение очереди aud д�
 #define RXD_DEMOD_USB 1  
 #define RXD_DEMOD_LSB 2  
 void rx_dsp_set_demod(uint8_t mode);
+  
+// Бортовой RTTY-декодер: единая точка правды, видна и в .ino, и в rx_dsp.cpp.    
+#ifndef RTTY_DECODE    
+#define RTTY_DECODE 0    
+#endif
 
 // Перестройка приёмного тракта на лету (CAT/FLDigi):  
 // малая отстройка — сдвиг NCO, большая — полная переустановка LO.  

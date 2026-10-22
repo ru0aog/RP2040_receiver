@@ -44,6 +44,7 @@ void rx_audio_set_mode(uint8_t mode) {
     if (mode != rx_mode) { rx_mode = mode; mode_changed = true; }  
     push_demod_to_core1();  
 }  
+
 void rx_audio_set_demod(uint8_t demod) { demod_mode = demod; push_demod_to_core1(); }
 
 /*  
@@ -510,7 +511,11 @@ void rx_audio_init(void) {
   
     memset(pcm_buffer, 0, sizeof(pcm_buffer));  
     hilb_init(); // Очистит буферы еще раз (для надежности)  
-  
+
+    // Синхронизируем демодулятор Core 1 со стартовым режимом (rx_mode/demod_mode),    
+    // иначе Core 1 остаётся в RXD_DEMOD_RAW и боковая не давится.    
+    push_demod_to_core1();
+
     if (!TinyUSBDevice.isInitialized()) {  
         TinyUSBDevice.begin(0);  
     }  
@@ -573,14 +578,7 @@ void rx_audio_poll(void) {
     }  
 }
 
-void rx_audio_set_mode(uint8_t mode) {  
-    if (mode > RX_MODE_TEST) return;  
-    if (mode != rx_mode) {  
-        rx_mode = mode;  
-        mode_changed = true;   // next_frame сбросит ресемплер  
-    }  
-}  
+
 uint8_t rx_audio_get_mode(void) { return rx_mode; }  
-  
-void rx_audio_set_demod(uint8_t demod) { demod_mode = demod; }  
+ 
 uint8_t rx_audio_get_demod(void) { return demod_mode; }
