@@ -165,13 +165,23 @@ static volatile uint8_t  aud_tail = 0;   // читает только core0
 static volatile uint32_t aud_dropped = 0;  
 static uint8_t aud_wr_n = 0;             // заполнение текущего слота
 
+// ---- Инструментирование загрузки Core 1 ----  
+static uint32_t busy_us_acc  = 0;   // время в обработке блоков за окно  
+static uint32_t total_us_acc = 0;   // полное время за окно  
+static volatile uint32_t dsp_load_permille = 0;  // загрузка, промилле (0..1000)
+
 // бесконечный изолированный рабочий цикл ядра Core 1
 // цифровой преобразователь частоты вниз (DDC — Digital Down Converter)
-static void __not_in_flash_func(rx_dsp_entry)(void) {  
+static void __not_in_flash_func(rx_dsp_entry)(void) {
+    uint32_t t_prev = time_us_32();   // метка времени предыдущей итерации  
     // бесконечный цикл ядра Core 1
     while (true) {
         // кормим собачку
         watchdog_update();
+        // Учёт полного времени итерации (включая холостое ожидание).  
+        const uint32_t t_now = time_us_32();  
+        total_us_acc += (t_now - t_prev);  
+        t_prev = t_now;  
         // проверяем очередь АЦП (функция в rx_capture.cpp)
         const volatile uint32_t* blk = rx_capture_get_block();
         // если данных ещё нет - на следующую итерацию
@@ -179,6 +189,8 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
             tight_loop_contents();  // подсказка компилятору для цикла ожидания; в этой итерации новых данных нет
             continue;
         }
+        // Начало полезной работы: засекаем время обработки блока.  
+        const uint32_t t_busy_start = time_us_32();
         // данные из DMA пришли
         uint8_t wr        = out_head;                           // индекс текущего свободного буфера выходной очереди
         uint8_t next_head = (uint8_t)((wr + 1) % RX_OUT_BUFS);  // следующий шаг кольцевого буфера
@@ -291,6 +303,16 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
             // Только после этого индекс out_head сдвигается на next_head, делая новый блок видимым для декодеров на Core 0
             __dmb();                  // данные блока видимы до публикации head  
             out_head = next_head;
+        }
+        // Конец полезной работы: накапливаем время обработки блока.  
+        busy_us_acc += (time_us_32() - t_busy_start);  
+  
+        // Раз в ~1 с пересчитываем загрузку. Деление — вне горячего пути,  
+        // только раз в секунду (программное деление на M0+ дорогое).  
+        if (total_us_acc >= 1000000u) {  
+            dsp_load_permille = (uint32_t)(((uint64_t)busy_us_acc * 1000u) / total_us_acc);  
+            busy_us_acc  = 0;  
+            total_us_acc = 0;  
         }
     }
 }
@@ -412,6 +434,16 @@ void rx_dsp_release_output(void) {
 uint32_t rx_dsp_out_dropped(void) {
     return out_dropped;
     }
+
+// Загрузка Core 1 в промилле (0..1000), обновляется раз в ~1 с.  
+uint32_t rx_dsp_load_permille(void) {  
+    return dsp_load_permille;  
+}  
+  
+// Счётчик дропов аудио-очереди (переполнение aud на Core 1).  
+uint32_t rx_dsp_aud_dropped(void) {  
+    return aud_dropped;  
+}
 
 // возвращает фактическую частоту дискретизации сигнала базовой полосы на выходе DSP-тракта
 // нужна декодерам для таймингов

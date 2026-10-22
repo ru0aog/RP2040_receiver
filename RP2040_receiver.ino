@@ -130,5 +130,15 @@ void loop() {
         }  
         rx_dsp_release_output();  
     }  
-#endif  
+#endif
+    // Диагностика: загрузка Core 1 и дропы, раз в секунду.  
+    static uint32_t t_dbg = 0;  
+    if (millis() - t_dbg >= 1000) {  
+        t_dbg = millis();  
+        Serial.printf("# CORE1_LOAD=%.1f%% aud_dropped=%lu out_dropped=%lu\n",  
+                      rx_dsp_load_permille() / 10.0,  
+                      (unsigned long)rx_dsp_aud_dropped(),  
+                      (unsigned long)rx_dsp_out_dropped());  
+    }  
 }
+
