@@ -14,15 +14,17 @@
 #define DEMOD_AM   2  
 #define DEMOD_FM   3  
 #define DEMOD_CW   4  
-
-#define DEMOD_MODE DEMOD_CW  
   
 // Фиксированное усиление сырых I/Q перед упаковкой в PCM.  
 #define RAW_IQ_GAIN 16  
   
+// сырой I/Q → rx_dsp_set_demod(RXD_DEMOD_RAW);
+// SSB верхняя → rx_dsp_set_demod(RXD_DEMOD_USB);
+// SSB нижняя → rx_dsp_set_demod(RXD_DEMOD_LSB).
+
 // ---- Runtime-состояние режима вывода ----  
 // Стартовый режим — сырые I/Q (как раньше при RAW_IQ_OUT=1).  
-static volatile uint8_t rx_mode     = RX_MODE_RAW_IQ;  
+static volatile uint8_t rx_mode     = RX_MODE_SSB;   // старт сразу в SSB-моно  // rx_mode     = RX_MODE_RAW_IQ;  
 static volatile uint8_t demod_mode  = DEMOD_USB;   // боковая для RX_MODE_SSB  
 static volatile bool    mode_changed = false;      // запрос на сброс ресемплера
   
@@ -258,13 +260,11 @@ static bool get_demod_input(float* out) {
         }  
     }  
   
-    const int32_t i = bi[pos];  
-    const int32_t q = bq[pos];  
+    const float m = (float)bi[pos];  // уже демодулировано на Core 1 (моно в aud_i)  
     ++pos;  
   
-    //*out = lp_filter(demod_sample(i, q));  
-    *out = demod_sample(i, q);// LPF обойдён: сырой выход демодулятора  
-    return true;  
+    *out = m;  
+    return true;
 }  
   
 // Забирает следующую пару I/Q без демодуляции и фильтрации.  

@@ -20,7 +20,7 @@ static constexpr uint32_t RX_FREQ_HZ = 3600000UL;
   
 // Включение бортового RTTY-декодера (matched-filter mark/space).  
 // Сырой I/Q в USB-аудио идёт параллельно по независимой очереди aud.  
-#define RTTY_DECODE 1
+#define RTTY_DECODE 0
   
 // Текущая частота приёма — единая точка правды для CAT.  
 static uint32_t current_rx_hz = RX_FREQ_HZ;  

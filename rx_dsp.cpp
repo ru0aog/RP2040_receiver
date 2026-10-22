@@ -165,6 +165,47 @@ static volatile uint8_t  aud_tail = 0;   // читает только core0
 static volatile uint32_t aud_dropped = 0;  
 static uint8_t aud_wr_n = 0;             // заполнение текущего слота
 
+// ---- Демодулятор, перенесён с Core 0 (rx_audio.cpp) ----  
+#define RXD_DEMOD_RAW 0   // сырые I/Q в aud (стерео)  
+#define RXD_DEMOD_USB 1   // верхняя боковая, моно  
+#define RXD_DEMOD_LSB 2   // нижняя боковая, моно  
+static volatile uint8_t rxd_demod_mode = RXD_DEMOD_RAW;  // ставит Core 0  
+  
+#define HILB_N 31  
+#define HILB_M ((HILB_N - 1) / 2)  
+static float hilb_buf[HILB_N] = {};  
+static int   hilb_idx = 0;  
+static float i_del[HILB_M + 1] = {};  
+static int   i_del_idx = 0;  
+  
+static const float hilb_h[HILB_N] = {  
+    -0.00340f, 0.0f, -0.00588f, 0.0f, -0.01340f, 0.0f, -0.02820f, 0.0f,  
+    -0.05350f, 0.0f, -0.09800f, 0.0f, -0.19350f, 0.0f, -0.63030f, 0.0f,  
+     0.63030f, 0.0f,  0.19350f, 0.0f,  0.09800f, 0.0f,  0.05350f, 0.0f,  
+     0.02820f, 0.0f,  0.01340f, 0.0f,  0.00588f, 0.0f,  0.00340f  
+};  
+  
+// Один демод-отсчёт из пары I/Q (15.625 ksps). Должен вызываться на КАЖДОМ  
+// emit, даже если очередь полна — иначе рвётся фаза Гильберта.  
+static inline float __not_in_flash_func(rxd_demod_sample)(int32_t i, int32_t q) {  
+    i_del[i_del_idx] = (float)i;  
+    int del = i_del_idx - HILB_M;  
+    if (del < 0) del += (HILB_M + 1);  
+    const float i_d = i_del[del];  
+    i_del_idx = (i_del_idx + 1) % (HILB_M + 1);  
+  
+    hilb_buf[hilb_idx] = (float)q;  
+    hilb_idx = (hilb_idx + 1) % HILB_N;  
+  
+    float hq = 0.0f;  
+    for (int k = 0; k < HILB_N; ++k) {  
+        const int idx = (hilb_idx + HILB_N - 1 - k) % HILB_N;  
+        hq += hilb_h[k] * hilb_buf[idx];  
+    }  
+    return (rxd_demod_mode == RXD_DEMOD_LSB) ? (i_d + hq) : (i_d - hq);  
+}
+
+
 // ---- Инструментирование загрузки Core 1 ----  
 static uint32_t busy_us_acc  = 0;   // время в обработке блоков за окно  
 static uint32_t total_us_acc = 0;   // полное время за окно  
@@ -263,16 +304,25 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
 
             // Насыщение и запись в буфер базовой полосы
             // Если фильтры выдали отсчет (emit == true), выходная очередь не полна, и мы не вылезли за размер блока (64 отсчета)
+           
+           
+           
             if (emit) {  
-            #if RTTY_DECODE  
-                // декодёр RTTY питается на Core 1 — без потерь блоков очереди out  
-                rx_mf_sample(sat16(vi), sat16(vq));  
-            #endif  
-                // аудио-базбенд: та же точка 15.625 ksps, после двух HB  
+                // Гильберт считаем ВСЕГДА (даже при полной очереди), иначе рвётся фаза.  
+                int16_t si, sq;  
+                if (rxd_demod_mode == RXD_DEMOD_RAW) {  
+                    si = sat16(vi);  
+                    sq = sat16(vq);  
+                } else {  
+                    int16_t m = sat16((int32_t)rxd_demod_sample(vi, vq));  // моно SSB  
+                    si = m;  
+                    sq = m;  
+                }  
+            
                 uint8_t anext = (uint8_t)((aud_head + 1) % RX_AUD_BUFS);  
                 if (anext != aud_tail) {  
-                    aud_i[aud_head][aud_wr_n] = sat16(vi);  
-                    aud_q[aud_head][aud_wr_n] = sat16(vq);  
+                    aud_i[aud_head][aud_wr_n] = si;  
+                    aud_q[aud_head][aud_wr_n] = sq;  
                     if (++aud_wr_n >= RX_AUD_SAMPLES) {  
                         __dmb();  
                         aud_head = anext;  
@@ -281,14 +331,14 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
                 } else {  
                     aud_dropped++;  
                 }  
-  
-                // очередь спектра/декодеров — тот же сигнал  
-                if (!queue_full && n_out < RX_OUT_SAMPLES) {  
-                    out_i[wr][n_out] = sat16(vi);  
-                    out_q[wr][n_out] = sat16(vq);  
-                    n_out++;  
-                }  
+                // очередь out убрана: с RTTY_DECODE=0 потребителя нет (снимаем мёртвую работу с Core 1)  
             }
+
+
+
+
+
+
         }
         // После окончания внутреннего цикла 
         // функция rx_capture_release() сообщает DMA-движку на Core 0,
@@ -344,8 +394,14 @@ void rx_dsp_start(float f_target_hz) {
     memset(out_q, 0, sizeof(out_q));
     out_head = out_tail = 0;
 
-    aud_head = aud_tail = aud_wr_n = 0;  
-    aud_dropped = 0;
+    aud_head = aud_tail = aud_wr_n = 0;    
+    aud_dropped = 0;  
+  
+    // сброс демодулятора, перенесённого на Core 1  
+    memset(hilb_buf, 0, sizeof(hilb_buf));  
+    memset(i_del,   0, sizeof(i_del));  
+    hilb_idx = 0;  
+    i_del_idx = 0;
 
     memset(cic_int_i, 0, sizeof(cic_int_i));  
     memset(cic_int_q, 0, sizeof(cic_int_q));  
@@ -461,6 +517,9 @@ void rx_dsp_stop(void) {
     out_head = out_tail = 0;
     out_dropped = 0;
 }
+
+// Вызывается с Core 0 при смене режима вывода USB-аудио.  
+void rx_dsp_set_demod(uint8_t mode) { rxd_demod_mode = mode; }
 
 // ---- Аудио-базбенд: читатель core0 ----  
 bool rx_dsp_get_audio(const int16_t** i, const int16_t** q, uint8_t* n) {  
