@@ -170,38 +170,51 @@ static uint8_t aud_wr_n = 0;             // заполнение текущег�
 #define RXD_DEMOD_USB 1   // верхняя боковая, моно  
 #define RXD_DEMOD_LSB 2   // нижняя боковая, моно  
 static volatile uint8_t rxd_demod_mode = RXD_DEMOD_RAW;  // ставит Core 0  
-  
+
+// ---- Hilbert FIR: 31 taps, Q15 fixed-point ----  
 #define HILB_N 31  
-#define HILB_M ((HILB_N - 1) / 2)  
-static float hilb_buf[HILB_N] = {};  
-static int   hilb_idx = 0;  
-static float i_del[HILB_M + 1] = {};  
-static int   i_del_idx = 0;  
-  
-static const float hilb_h[HILB_N] = {  
-    -0.00340f, 0.0f, -0.00588f, 0.0f, -0.01340f, 0.0f, -0.02820f, 0.0f,  
-    -0.05350f, 0.0f, -0.09800f, 0.0f, -0.19350f, 0.0f, -0.63030f, 0.0f,  
-     0.63030f, 0.0f,  0.19350f, 0.0f,  0.09800f, 0.0f,  0.05350f, 0.0f,  
-     0.02820f, 0.0f,  0.01340f, 0.0f,  0.00588f, 0.0f,  0.00340f  
+#define HILB_M ((HILB_N - 1) / 2)   // 15 отсчётов групповой задержки  
+
+// Только 16 ненулевых отводов (чётные позиции). Q15 = round(coeff * 32768).  
+// Пара {смещение в буфере, коэффициент}. Смещение k = позиция в исходном hilb_h.  
+static const int16_t hilb_hq15[16] = {  
+    -111, -193, -439, -924, -1753, -3211, -6341, -20654,  
+   20654,  6341,  3211,  1753,   924,   439,   193,    111  
 };  
+// k-индексы ненулевых отводов в исходном 31-отводном фильтре:  
+static const uint8_t hilb_k[16] = {  
+    0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30  
+};  
+  
+static int16_t hilb_buf[HILB_N] = {};  
+static int     hilb_idx = 0;  
+  
+static int16_t i_del[HILB_M + 1] = {};  
+static int     i_del_idx = 0;
+
   
 // Один демод-отсчёт из пары I/Q (15.625 ksps). Должен вызываться на КАЖДОМ  
 // emit, даже если очередь полна — иначе рвётся фаза Гильберта.  
-static inline float __not_in_flash_func(rxd_demod_sample)(int32_t i, int32_t q) {  
-    i_del[i_del_idx] = (float)i;  
+static inline int32_t __not_in_flash_func(rxd_demod_sample)(int32_t i, int32_t q) {  
+    i_del[i_del_idx] = (int16_t)i;  
     int del = i_del_idx - HILB_M;  
     if (del < 0) del += (HILB_M + 1);  
-    const float i_d = i_del[del];  
+    const int32_t i_d = (int32_t)i_del[del];  
     i_del_idx = (i_del_idx + 1) % (HILB_M + 1);  
   
-    hilb_buf[hilb_idx] = (float)q;  
+    hilb_buf[hilb_idx] = (int16_t)q;  
     hilb_idx = (hilb_idx + 1) % HILB_N;  
   
-    float hq = 0.0f;  
-    for (int k = 0; k < HILB_N; ++k) {  
-        const int idx = (hilb_idx + HILB_N - 1 - k) % HILB_N;  
-        hq += hilb_h[k] * hilb_buf[idx];  
+    // Свёртка только по ненулевым отводам, Q15, аккумулятор int64.  
+    int64_t acc = 0;  
+    for (int n = 0; n < 16; ++n) {  
+        const int k = hilb_k[n];  
+        int idx = hilb_idx + HILB_N - 1 - k;  
+        idx %= HILB_N;  
+        acc += (int64_t)hilb_hq15[n] * (int64_t)hilb_buf[idx];  
     }  
+    const int32_t hq = (int32_t)(acc >> 15);   // обратно в масштаб отсчёта  
+  
     return (rxd_demod_mode == RXD_DEMOD_LSB) ? (i_d + hq) : (i_d - hq);  
 }
 
