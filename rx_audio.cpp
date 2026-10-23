@@ -42,31 +42,35 @@ void rx_audio_set_mode(uint8_t mode) {
 
 void rx_audio_set_demod(uint8_t demod) { demod_mode = demod; push_demod_to_core1(); }
  
-// Необязательная АРУ. В текущем режиме вызов оставлен выключенным,  
-// чтобы сохранить исходный уровень сигнала.  
-static float agc_peak = 4096.0f;  
+// АРУ
+// Пик в тех же единицах, что |отсчёт| (0..32767). Целочисленный EMA.  
+static int32_t agc_peak = 4096;  
   
-static inline int16_t agc_limit(float x) {  
-    const float ax = fabsf(x);  
+// Коэффициенты EMA в Q16 (вместо float 0.01 / 0.0002).  
+#define AGC_ATT_Q16   655   // атака  ≈ 0.01  (655/65536)  
+#define AGC_DEC_Q16    13   // спад   ≈ 0.0002 (13/65536)  
+#define AGC_PEAK_MIN  2048  // минимальный порог (потолок усиления 12 крат)  
+#define AGC_CEIL     24576  // потолок усиления = -2.5 дБ
   
-    // Детектор пиков (атака и спад)  
-    if (ax > agc_peak) {  
-        // agc_peak += (ax - agc_peak) * 0.0625f;  
-        agc_peak += (ax - agc_peak) * 0.01f; 
+static inline int16_t agc_limit(int32_t x) {  
+    int32_t ax = (x < 0) ? -x : x;  
+  
+    // Детектор пиков (атака/спад) — целочисленный EMA в Q16, без float.  
+    int32_t diff = ax - agc_peak;  
+    if (diff > 0) {  
+        agc_peak += (int32_t)(((int64_t)diff * AGC_ATT_Q16) >> 16);  
     } else {  
-        agc_peak += (ax - agc_peak) * 0.0002f;  
+        agc_peak += (int32_t)(((int64_t)diff * AGC_DEC_Q16) >> 16);  
     }  
-    // Защита от разгона усиления в паузах (минимальный порог)  
-    // Поднимите выше 2048.0f, если тихие звуки всё ещё слишком сильно усиливаются  
-    if (agc_peak < 2048.0f) {  // 256.0f  максимальное усиление 96 крат  
-        agc_peak = 2048.0f;    // 2048.0f максимальное усиление 12 крат  
-    }  
-    float g = x * 24576.0f / agc_peak;  // потолок усиления 24576.0f = -2,5 дБ  
-    // Жесткий лимитер на крайний случай  
-    if (g > 32767.0f)  g = 32767.0f;  
-    if (g < -32768.0f) g = -32768.0f;  
+    if (agc_peak < AGC_PEAK_MIN) agc_peak = AGC_PEAK_MIN;  
+  
+    // Деление — аппаратным делителем RP2040 (SIO), а не software float.  
+    // x <= 32767, x*24576 < 8.1e8 — умещается в int32; на всякий случай int64.  
+    int32_t g = (int32_t)(((int64_t)x * AGC_CEIL) / agc_peak);  
+    if (g >  32767) g =  32767;  
+    if (g < -32768) g = -32768;  
     return (int16_t)g;  
-}  
+}
   
 // ---- Источник аудиоданных от rx_dsp ----  
 static const int16_t* bi = nullptr;  
@@ -345,7 +349,7 @@ static USBAudioStream usb_out;
 static int16_t pcm_buffer[192 * 2];  // до 192 stereo frames  
   
 void rx_audio_init(void) {  
-    agc_peak = 4096.0f;  
+    agc_peak = 4096;
     memset(pcm_buffer, 0, sizeof(pcm_buffer));  
     // Синхронизируем демодулятор Core 1 со стартовым режимом (rx_mode/demod_mode),    
     // иначе Core 1 остаётся в RXD_DEMOD_RAW и боковая не давится.    
