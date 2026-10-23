@@ -1,4 +1,4 @@
-[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/ru0aog/RP2040_beacon)
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/ru0aog/RP2040_receiver)
 
 # 🛰️ Pico-SDR SSB/RTTY Receiver (RP2040)  
   
