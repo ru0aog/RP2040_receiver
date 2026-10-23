@@ -194,8 +194,16 @@ void loop() {
   
     const uint32_t t_busy_start = time_us_32();    
   
-    rx_audio_poll();  
-    //fldigi_cat_poll();   // неблокирующий разбор CAT-команд      
+    rx_audio_poll();
+    
+    // CAT опрашиваем не каждую итерацию, а раз в ~15 мс: обращения к  
+    // TinyUSB-CDC (dtr()/available()) в fldigi_cat_poll() дорогие,  
+    // а для разбора CAT-команд такой частоты более чем достаточно.  
+    static uint32_t t_cat = 0;  
+    if (millis() - t_cat >= 15) {  
+        t_cat = millis();  
+        fldigi_cat_poll();   // неблокирующий разбор CAT-команд  
+    }     
     
 #if RTTY_DECODE    
     const int16_t* bi;    
