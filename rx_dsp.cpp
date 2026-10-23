@@ -110,7 +110,7 @@ static inline bool hb_push(hb_state_t* st, int32_t x, int32_t* out) {
     // Указатель st->w сдвигается на следующий элемент
     // Операция % HB_NTAPS (в данном случае % 15) зацикливает массив,
     // обеспечивает циклический переход индекса в программном коде, который компилятор может оптимизировать.
-    st->w = (st->w + 1) % st->ntaps; 
+    if (++st->w >= st->ntaps) st->w = 0;
     // Прореживание частоты на 2
     st->phase ^= 1;     // Переменная st->phase это однобитный триггер чётности 
     // (флаг, который при каждом вызове функции переключается между 0 и 1 с помощью операции XOR ^= 1)
@@ -200,20 +200,30 @@ static inline int32_t __not_in_flash_func(rxd_demod_sample)(int32_t i, int32_t q
     int del = i_del_idx - HILB_M;  
     if (del < 0) del += (HILB_M + 1);  
     const int32_t i_d = (int32_t)i_del[del];  
-    i_del_idx = (i_del_idx + 1) % (HILB_M + 1);  
+    if (++i_del_idx >= (HILB_M + 1)) i_del_idx = 0;
   
     hilb_buf[hilb_idx] = (int16_t)q;  
-    hilb_idx = (hilb_idx + 1) % HILB_N;  
+    if (++hilb_idx >= HILB_N) hilb_idx = 0;  
   
-    // Свёртка только по ненулевым отводам, Q15, аккумулятор int64.  
+    // Свёртка по ненулевым отводам. Фильтр антисимметричен:  
+    // hilb_hq15[15-n] == -hilb_hq15[n], а hilb_k[15-n] == HILB_N-1 - hilb_k[n].  
+    // => 16 умножений сводятся к 8: c[n]*(buf[idx_lo] - buf[idx_hi]).  
+    // Умножение 32-битное (|c|<=20654, |diff|<=65534, |произв.|~1.35e9 < INT32_MAX),  
+    // аккумулятор остаётся 64-битным (сумма 8 произв. в худшем случае ~2.2e9 > INT32_MAX).  
     int64_t acc = 0;  
-    for (int n = 0; n < 16; ++n) {  
-        const int k = hilb_k[n];  
-        int idx = hilb_idx + HILB_N - 1 - k;  
-        idx %= HILB_N;  
-        acc += (int64_t)hilb_hq15[n] * (int64_t)hilb_buf[idx];  
+    for (int n = 0; n < 8; ++n) {  
+        const int k = hilb_k[n];               // k = 0,2,...,14  
+  
+        int idx_lo = hilb_idx + HILB_N - 1 - k; // соответствует отводу n  
+        if (idx_lo >= HILB_N) idx_lo -= HILB_N;  
+  
+        int idx_hi = hilb_idx + k;              // соответствует отводу 15-n  
+        if (idx_hi >= HILB_N) idx_hi -= HILB_N;  
+  
+        const int32_t diff = (int32_t)hilb_buf[idx_lo] - (int32_t)hilb_buf[idx_hi];  
+        acc += (int32_t)((int32_t)hilb_hq15[n] * diff);  
     }  
-    const int32_t hq = (int32_t)(acc >> 15);   // обратно в масштаб отсчёта  
+    const int32_t hq = (int32_t)(acc >> 15);   // обратно в масштаб отсчёта
   
     return (rxd_demod_mode == RXD_DEMOD_LSB) ? (i_d + hq) : (i_d - hq);  
 }

@@ -11,9 +11,6 @@
 // ---- Демодулятор ----  
 #define DEMOD_USB  0  
 #define DEMOD_LSB  1  
-#define DEMOD_AM   2  
-#define DEMOD_FM   3  
-#define DEMOD_CW   4  
   
 // Фиксированное усиление сырых I/Q перед упаковкой в PCM.  
 #define RAW_IQ_GAIN 16  
@@ -46,170 +43,7 @@ void rx_audio_set_mode(uint8_t mode) {
 }  
 
 void rx_audio_set_demod(uint8_t demod) { demod_mode = demod; push_demod_to_core1(); }
-
-/*  
-// ---- LPF Butterworth-подобный biquad, Fs=15625 Гц ----  
-// Коэффициенты сохранены из исходного файла.  
-static constexpr float LP_B0 = 0.1933f;  
-static constexpr float LP_B1 = 0.3866f;  
-static constexpr float LP_B2 = 0.1933f;  
-static constexpr float LP_A1 = -0.4317f;  
-static constexpr float LP_A2 = 0.2050f;  
-*/  
-  
-// ============================================================  
-// Простейший НЧ-фильтр первого порядка  
-// Fs = 44100 Гц, Fc примерно 5000 Гц  
-// ============================================================  
-  
-namespace RxAudioPostFilter {  
-  
-static constexpr float ALPHA = 0.5095f;  
-  
-static float state = 0.0f;  
-  
-inline void reset()  
-{  
-    state = 0.0f;  
-}  
-  
-inline float process(float input)  
-{  
-    state += ALPHA * (input - state);  
-    return state;  
-}  
-  
-} // namespace RxAudioPostFilter  
-  
-// Chebyshev I, N=2, ripple=0.5 dB  
-// Fs = 15625 Hz, Fc = 3500 Hz  
-static const float LP_B0 = 0.3060f;  
-static const float LP_B1 = 0.6120f;  
-static const float LP_B2 = 0.3060f;  
-static const float LP_A1 = 0.0130f;  
-static const float LP_A2 = 0.2110f;  
-  
-  
-static float lp_x1 = 0.0f;  
-static float lp_x2 = 0.0f;  
-static float lp_y1 = 0.0f;  
-static float lp_y2 = 0.0f;  
-  
-static inline float lp_filter(float x) {  
-    const float y = LP_B0 * x  
-                  + LP_B1 * lp_x1  
-                  + LP_B2 * lp_x2  
-                  - LP_A1 * lp_y1  
-                  - LP_A2 * lp_y2;  
-  
-    lp_x2 = lp_x1;  
-    lp_x1 = x;  
-    lp_y2 = lp_y1;  
-    lp_y1 = y;  
-    return y;  
-}  
-  
-// ---- FM discriminator state ----  
-static int32_t prev_i = 0;  
-static int32_t prev_q = 0;  
-  
-// ---- Hilbert FIR: 31 taps, Fs=15625 Гц ----  
-#define HILB_N 31  
-#define HILB_M ((HILB_N - 1) / 2)  // 15 отсчётов групповой задержки  
-  
-static float hilb_buf[HILB_N] = {};  
-static int hilb_idx = 0;  
-  
-// Для задержки ровно на 15 входных отсчётов нужен кольцевой буфер  
-// длиной 16: читаем элемент, который был записан 15 вызовов назад.  
-static float i_del[HILB_M + 1] = {};  
-static int i_del_idx = 0;  
-  
-static float am_dc = 0.0f;  
-  
-// Hilbert FIR, 31 taps, Fs=15625, окно Хэмминга, усиление полосы ~1.0.  
-// Антисимметричный, центр (idx 15) = 0, максимум на смещении ±1 (idx 14/16).  
-static const float hilb_h[HILB_N] = {  
-    -0.00340f, 0.0f, -0.00588f, 0.0f, -0.01340f, 0.0f, -0.02820f, 0.0f,  
-    -0.05350f, 0.0f, -0.09800f, 0.0f, -0.19350f, 0.0f, -0.63030f, 0.0f,  
-     0.63030f, 0.0f,  0.19350f, 0.0f,  0.09800f, 0.0f,  0.05350f, 0.0f,  
-     0.02820f, 0.0f,  0.01340f, 0.0f,  0.00588f, 0.0f,  0.00340f  
-};
-  
-// Функция инициализации теперь просто очищает буферы  
-static void hilb_init(void) {  
-    memset(hilb_buf, 0, sizeof(hilb_buf));  
-    memset(i_del, 0, sizeof(i_del));  
-}  
-  
-// Подаёт одну пару I/Q (15625 Гц), возвращает один демодулированный отсчёт.  
-static inline float demod_sample(int32_t i, int32_t q) {  
-    // Записываем текущий I в буфер  
-    i_del[i_del_idx] = (float)i;  
-  
-    // Берем отсчет, который был записан ровно HILB_M шагов назад  
-    int del_read_idx = i_del_idx - HILB_M;  
-    if (del_read_idx < 0) {  
-        del_read_idx += (HILB_M + 1);  
-    }  
-    const float i_d = i_del[del_read_idx];  
-  
-    // Инкремент индекса записи  
-    i_del_idx = (i_del_idx + 1) % (HILB_M + 1);  
-  
-    // Q через Hilbert FIR.  
-    hilb_buf[hilb_idx] = (float)q;  
-    hilb_idx = (hilb_idx + 1) % HILB_N;  
-  
-    float hq = 0.0f;  
-    for (int k = 0; k < HILB_N; ++k) {  
-        const int idx = (hilb_idx + HILB_N - 1 - k) % HILB_N;  
-        hq += hilb_h[k] * hilb_buf[idx];  
-    }  
-  
-    float dem = 0.0f;  
-
-    switch (demod_mode) {
-        case DEMOD_USB:
-            dem = i_d - hq;   // фазовый метод: верхняя боковая 
-            // USB = I_delayed - H(Q)  
-            //dem = i_d - hq;  
-            // dem = i;  
-            break;  
-  
-        case DEMOD_LSB:  
-            // LSB = I_delayed + H(Q)  
-            dem = i_d + hq;  
-            break;  
-  
-        case DEMOD_CW:  
-            // Для CW обычно используют USB или LSB (например, USB)  
-            dem = i;  
-            break;  
-  
-        case DEMOD_AM: {  
-            const float fi = (float)i;  
-            const float fq = (float)q;  
-            const float env = sqrtf(fi * fi + fq * fq);  
-            am_dc += (env - am_dc) * 0.001f;  
-            dem = env - am_dc;  
-            break;  
-        }  
-  
-        case DEMOD_FM:  
-        default: {  
-            const int64_t d = (int64_t)i * (int64_t)prev_q  
-                            - (int64_t)q * (int64_t)prev_i;  
-            prev_i = i;  
-            prev_q = q;  
-            dem = (float)(d >> 8);  
-            break;  
-        }  
-    }  
-  
-    return dem;  
-}  
-  
+ 
 // Необязательная АРУ. В текущем режиме вызов оставлен выключенным,  
 // чтобы сохранить исходный уровень сигнала.  
 static float agc_peak = 4096.0f;  
@@ -476,42 +310,8 @@ static USBAudioStream usb_out;
 static int16_t pcm_buffer[192 * 2];  // до 192 stereo frames  
   
 void rx_audio_init(void) {  
-    // Сброс состояний фильтров и демодулятора.  
-    lp_x1 = lp_x2 = lp_y1 = lp_y2 = 0.0f;  
-    RxAudioPostFilter::reset();  
-  
-    // Стираем ТОЛЬКО рабочие буферы данных, массив коэффициентов hilb_h не трогаем!  
-    memset(hilb_buf, 0, sizeof(hilb_buf));  
-    memset(i_del, 0, sizeof(i_del));  
-    hilb_idx = 0;  
-    i_del_idx = 0;  
-  
-    prev_i = 0;  
-    prev_q = 0;  
-    am_dc = 0.0f;  
     agc_peak = 4096.0f;  
-  
-    // Сброс состояния источника и ресемплера.  
-    bi = nullptr;  
-    bq = nullptr;  
-    cur_n = 0;  
-    pos = 0;  
-  
-    rs_phase = 0.0f;  
-    rs_step  = 15625.0f;
-    rs_x0 = 0.0f;  
-    rs_x1 = 0.0f;  
-    rs_started = false;  
-    rs_init_count = 0;  
-    rs_advance_pending = false;  
-
-    rs_q0 = 0.0f;  
-    rs_q1 = 0.0f;  
-    mode_changed = false;
-  
     memset(pcm_buffer, 0, sizeof(pcm_buffer));  
-    hilb_init(); // Очистит буферы еще раз (для надежности)  
-
     // Синхронизируем демодулятор Core 1 со стартовым режимом (rx_mode/demod_mode),    
     // иначе Core 1 остаётся в RXD_DEMOD_RAW и боковая не давится.    
     push_demod_to_core1();
@@ -527,7 +327,6 @@ void rx_audio_init(void) {
   
     usb_out.begin(cfg);  
 }  
-  
   
 // Вызывать регулярно из loop(). Не вызывать параллельно из таймера:  
 // у USB-потока и ресемплера должен быть один потребитель.  
