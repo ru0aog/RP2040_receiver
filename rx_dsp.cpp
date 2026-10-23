@@ -233,6 +233,59 @@ static inline int32_t __not_in_flash_func(rxd_demod_sample)(int32_t i, int32_t q
 }
 
 
+// ---- Аудио-НЧ-фильтр 3 кГц для SSB (работает на 15.625 ksps, Core 1) ----  
+// Ограничивает полосу демодулированного моно-сигнала до ~3 кГц по -1 дБ.  
+// Оконный sinc (окно Блэкмана), Q15, DC-gain = 1.0. Линейная фаза.  
+#define AF_LP_N     63          // число отводов (нечётное → линейная фаза)  
+#define AF_LP_FC_HZ 3100.0f     // -6 дБ чуть выше 3 кГц → ~ -1 дБ на 3 кГц  
+  
+static int16_t af_lp_taps[AF_LP_N];  
+static int32_t af_lp_buf[AF_LP_N] = {};  
+static int     af_lp_idx = 0;  
+  
+static void af_lp_init(void) {  
+    const int   M  = (AF_LP_N - 1) / 2;  
+    const float fc = AF_LP_FC_HZ / RX_FS_OUT_HZ;   // нормир. частота среза (0..0.5)  
+    float h[AF_LP_N];  
+    float sum = 0.0f;  
+    for (int n = 0; n < AF_LP_N; n++) {  
+        const int m = n - M;  
+        float s = (m == 0) ? (2.0f * fc)  
+                           : sinf(2.0f * PI * fc * m) / (PI * m);   // идеальный sinc  
+        float w = 0.42f - 0.5f  * cosf(2.0f * PI * n / (AF_LP_N - 1))  
+                        + 0.08f * cosf(4.0f * PI * n / (AF_LP_N - 1)); // окно Блэкмана  
+        h[n] = s * w;  
+        sum += h[n];  
+    }  
+    for (int n = 0; n < AF_LP_N; n++)                              // нормировка DC=1, Q15  
+        af_lp_taps[n] = (int16_t)lroundf(h[n] / sum * 32768.0f);  
+}  
+  
+// Один отсчёт НЧ-фильтра. Вызывать на КАЖДОМ emit в SSB — иначе рвётся  
+// линия задержки (как у Гильберта).  
+static inline int32_t __not_in_flash_func(af_lp_push)(int32_t x) {    
+    af_lp_buf[af_lp_idx] = x;    
+    if (++af_lp_idx >= AF_LP_N) af_lp_idx = 0;    // af_lp_idx — самый старый отсчёт    
+    
+    // Линейно-фазный FIR симметричен: taps[k] == taps[N-1-k].    
+    // Сворачиваем пары → 32 умножения вместо 63.    
+    // Умножение 32-битное (единичный MULS на M0+), а не int64 (__aeabi_lmul):    
+    //   |tap| <= ~13000, |buf_lo+buf_hi| <= ~131072 → |произв.| < 1.7e9 < INT32_MAX.    
+    // Аккумулятор держим 64-битным (сумма 32 произв. может превысить INT32_MAX).    
+    int64_t acc = 0;    
+    int lo = af_lp_idx;                  // самый старый (k = 0)    
+    int hi = af_lp_idx + AF_LP_N - 1;    // самый новый (k = N-1)    
+    if (hi >= AF_LP_N) hi -= AF_LP_N;    
+    for (int k = 0; k < AF_LP_N / 2; k++) {              // 31 пара    
+        acc += (int32_t)af_lp_taps[k] * (af_lp_buf[lo] + af_lp_buf[hi]);    
+        if (++lo >= AF_LP_N) lo = 0;    
+        if (--hi < 0)        hi = AF_LP_N - 1;    
+    }    
+    acc += (int32_t)af_lp_taps[AF_LP_N / 2] * af_lp_buf[lo];  // центральный отвод    
+    return (int32_t)((acc + (1 << 14)) >> 15);    // Q15 → масштаб отсчёта, +0.5 LSB    
+}
+
+
 // ---- Инструментирование загрузки Core 1 ----  
 static uint32_t busy_us_acc  = 0;   // время в обработке блоков за окно  
 static uint32_t total_us_acc = 0;   // полное время за окно  
@@ -333,17 +386,16 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
 
             // Насыщение и запись в буфер базовой полосы
             // Если фильтры выдали отсчет (emit == true), выходная очередь не полна, и мы не вылезли за размер блока (64 отсчета)
-           
-           
-           
             if (emit) {  
                 // Гильберт считаем ВСЕГДА (даже при полной очереди), иначе рвётся фаза.  
                 int16_t si, sq;  
                 if (rxd_demod_mode == RXD_DEMOD_RAW) {  
                     si = sat16(vi);  
                     sq = sat16(vq);  
-                } else {  
-                    int16_t m = sat16((int32_t)rxd_demod_sample(vi, vq));  // моно SSB  
+                } else {
+                    int32_t d  = rxd_demod_sample(vi, vq);  // моно SSB, до фильтра  
+                    int32_t df = af_lp_push(d);             // НЧ-фильтр 3 кГц  
+                    int16_t m  = sat16(df);                 // моно SSB  
                     si = m;  
                     sq = m;  
                 }  
@@ -446,6 +498,10 @@ void rx_dsp_start(float f_target_hz) {
     // Инициализация гетеродина
     // Генерирует в ОЗУ таблицу синусов для быстрого смешивания частот
     nco_lut_init();
+    // НЧ-фильтр
+    af_lp_init();                       // коэффициенты НЧ-фильтра 3 кГц  
+    memset(af_lp_buf, 0, sizeof(af_lp_buf));  
+    af_lp_idx = 0;
     // Расчет шага сетки NCO
     // Вычисляет точную математическую разницу между желаемой частотой приема
     // и фактической частотой аппаратного генератора для цифровой подстройки

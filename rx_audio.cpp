@@ -19,8 +19,6 @@
 // SSB верхняя → rx_dsp_set_demod(RXD_DEMOD_USB);
 // SSB нижняя → rx_dsp_set_demod(RXD_DEMOD_LSB).
 
-
-
 // ---- Runtime-состояние режима вывода ----  
 // Стартовый режим — сырые I/Q (как раньше при RAW_IQ_OUT=1).  
 static volatile uint8_t rx_mode     = RX_MODE_SSB;   // старт сразу в SSB-моно  // rx_mode     = RX_MODE_RAW_IQ;  
