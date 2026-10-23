@@ -172,7 +172,7 @@ void setup()
     startReceiver();
   
     // Второй USB-CDC для CAT (FLDigi, Kenwood TS-2000).    
-    // fldigi_cat_init();  
+    fldigi_cat_init();  
 }  
   
 // RP2040_receiver.ino  
@@ -195,7 +195,7 @@ void loop() {
     const uint32_t t_busy_start = time_us_32();    
   
     rx_audio_poll();  
-    // fldigi_cat_poll();   // неблокирующий разбор CAT-команд      
+    fldigi_cat_poll();   // неблокирующий разбор CAT-команд      
     
 #if RTTY_DECODE    
     const int16_t* bi;    
@@ -221,10 +221,12 @@ void loop() {
     static uint32_t t_dbg = 0;    
     if (millis() - t_dbg >= 1000) {    
         t_dbg = millis();    
-        Serial.printf("# CORE0_LOAD=%.1f%% CORE1_LOAD=%.1f%% aud_dropped=%lu out_dropped=%lu\n",    
-                      core0_load_permille / 10.0,    
-                      rx_dsp_load_permille() / 10.0,    
-                      (unsigned long)rx_dsp_aud_dropped(),    
-                      (unsigned long)rx_dsp_out_dropped());    
-    }    
+        Serial.printf("# CORE0_LOAD=%.1f%% CORE1_LOAD=%.1f%% aud_dropped=%lu out_dropped=%lu clip=%lu\n",  
+                      core0_load_permille / 10.0,  
+                      rx_dsp_load_permille() / 10.0,  
+                      (unsigned long)rx_dsp_aud_dropped(),  
+                      (unsigned long)rx_dsp_out_dropped(),  
+                      (unsigned long)rx_dsp_clip_count());   
+    }
+
 }

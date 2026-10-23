@@ -11,7 +11,6 @@
 #include <string.h>  
 #include <stdlib.h>  
   
-static Adafruit_USBD_CDC CatSerial;  
 static bool cat_enabled = false;  
   
 // Буфер накопления одной CAT-команды (до ';').  
@@ -28,15 +27,8 @@ static const char CAT_MODE = '2';
 // ---- Ответы ------------------------------------------------------------------  
   
 static void cat_send(const char* s) {
-    Serial.printf("# CAT_TX <%s>\n", s);
-
-    for (size_t i = 0; i < strlen(s); i++) {
-        Serial.printf("%02X ", (uint8_t)s[i]);
-    }
-    Serial.println();
-
-    CatSerial.write((const uint8_t*)s, strlen(s));
-    CatSerial.flush();
+    Serial.write((const uint8_t*)s, strlen(s));
+    Serial.flush();
 }
   
 // FA + 11 цифр частоты + ';'  
@@ -139,17 +131,7 @@ static void cat_execute(const char* cmd) {
 // ---- Публичный API -----------------------------------------------------------  
   
 void fldigi_cat_init(void) {  
-    CatSerial.setStringDescriptor("RP2040 RX CAT");  
-    CatSerial.begin(115200);  
-    cat_enabled = (Adafruit_USBD_CDC::getInstanceCount() >= 2);  
-  
-    // Интерфейс, добавленный после энумерации, появится только после  
-    // переподключения — как в hayes_modem_init() маяка.  
-    if (cat_enabled && TinyUSBDevice.mounted()) {  
-        TinyUSBDevice.detach();  
-        delay(10);  
-        TinyUSBDevice.attach();  
-    }  
+    cat_enabled = true;   // CAT идёт по основному Serial, отдельный CDC не поднимаем  
     cat_len = 0;  
 }  
   
@@ -158,18 +140,17 @@ void fldigi_cat_poll(void) {
   
     // Терминал только что открыл порт: чистим входной буфер и недособранную  
     // команду, чтобы спурьёзный байт от detach()/attach() не испортил разбор.  
-    bool dtr = CatSerial.dtr();  
+    bool dtr = Serial.dtr();  
     if (!cat_prev_dtr && dtr) {  
-        while (CatSerial.available() > 0) CatSerial.read();  
+        while (Serial.available() > 0) Serial.read();  
         cat_len = 0;  
     }  
     cat_prev_dtr = dtr;  
   
-    while (CatSerial.available() > 0) {  
-        char c = (char)CatSerial.read();  
+    while (Serial.available() > 0) {  
+        char c = (char)Serial.read();  
         if (c == ';') {  
             cat_buf[cat_len] = '\0';
-            Serial.printf("# CAT_RX <%s;>\n", cat_buf);   // DEBUG: убрать после отладки  
             cat_execute(cat_buf);  
             cat_len = 0;  
         } else if (c != '\r' && c != '\n') {  

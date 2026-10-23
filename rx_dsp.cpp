@@ -27,7 +27,9 @@
 // NCO: 32-битный фазовый аккумулятор  
 static volatile uint32_t nco_phase = 0;  
 static volatile uint32_t nco_step  = 0;     // 2^32 * f_nco / Fs_in  
-  
+
+static volatile uint32_t clip_count = 0;   // диагностика: число срабатываний лимитера
+
 // sin/cos LUT: 1024 точки, Q15, квадратурная пара  
 // табличная генерация опорного гармонического сигнала (LUT — Look-Up Table)
 static int16_t nco_lut[1024];       // таблица LUT 1024*16бит = 2 кБ
@@ -97,9 +99,9 @@ static inline bool cic_push_iq(int32_t xi, int32_t xq, int32_t* yi, int32_t* yq)
         int32_t dq = tq - cic_comb_q[k]; cic_comb_q[k] = tq; tq = dq;  
     }  
   
-// DC-gain CIC = R^N = 2^3 = 8 → возвращаем масштаб    
-    *yi = ti >> 3;    
-    *yq = tq >> 3;
+// DC-gain CIC = R^N = 2^3 = 8 → возвращаем масштаб (с округлением, +0.5 LSB)  
+    *yi = (ti + 4) >> 3;      
+    *yq = (tq + 4) >> 3;
     return true;  
 }
 
@@ -127,10 +129,11 @@ static inline bool hb_push(hb_state_t* st, int32_t x, int32_t* out) {
         // цифровое умножение отсчёта сигнала на соответствующий коэффициент фильтра (hb_taps)
         acc += st->d[idx] * st->taps[k];  
     }
-    // Масштабирование и выдача готового отсчёта
-    *out = acc >> 15;
+    // Масштабирование и выдача готового отсчёта (с округлением, +0.5 LSB)  
+    *out = (acc + (1 << 14)) >> 15;
     return true;
 }
+
 
 // 16-битный ограничитель
 static inline int16_t sat16(int32_t v) {
@@ -138,6 +141,7 @@ static inline int16_t sat16(int32_t v) {
 // Если значение ушло ниже минимального порога -32768, оно ограничивается снизу до -32768
 // Если значение находится в безопасных пределах, оно возвращается без изменений
     if ((v >> 15) ^ (v >> 31)) {
+        clip_count++;                       // сигнал упёрся в потолок int16  
         return (v >> 31) ^ 0x7FFF;
     }
     return (int16_t)v;
@@ -294,7 +298,7 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
                 // Производится комплексное умножение вектора входного сигнала на вектор гетеродинирования
                 // Сдвиг >> 15 возвращает результат из формата Q15 обратно к обычным целым числам
                 // После этой операции целевой радиосигнал математически смещается в нулевую промежуточную частоту
-                int32_t i_rot = (i_raw * cs + q_raw * sn) >> 15;
+                int32_t i_rot = (i_raw * cs + q_raw * sn) >> 15;  
                 int32_t q_rot = (q_raw * cs - i_raw * sn) >> 15;
 
  
@@ -422,7 +426,8 @@ void rx_dsp_start(float f_target_hz) {
     out_head = out_tail = 0;
 
     aud_head = aud_tail = aud_wr_n = 0;    
-    aud_dropped = 0;  
+    aud_dropped = 0;
+    clip_count = 0;
   
     // сброс демодулятора, перенесённого на Core 1  
     memset(hilb_buf, 0, sizeof(hilb_buf));  
@@ -523,9 +528,14 @@ uint32_t rx_dsp_load_permille(void) {
     return dsp_load_permille;  
 }  
   
-// Счётчик дропов аудио-очереди (переполнение aud на Core 1).  
-uint32_t rx_dsp_aud_dropped(void) {  
-    return aud_dropped;  
+// Счётчик дропов аудио-очереди (переполнение aud на Core 1).    
+uint32_t rx_dsp_aud_dropped(void) {    
+    return aud_dropped;    
+}  
+  
+// Счётчик срабатываний лимитера sat16 — диагностика клиппинга сверху.  
+uint32_t rx_dsp_clip_count(void) {  
+    return clip_count;  
 }
 
 // возвращает фактическую частоту дискретизации сигнала базовой полосы на выходе DSP-тракта
