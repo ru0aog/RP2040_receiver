@@ -1,4 +1,6 @@
-# Pico-SDR SSB/RTTY Receiver (RP2040)  
+[![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/ru0aog/RP2040_beacon)
+
+# 🛰️ Pico-SDR SSB/RTTY Receiver (RP2040)  
   
 [![Platform: RP2040](https://shields.io)](https://raspberrypi.com)  
 [![Framework: Arduino-Pico](https://shields.io)](https://github.com/earlephilhower/arduino-pico)  
@@ -15,7 +17,7 @@
   
 ---  
   
-## Возможности  
+## ⚡ Основные возможности
   
 * **Прямая квадратурная оцифровка.** Два канала ADC (GPIO26=I, GPIO27=Q) в  
   round-robin на суммарной частоте `250 ksps` (`125 ksps` на канал).  
