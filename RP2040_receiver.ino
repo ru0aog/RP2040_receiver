@@ -175,30 +175,56 @@ void setup()
     // fldigi_cat_init();  
 }  
   
-void loop() {  
-    rx_audio_poll();
-    // fldigi_cat_poll();   // неблокирующий разбор CAT-команд    
+// RP2040_receiver.ino  
+void loop() {    
+    // --- Учёт загрузки Core 0 (по образцу Core 1) ---    
+    // total: полное время итерации; busy: время внутри рабочих функций.    
+    // Прим.: у Core 0 нет явного idle-маркера, метрика = доля wall-clock,    
+    // проведённая в rx_audio_poll()/RTTY, а не «истинная» занятость CPU.    
+    static uint32_t t_prev       = 0;    
+    static uint32_t busy_us_acc  = 0;    
+    static uint32_t total_us_acc = 0;    
+    static uint32_t core0_load_permille = 0;    
+    static bool     t_prev_init  = false;    
   
-#if RTTY_DECODE  
-    // Потребитель базовой полосы 15.625 ksps для matched-filter RTTY.  
-    const int16_t* bi;  
-    const int16_t* bq;  
-    uint8_t n;  
-    while (rx_dsp_get_output(&bi, &bq, &n)) {  
-        for (uint8_t k = 0; k < n; k++) {  
-            rx_mf_sample(bi[k], bq[k]);  
-        }  
-        rx_dsp_release_output();  
-    }  
-#endif
-    // Диагностика: загрузка Core 1 и дропы, раз в секунду.  
-    static uint32_t t_dbg = 0;  
-    if (millis() - t_dbg >= 1000) {  
-        t_dbg = millis();  
-        Serial.printf("# CORE1_LOAD=%.1f%% aud_dropped=%lu out_dropped=%lu\n",  
-                      rx_dsp_load_permille() / 10.0,  
-                      (unsigned long)rx_dsp_aud_dropped(),  
-                      (unsigned long)rx_dsp_out_dropped());  
-    }  
+    const uint32_t t_now = time_us_32();    
+    if (!t_prev_init) { t_prev = t_now; t_prev_init = true; }    
+    total_us_acc += (t_now - t_prev);    
+    t_prev = t_now;    
+  
+    const uint32_t t_busy_start = time_us_32();    
+  
+    rx_audio_poll();  
+    // fldigi_cat_poll();   // неблокирующий разбор CAT-команд      
+    
+#if RTTY_DECODE    
+    const int16_t* bi;    
+    const int16_t* bq;    
+    uint8_t n;    
+    while (rx_dsp_get_output(&bi, &bq, &n)) {    
+        for (uint8_t k = 0; k < n; k++) {    
+            rx_mf_sample(bi[k], bq[k]);    
+        }    
+        rx_dsp_release_output();    
+    }    
+#endif  
+  
+    busy_us_acc += (time_us_32() - t_busy_start);    
+  
+    if (total_us_acc >= 1000000u) {    
+        core0_load_permille = (uint32_t)(((uint64_t)busy_us_acc * 1000u) / total_us_acc);    
+        busy_us_acc  = 0;    
+        total_us_acc = 0;    
+    }    
+  
+    // Диагностика: загрузка Core 0/Core 1 и дропы, раз в секунду.    
+    static uint32_t t_dbg = 0;    
+    if (millis() - t_dbg >= 1000) {    
+        t_dbg = millis();    
+        Serial.printf("# CORE0_LOAD=%.1f%% CORE1_LOAD=%.1f%% aud_dropped=%lu out_dropped=%lu\n",    
+                      core0_load_permille / 10.0,    
+                      rx_dsp_load_permille() / 10.0,    
+                      (unsigned long)rx_dsp_aud_dropped(),    
+                      (unsigned long)rx_dsp_out_dropped());    
+    }    
 }
-

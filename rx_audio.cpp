@@ -174,10 +174,14 @@ static bool rs_started = false;
 static uint8_t rs_init_count = 0;  
 static bool rs_advance_pending = false;  
 
+// rx_audio.cpp  
 static float rs_phase = 0.0f;  
 // Адаптивный шаг ресемплера. Номинал 15625 (отношение 15625/44100).  
 // Подстраивается по заполнению aud-очереди в rx_audio_poll().  
-static float rs_step = 15625.0f;
+static float rs_step = 15625.0f;  
+  
+// 1/Fout: умножение дешевле программного float-деления на RP2040 (нет FPU).  
+static const float RS_INV_OUT = 1.0f / 44100.0f;
 
 // Второй канал (Q) ресемплера. Фаза rs_phase общая для I и Q,  
 // чтобы каналы не разъехались во времени.  
@@ -252,9 +256,10 @@ static bool next_frame(int16_t* l, int16_t* r) {
             rs_advance_pending = false;  
         }  
   
-        const float frac = rs_phase / 44100.0f;  
+        // RX_MODE_RAW_IQ  
+        const float frac = rs_phase * RS_INV_OUT;  
         const float yi = rs_x0 + (rs_x1 - rs_x0) * frac;  
-        const float yq = rs_q0 + (rs_q1 - rs_q0) * frac;  
+        const float yq = rs_q0 + (rs_q1 - rs_q0) * frac; 
     
         rs_phase += rs_step;  
         if (rs_phase >= 44100.0f) {  
@@ -290,8 +295,9 @@ static bool next_frame(int16_t* l, int16_t* r) {
         rs_advance_pending = false;  
     }  
   
-    const float frac = rs_phase / 44100.0f;  
-    const float y = rs_x0 + (rs_x1 - rs_x0) * frac;  
+    // RX_MODE_SSB  
+    const float frac = rs_phase * RS_INV_OUT;  
+    const float y = rs_x0 + (rs_x1 - rs_x0) * frac; 
   
     rs_phase += rs_step;  
     if (rs_phase >= 44100.0f) {  
