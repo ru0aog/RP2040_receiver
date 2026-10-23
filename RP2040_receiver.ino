@@ -87,68 +87,8 @@ static void startReceiver()
 }
 
 
-  
-// Разгон clk_sys по образцу vfo_set_clk_sys из vfo_hardware.cpp.  
-// ВСЯ процедура в RAM: нельзя обращаться к флэшу, пока SSI переинициализируется.  
-static void __not_in_flash_func(oc_set_clk_sys)(  
-        uint32_t vco_hz, uint32_t p1, uint32_t p2,  
-        uint32_t target_hz, vreg_voltage vsel)  
-{  
-    const uint32_t OC_XOSC_HZ = 12000000u;
-    const uint32_t FLASH_MAX  = 48000000u;  
-  
-    // Делитель SCK флэша от целевой частоты (ceil, чётный, [2..34]).  
-    uint32_t ssi_baud = (target_hz + FLASH_MAX - 1u) / FLASH_MAX;  
-    ssi_baud = (ssi_baud + 1u) & ~1u;  
-    if (ssi_baud < 2u)  ssi_baud = 2u;  
-    if (ssi_baud > 34u) ssi_baud = 34u;  
-  
-    // 1. Поднять напряжение ДО разгона.  
-    vreg_set_voltage(vsel);  
-    busy_wait_us(500);  
-  
-    uint32_t ints = save_and_disable_interrupts();  
-  
-    // 2. clk_sys -> XOSC 12 МГц: SCK флэша = 6 МГц, трогать SSI безопасно.  
-    clock_configure(clk_sys,  
-                    CLOCKS_CLK_SYS_CTRL_SRC_VALUE_CLKSRC_CLK_SYS_AUX,  
-                    CLOCKS_CLK_SYS_CTRL_AUXSRC_VALUE_XOSC_CLKSRC,  
-                    OC_XOSC_HZ, OC_XOSC_HZ);  
-  
-    // 3. Переинициализировать PLL_SYS и дождаться LOCK.  
-    pll_init(pll_sys, 1, vco_hz, p1, p2);  
-    uint32_t to = 20000u;  
-    while (!(pll_sys_hw->cs & PLL_CS_LOCK_BITS) && --to) tight_loop_contents();  
-  
-    // 4. Переписать делитель флэша, пока ещё на XOSC.  
-    __dmb();  
-    ssi_hw->ssienr = 0;  
-    ssi_hw->baudr  = ssi_baud;  
-    ssi_hw->ssienr = 1;  
-    __dmb();  
-  
-    // 5. clk_sys -> PLL_SYS (целевая частота). SCK = target/ssi_baud <= 48 МГц.  
-    clock_configure(clk_sys,  
-                    CLOCKS_CLK_SYS_CTRL_SRC_VALUE_CLKSRC_CLK_SYS_AUX,  
-                    CLOCKS_CLK_SYS_CTRL_AUXSRC_VALUE_CLKSRC_PLL_SYS,  
-                    target_hz, target_hz);  
-  
-    restore_interrupts(ints);  
-}
-
 void setup()  
 {
-
-    // Разгон: VCO=1560 МГц, p1=3, p2=4 -> clk_sys = 130 МГц.  
-    // Для 130 МГц vreg можно оставить номинал, но берём 1.15 В для запаса.  
-    // oc_set_clk_sys(1560000000u, 3, 4, 130000000u, VREG_VOLTAGE_1_15);  
-  
-    // Периферия (ADC + TinyUSB) строго на pll_usb 48 МГц, независимо от clk_sys.  
-    clock_configure(  
-        clk_peri, 0,  
-        CLOCKS_CLK_PERI_CTRL_AUXSRC_VALUE_CLKSRC_PLL_USB,  
-        48000000UL, 48000000UL);  
-  
     rx_audio_init();  
  
     Serial.begin(115200);  
@@ -159,16 +99,7 @@ void setup()
         TinyUSBDevice.task();  
         #endif  
     }  
-  
-    // clk_sys = 129.333 МГц (VCO 1164 МГц / 9) — при этой частоте делитель  
-    // квадратурного LO для 3.6 МГц выходит целым (D=9), джиттера нет.  
-    // pll_usb (48 МГц) не трогаем: ADC и USB работают как раньше.  
-    set_sys_clock_pll(1164UL * 1000 * 1000, 3, 3);
 
-
-  
-
-  
     startReceiver();
   
     // Второй USB-CDC для CAT (FLDigi, Kenwood TS-2000).    
