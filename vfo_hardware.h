@@ -61,7 +61,11 @@ uint8_t  rx_dsp_aud_fill(void);   // заполнение очереди aud д�
 #define RXD_DEMOD_USB 1  
 #define RXD_DEMOD_LSB 2  
 void rx_dsp_set_demod(uint8_t mode);
-  
+// Перестраиваемая полоса AF-фильтра (SSB), Гц. f_lo=0 → поведение прежнего ФНЧ.  
+void     rx_dsp_set_af_band(uint32_t f_lo_hz, uint32_t f_hi_hz);  
+uint32_t rx_dsp_af_lo_hz(void);  
+uint32_t rx_dsp_af_hi_hz(void);
+
 // Бортовой RTTY-декодер: единая точка правды, видна и в .ino, и в rx_dsp.cpp.    
 #ifndef RTTY_DECODE    
 #define RTTY_DECODE 0    

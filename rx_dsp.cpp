@@ -248,32 +248,56 @@ static inline int32_t __not_in_flash_func(rxd_demod_sample)(int32_t i, int32_t q
 
 
 // ---- Аудио-НЧ-фильтр 3 кГц для SSB (работает на 15.625 ksps, Core 1) ----  
-// Ограничивает полосу демодулированного моно-сигнала до ~3 кГц по -1 дБ.  
-// Оконный sinc (окно Блэкмана), Q15, DC-gain = 1.0. Линейная фаза.  
 #define AF_LP_N     63          // число отводов (нечётное → линейная фаза)  
-#define AF_LP_FC_HZ 3100.0f     // -6 дБ чуть выше 3 кГц → ~ -1 дБ на 3 кГц  
+  
+// Текущие края полосы (Гц). По умолчанию 0..3100 — как прежний ФНЧ 3 кГц.  
+static volatile uint32_t af_lo_hz = 0;  
+static volatile uint32_t af_hi_hz = 3100;  
   
 static int16_t af_lp_taps[AF_LP_N];  
 static int32_t af_lp_buf[AF_LP_N] = {};  
 static int     af_lp_idx = 0;  
   
+// Пересчёт таблицы под текущие af_lo_hz/af_hi_hz.  
+// Полосовой = lowpass(fc_hi) - lowpass(fc_lo). При fc_lo=0 → чистый ФНЧ.  
 static void af_lp_init(void) {  
-    const int   M  = (AF_LP_N - 1) / 2;  
-    const float fc = AF_LP_FC_HZ / RX_FS_OUT_HZ;   // нормир. частота среза (0..0.5)  
+    const int   M     = (AF_LP_N - 1) / 2;  
+    const float fc_hi = (float)af_hi_hz / RX_FS_OUT_HZ;   // верхний срез (0..0.5)  
+    const float fc_lo = (float)af_lo_hz / RX_FS_OUT_HZ;   // нижний срез  (0..0.5)  
     float h[AF_LP_N];  
-    float sum = 0.0f;  
+    float sum_dc = 0.0f;   // сумма отводов (для нормировки усиления в полосе)  
     for (int n = 0; n < AF_LP_N; n++) {  
         const int m = n - M;  
-        float s = (m == 0) ? (2.0f * fc)  
-                           : sinf(2.0f * PI * fc * m) / (PI * m);   // идеальный sinc  
+        // Два идеальных sinc: верхний и нижний срез.  
+        float s_hi = (m == 0) ? (2.0f * fc_hi)  
+                              : sinf(2.0f * PI * fc_hi * m) / (PI * m);  
+        float s_lo = (m == 0) ? (2.0f * fc_lo)  
+                              : sinf(2.0f * PI * fc_lo * m) / (PI * m);  
         float w = 0.42f - 0.5f  * cosf(2.0f * PI * n / (AF_LP_N - 1))  
                         + 0.08f * cosf(4.0f * PI * n / (AF_LP_N - 1)); // окно Блэкмана  
-        h[n] = s * w;  
-        sum += h[n];  
+        h[n] = (s_hi - s_lo) * w;                      // полосовой импульсный отклик  
+        // Усиление в центре полосы оцениваем по модулю отводов (DC у ПФ = 0).  
+        sum_dc += fabsf(h[n]);  
     }  
-    for (int n = 0; n < AF_LP_N; n++)                              // нормировка DC=1, Q15  
-        af_lp_taps[n] = (int16_t)lroundf(h[n] / sum * 32768.0f);  
+    // Нормируем так, чтобы пик АЧХ в полосе был ~1.0 (без переполнения Q15).  
+    const float norm = (sum_dc > 0.0f) ? (2.0f / sum_dc) : 1.0f;  
+    for (int n = 0; n < AF_LP_N; n++)  
+        af_lp_taps[n] = (int16_t)lroundf(h[n] * norm * 32768.0f);  
 }  
+  
+// Рантайм-установка полосы (вызывается из CAT). f_lo/f_hi в Гц.  
+// Применяется зажатие в разумные пределы и защита f_lo < f_hi.  
+void rx_dsp_set_af_band(uint32_t f_lo_hz, uint32_t f_hi_hz) {  
+    const uint32_t FS2 = (uint32_t)(RX_FS_OUT_HZ * 0.5f);   // Найквист ~7812 Гц  
+    if (f_hi_hz > FS2 - 200) f_hi_hz = FS2 - 200;  
+    if (f_lo_hz >= f_hi_hz)  f_lo_hz = (f_hi_hz > 100) ? (f_hi_hz - 100) : 0;  
+    af_lo_hz = f_lo_hz;  
+    af_hi_hz = f_hi_hz;  
+    af_lp_init();          // пересчёт таблицы (редкая операция, не в горячем пути)  
+}  
+  
+uint32_t rx_dsp_af_lo_hz(void) { return af_lo_hz; }  
+uint32_t rx_dsp_af_hi_hz(void) { return af_hi_hz; }
   
 // Один отсчёт НЧ-фильтра. Вызывать на КАЖДОМ emit в SSB — иначе рвётся  
 // линия задержки (как у Гильберта).  

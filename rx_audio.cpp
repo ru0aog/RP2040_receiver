@@ -184,6 +184,50 @@ static inline int16_t raw_iq_clip(float x) {
     return (int16_t)g;  
 }  
 
+// ---- Антиалиасинг-ФНЧ на выходе 44100 Гц (подавление образов ресемплера >12 кГц) ----  
+// Каскад 2 секций → Баттерворт 4-го порядка, fc ≈ 3300 Гц (полоса 0…3 кГц ровная ≤1 дБ).  
+// Коэффициенты Q13 (1.0 = 8192), Direct Form I, int64-аккумулятор.  
+// ВНИМАНИЕ: значения стартовые — проверить/подстроить на железе по реальной АЧХ.  
+#define BQ_Q 13  
+  
+typedef struct {  
+    int32_t b0, b1, b2, a1, a2;   // a1,a2 с «родным» знаком RBJ (вычитаются в DF-I)  
+    int64_t z1, z2;               // состояние (int64 — запас от переполнения)  
+} biquad_t;  
+  
+// Две секции 4-го порядка Баттерворта, fc=3300 Гц @ 44100 (Q=0.5412 и Q=1.3066):  
+static biquad_t bq_ssb[2] = {  
+    { 314, 628, 314, -10292, 3355, 0, 0 },  
+    { 380, 759, 380, -12444, 5769, 0, 0 },  
+};  
+static biquad_t bq_i[2] = {   // RAW_IQ: отдельный экземпляр на I  
+    { 314, 628, 314, -10292, 3355, 0, 0 },  
+    { 380, 759, 380, -12444, 5769, 0, 0 },  
+};  
+static biquad_t bq_q[2] = {   // RAW_IQ: отдельный экземпляр на Q  
+    { 314, 628, 314, -10292, 3355, 0, 0 },  
+    { 380, 759, 380, -12444, 5769, 0, 0 },  
+};  
+  
+static inline int32_t __not_in_flash_func(biquad_run)(biquad_t* s, int32_t x) {  
+    int64_t acc = (int64_t)s->b0 * x + s->z1;  
+    int32_t y   = (int32_t)(acc >> BQ_Q);  
+    s->z1 = (int64_t)s->b1 * x - (int64_t)s->a1 * y + s->z2;  
+    s->z2 = (int64_t)s->b2 * x - (int64_t)s->a2 * y;  
+    return y;  
+}  
+  
+static inline int32_t biquad_cascade(biquad_t* sec, int32_t x) {  
+    x = biquad_run(&sec[0], x);  
+    x = biquad_run(&sec[1], x);  
+    return x;  
+}  
+  
+static inline void biquad_reset(biquad_t* sec) {  
+    sec[0].z1 = sec[0].z2 = 0;  
+    sec[1].z1 = sec[1].z2 = 0;  
+}
+
 // Коэффициенты Catmull-Rom, умноженные на 2 (чтобы убрать 0.5). int32.  
 static int32_t rs_c0 = 0, rs_c1 = 0, rs_c2 = 0, rs_c3 = 0;      // SSB / I  
 static int32_t rs_cq0 = 0, rs_cq1 = 0, rs_cq2 = 0, rs_cq3 = 0;  // Q (RAW_IQ)
@@ -215,13 +259,16 @@ static bool next_frame(int16_t* l, int16_t* r) {
   
     // Запрос смены режима: сбрасываем ресемплер и отпускаем удерживаемый блок,  
     // чтобы стерео(2 канала) и моно(1 канал) не перемешались в интерполяторе.  
-    if (mode_changed) {  
-        mode_changed      = false;  
-        rs_started        = false;  
-        rs_init_count     = 0;  
-        rs_advance_pending = false;  
-        rs_phase_q         = 0;  
-        if (cur_n != 0) {  
+    if (mode_changed) {    
+        mode_changed      = false;    
+        rs_started        = false;    
+        rs_init_count     = 0;    
+        rs_advance_pending = false;    
+        rs_phase_q         = 0;    
+        biquad_reset(bq_ssb);     // сброс фильтров, чтобы не щёлкало на SSB↔RAW_IQ  
+        biquad_reset(bq_i);    
+        biquad_reset(bq_q);    
+        if (cur_n != 0) {
             rx_dsp_release_audio();  
             cur_n = 0;  
             pos   = 0;  
@@ -279,18 +326,20 @@ static bool next_frame(int16_t* l, int16_t* r) {
         }
   
         // RX_MODE_RAW_IQ  
-        const uint32_t mu_q15 = rs_phase_q >> 17;  
-        const int32_t  yi2 = farrow_eval_i(rs_c0,  rs_c1,  rs_c2,  rs_c3,  mu_q15);  
-        const int32_t  yq2 = farrow_eval_i(rs_cq0, rs_cq1, rs_cq2, rs_cq3, mu_q15);  
-        const float    yi  = (float)((yi2 + 1) >> 1);  
-        const float    yq  = (float)((yq2 + 1) >> 1);  
-        
-        const uint32_t prev = rs_phase_q;  
-        rs_phase_q += rs_step_q;  
-        if (rs_phase_q < prev) rs_advance_pending = true;
-  
-        *l = raw_iq_clip(yi);  // I -> левый  
-        *r = raw_iq_clip(yq);  // Q -> правый  
+        const uint32_t mu_q15 = rs_phase_q >> 17;    
+        const int32_t  yi2 = farrow_eval_i(rs_c0,  rs_c1,  rs_c2,  rs_c3,  mu_q15);    
+        const int32_t  yq2 = farrow_eval_i(rs_cq0, rs_cq1, rs_cq2, rs_cq3, mu_q15);    
+        int32_t        yi  = (yi2 + 1) >> 1;    
+        int32_t        yq  = (yq2 + 1) >> 1;    
+        yi = biquad_cascade(bq_i, yi);     // антиалиасинг-ФНЧ на I  
+        yq = biquad_cascade(bq_q, yq);     // антиалиасинг-ФНЧ на Q  
+          
+        const uint32_t prev = rs_phase_q;    
+        rs_phase_q += rs_step_q;    
+        if (rs_phase_q < prev) rs_advance_pending = true;  
+    
+        *l = raw_iq_clip((float)yi);  // I -> левый    
+        *r = raw_iq_clip((float)yq);  // Q -> правый
         return true;  
     }  
   
@@ -330,15 +379,16 @@ static bool next_frame(int16_t* l, int16_t* r) {
     }
   
     // RX_MODE_SSB  
-    const uint32_t mu_q15 = rs_phase_q >> 17;          // старшие 15 бит фазы  
-    const int32_t  y2x    = farrow_eval_i(rs_c0, rs_c1, rs_c2, rs_c3, mu_q15);  
-    const float    y      = (float)((y2x + 1) >> 1);   // 2*y -> y с округлением  
+    const uint32_t mu_q15 = rs_phase_q >> 17;          // старшие 15 бит фазы    
+    const int32_t  y2x    = farrow_eval_i(rs_c0, rs_c1, rs_c2, rs_c3, mu_q15);    
+    int32_t        y      = (y2x + 1) >> 1;            // 2*y -> y с округлением    
+    y = biquad_cascade(bq_ssb, y);                     // антиалиасинг-ФНЧ 44.1 кГц  
+      
+    const uint32_t prev = rs_phase_q;    
+    rs_phase_q += rs_step_q;    
+    if (rs_phase_q < prev) rs_advance_pending = true;  // перенос 2^32 = сдвиг окна  
     
-    const uint32_t prev = rs_phase_q;  
-    rs_phase_q += rs_step_q;  
-    if (rs_phase_q < prev) rs_advance_pending = true;  // перенос 2^32 = сдвиг окна
-  
-    const int16_t s = agc_limit(y);  
+    const int16_t s = agc_limit(y);                    // agc_limit(int32_t) — ок
     *l = s;  
     *r = s;  
     return true;  
