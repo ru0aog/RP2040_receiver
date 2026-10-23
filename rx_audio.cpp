@@ -10,7 +10,9 @@
   
 // ---- Демодулятор ----  
 #define DEMOD_USB  0  
-#define DEMOD_LSB  1  
+#define DEMOD_LSB  1
+#define DEMOD_AM   2    
+#define DEMOD_FM   3
   
 // Фиксированное усиление сырых I/Q перед упаковкой в PCM.  
 #define RAW_IQ_GAIN 16  
@@ -28,7 +30,12 @@ static volatile bool    mode_changed = false;      // запрос на сбро
 // хелпер: перевести (rx_mode, demod_mode) в режим Core 1  
 static void push_demod_to_core1(void) {  
     if (rx_mode == RX_MODE_SSB) {  
-        rx_dsp_set_demod(demod_mode == DEMOD_LSB ? RXD_DEMOD_LSB : RXD_DEMOD_USB);  
+        switch (demod_mode) {    
+            case DEMOD_LSB: rx_dsp_set_demod(RXD_DEMOD_LSB); break;    
+            case DEMOD_AM:  rx_dsp_set_demod(RXD_DEMOD_AM);  break;    
+            case DEMOD_FM:  rx_dsp_set_demod(RXD_DEMOD_FM);  break;    
+            default:        rx_dsp_set_demod(RXD_DEMOD_USB); break;    
+        }    
     } else {  
         rx_dsp_set_demod(RXD_DEMOD_RAW);   // сырой I/Q и тест  
     }  
@@ -195,21 +202,6 @@ typedef struct {
     int64_t z1, z2;               // состояние (int64 — запас от переполнения)  
 } biquad_t;  
   
-/*
-// Две секции 4-го порядка Баттерворта, fc=3300 Гц @ 44100 (Q=0.5412 и Q=1.3066):  
-static biquad_t bq_ssb[2] = {  
-    { 314, 628, 314, -10292, 3355, 0, 0 },  
-    { 380, 759, 380, -12444, 5769, 0, 0 },  
-};
-static biquad_t bq_i[2] = {   // RAW_IQ: отдельный экземпляр на I  
-    { 314, 628, 314, -10292, 3355, 0, 0 },  
-    { 380, 759, 380, -12444, 5769, 0, 0 },  
-};  
-static biquad_t bq_q[2] = {   // RAW_IQ: отдельный экземпляр на Q  
-    { 314, 628, 314, -10292, 3355, 0, 0 },  
-    { 380, 759, 380, -12444, 5769, 0, 0 },  
-};  
-*/
 // Две секции 4-го порядка Баттерворта, fc=5300 Гц @ 44100 (Q=0.5412 и Q=1.3066):
 static biquad_t bq_ssb[2] = {  
     { 682, 1363, 682, -7305, 1840, 0, 0 },  

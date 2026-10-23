@@ -59,7 +59,9 @@ uint8_t  rx_dsp_aud_fill(void);   // заполнение очереди aud д�
 // Демодулятор на Core 1 (USB-аудио):  
 #define RXD_DEMOD_RAW 0  
 #define RXD_DEMOD_USB 1  
-#define RXD_DEMOD_LSB 2  
+#define RXD_DEMOD_LSB 2
+#define RXD_DEMOD_AM  3   // амплитудный детектор (огибающая)    
+#define RXD_DEMOD_FM  4   // частотный дискриминатор  
 void rx_dsp_set_demod(uint8_t mode);
 // Перестраиваемая полоса AF-фильтра (SSB), Гц. f_lo=0 → поведение прежнего ФНЧ.  
 void     rx_dsp_set_af_band(uint32_t f_lo_hz, uint32_t f_hi_hz);  

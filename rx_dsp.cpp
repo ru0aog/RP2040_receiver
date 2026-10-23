@@ -186,7 +186,9 @@ static uint8_t aud_wr_n = 0;             // заполнение текущег�
 // ---- Демодулятор, перенесён с Core 0 (rx_audio.cpp) ----  
 #define RXD_DEMOD_RAW 0   // сырые I/Q в aud (стерео)  
 #define RXD_DEMOD_USB 1   // верхняя боковая, моно  
-#define RXD_DEMOD_LSB 2   // нижняя боковая, моно  
+#define RXD_DEMOD_LSB 2   // нижняя боковая, моно
+#define RXD_DEMOD_AM  3   // амплитудный детектор (огибающая)    
+#define RXD_DEMOD_FM  4   // частотный дискриминатор    
 static volatile uint8_t rxd_demod_mode = RXD_DEMOD_RAW;  // ставит Core 0  
 
 // ---- Hilbert FIR: 31 taps, Q15 fixed-point ----  
@@ -246,6 +248,34 @@ static inline int32_t __not_in_flash_func(rxd_demod_sample)(int32_t i, int32_t q
     return (rxd_demod_mode == RXD_DEMOD_LSB) ? (i_d + hq) : (i_d - hq);  
 }
 
+// ---- AM: детектор огибающей (без sqrt), alpha-max-beta-min + DC-блокер ----  
+static int32_t am_dc = 0;   // EMA уровня несущей (= постоянная составляющая огибающей)  
+  
+static inline int32_t __not_in_flash_func(rxd_am_sample)(int32_t i, int32_t q) {  
+    int32_t ai = i < 0 ? -i : i;  
+    int32_t aq = q < 0 ? -q : q;  
+    int32_t mx = ai > aq ? ai : aq;  
+    int32_t mn = ai > aq ? aq : ai;  
+    // |v| ≈ max + 3/8·min — ошибка ≤ ~7%, без sqrt/деления  
+    int32_t env = mx + ((mn * 3) >> 3);  
+    // DC-блокер: убираем несущую (среднее), оставляем звук  
+    am_dc += (env - am_dc) >> 8;        // постоянная времени ~256 отсчётов  
+    return env - am_dc;  
+}  
+  
+// ---- FM: частотный дискриминатор d(phase) ≈ (i_prev·q − q_prev·i)/(i²+q²) ----  
+#define FM_GAIN 24000               // подобрать на железе под громкость/девиацию  
+static int32_t fm_i_prev = 0, fm_q_prev = 0;  
+  
+static inline int32_t __not_in_flash_func(rxd_fm_sample)(int32_t i, int32_t q) {  
+    int64_t cross = (int64_t)fm_i_prev * q - (int64_t)fm_q_prev * i;  // ~ sin(Δφ)·|v|²  
+    int64_t mag2  = (int64_t)i * i + (int64_t)q * q;  
+    fm_i_prev = i;  
+    fm_q_prev = q;  
+    if (mag2 < 1) mag2 = 1;          // защита от деления на 0 в паузах  
+    // Нормировка на амплитуду → громкость не зависит от силы сигнала  
+    return (int32_t)((cross * FM_GAIN) / mag2);  
+}
 
 // ---- Аудио-НЧ-фильтр 3 кГц для SSB (работает на 15.625 ksps, Core 1) ----  
 #define AF_LP_N     63          // число отводов (нечётное → линейная фаза)  
@@ -431,10 +461,13 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
                     si = sat16(vi);  
                     sq = sat16(vq);  
                 } else {
-                    int32_t d  = rxd_demod_sample(vi, vq);  // моно SSB, до фильтра  
-                    int32_t df = af_lp_push(d);             // НЧ-фильтр 3 кГц  
-                    int16_t m  = sat16(df);                 // моно SSB  
-                    si = m;  
+                    int32_t d;  
+                    if      (rxd_demod_mode == RXD_DEMOD_AM) d = rxd_am_sample(vi, vq);  
+                    else if (rxd_demod_mode == RXD_DEMOD_FM) d = rxd_fm_sample(vi, vq);  
+                    else                                     d = rxd_demod_sample(vi, vq); // SSB  
+                    int32_t df = af_lp_push(d);             // полосовой AF-фильтр (SH/SL)    
+                    int16_t m  = sat16(df);                 // моно    
+                    si = m;    
                     sq = m;  
                 }  
             

@@ -28,6 +28,8 @@ static char cat_mode = '2';
 // Индексы боковой в rx_audio.cpp: DEMOD_USB=0, DEMOD_LSB=1.  
 #define CAT_DEMOD_USB 0  
 #define CAT_DEMOD_LSB 1
+#define CAT_DEMOD_AM  2  
+#define CAT_DEMOD_FM  3  
   
 // ---- Ответы ------------------------------------------------------------------  
   
@@ -138,8 +140,16 @@ static void cat_execute(const char* cmd) {
                     cat_mode = '3';    
                     // при желании здесь же выставить узкую полосу CW через SH/SL    
                     return;    
-                case '4':  // FM — демодулятора нет    
-                case '5':  // AM — демодулятора нет    
+                case '4':  // FM      
+                    rx_audio_set_mode(RX_MODE_SSB);      
+                    rx_audio_set_demod(CAT_DEMOD_FM);      
+                    cat_mode = '4';      
+                    return;      
+                case '5':  // AM      
+                    rx_audio_set_mode(RX_MODE_SSB);      
+                    rx_audio_set_demod(CAT_DEMOD_AM);      
+                    cat_mode = '5';      
+                    return;    
                 default:    
                     cat_reply_err();    
                     return;    
