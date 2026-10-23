@@ -183,6 +183,7 @@ static bool quad_active = false;          // true = SM сконфигуриро�
 void vfo_quadrature_start(uint32_t freq_hz);   // freq_hz = частота ПРИЁМА (LO ставится на freq−IF)  
 void vfo_quadrature_stop(uint32_t freq_hz, double step_hz);  
 uint32_t vfo_quadrature_lo_hz(void);           // фактическая частота LO после квантования clkdiv
+static void __not_in_flash_func(vfo_set_clk_sys)(const PllConfig& cfg_in, uint32_t vsel);
 
 // Фактическая квантованная частота LO (для NCO)  
 static uint32_t quad_lo_actual_hz = 0;
@@ -191,42 +192,112 @@ uint32_t vfo_quadrature_lo_hz(void) {
     return quad_lo_actual_hz; 
 }
 
+// В маяке эти лимиты/коррекция живут в file_manager.cpp (из Flash).  
+// У приёмника отдельного file_manager нет — определяем здесь с  
+// паспортными значениями по умолчанию (как в комментариях vfo_hardware.h).  
+uint32_t vfo_max_clk_sys_hz = 320000000UL;   // было VFO_CLK_SYS_NOMINAL_HZ (133 МГц)  
+uint32_t vfo_max_pll_vco_hz = 2500000000UL;  // 2500 МГц достаточно: VCO/pdiv(min 4) = до 400 МГц  
+int32_t  vfo_xosc_corr_ppb  = (int32_t)VFO_XOSC_DEFAULT_PPB;  // дефолт +25000 ppb
+
 // Перевести VFO в RX-режим квадратурного LO (I/Q для SDR-смесителя).  
 void vfo_quadrature_start(uint32_t freq_hz) {
     // Целевая частота LO — ниже настраиваемой на величину ПЧ  
     uint32_t lo_hz = (freq_hz > RX_IF_SHIFT_HZ) ? (freq_hz - RX_IF_SHIFT_HZ) : freq_hz;  
     Serial.print("[QUAD] Целевая частота "); Serial.println(lo_hz);
 
-    // === Вариант 3: подгоняем clk_sys под ЦЕЛЫЙ делитель LO ===  
-    // Выбираем целый D так, чтобы шина легла в безопасный диапазон разгона,  
-    // затем задаём clk_sys = 4*lo*D. Делитель остаётся целым (нет джиттера),  
-    // а LO ложится ровно на цель — без ухода на сотни кГц/МГц на ВЧ.  
-    // pll_usb (48 МГц, ADC+USB) НЕ трогаем — он на отдельном PLL.  
-    const uint32_t CLK_MIN_HZ = 100000000UL;   // нижняя рабочая граница шины  
-    const uint32_t CLK_MAX_HZ = 136000000UL;   // верхняя безопасная при разгоне  
+// === Подгонка clk_sys под ЦЕЛЫЙ делитель LO ===  
+    // LO = clk_sys/(4*D), D — целый делитель PIO (дробный даёт джиттер -> спуры).  
+    // На фиксированных 133 МГц целый D слишком «крупный» на ВЧ (на 14 МГц  
+    // ближайший D=2 => 16.625 МГц, промах 2.5 МГц > ±62.5 кГц окна NCO).  
+    // Ищем достижимую комбинацию PLL, при которой clk_sys/(4*D) ложится  
+    // ближе всего к lo_hz, прошиваем её путём TX (vfo_set_clk_sys) и  
+    // ПЕРЕСЧИТЫВАЕМ делитель от РЕАЛЬНОЙ шины.  
+    const uint64_t xosc_hz = vfo_calibrated_xosc_hz();  
+    const uint64_t clk_max = vfo_effective_clk_max();  
+    const uint64_t vco_max = vfo_effective_pll_max();  
   
-    // Минимальный D, дающий clk_sys >= CLK_MIN_HZ, но не ниже 2.  
-    uint32_t D = (uint32_t)((CLK_MIN_HZ + 4ull*lo_hz - 1) / (4ull*lo_hz));  
-    if (D < 2) D = 2;  
-    uint32_t clk_target = (uint32_t)(4ull * lo_hz * D);  
-    // Если D слишком большой и вышли за верх — уменьшаем, пока в окне.  
-    while (clk_target > CLK_MAX_HZ && D > 2) { D--; clk_target = (uint32_t)(4ull * lo_hz * D); }  
+    PllConfig best     = pll_nominal;   // безопасный дефолт  
+    uint64_t  best_err = UINT64_MAX;    // |LO_факт - lo_hz|  
   
-    // Применяем новую шину. required=false: при недостижимой частоте  
-    // set_sys_clock_khz вернёт false и шина останется прежней.  
-    bool clk_ok = set_sys_clock_khz(clk_target / 1000u, false);  
+    for (uint32_t refdiv = 1; refdiv <= 3; refdiv++) {  
+        uint64_t ref_hz = xosc_hz / refdiv;  
+        for (uint32_t p1 = 2; p1 <= 7; p1++) {  
+            for (uint32_t p2 = 1; p2 <= 7; p2++) {  
+                if (p1 < p2) continue;                // старший постделитель первым  
+                uint32_t pdiv = p1 * p2;  
+                for (uint32_t fbdiv = 16; fbdiv <= 320; fbdiv++) {  
+                    uint64_t vco = ref_hz * fbdiv;  
+                    if (vco < 750000000ULL || vco > vco_max) continue;  
+                    uint64_t clk = vco / pdiv;  
+                    if (clk < VFO_CLK_SYS_MIN_HZ || clk > clk_max) continue;  
   
-    uint64_t clk_sys_hz = clock_get_hz(clk_sys);     // фактическая ПОСЛЕ подгонки  
-    uint32_t div_q8 = D << 8;                          // целый делитель, frac=0  
+                    uint64_t D = (clk + 2ull * lo_hz) / (4ull * lo_hz);  // round(clk/(4*lo))  
+                    if (D < 2) D = 2;  
+                    uint64_t lo_got = clk / (4ull * D);  
+                        if (lo_got >= freq_hz) continue;   // LO обязан быть НИЖЕ приёма → ПЧ положительна  
+
+                    uint64_t err = (lo_got > lo_hz) ? (lo_got - lo_hz) : (lo_hz - lo_got);  
   
-    if (div_q8 < (2u << 8))                div_q8 = 2u << 8;  
-    if (div_q8 > (0xFFFFu << 8))           div_q8 = 0xFFFFu << 8;  
+                        // Среди кандидатов с ПРИЕМЛЕМОЙ ошибкой (остаток добирает NCO)  
+                        // предпочитаем БОЛЬШУЮ clk_sys — это запас по Core1 (на низкой  
+                        // шине 100.7 МГц Core1 уходил в 96% и спектр терял крутизну).  
+                        // ERR_TOL << ±62500 Гц окна NCO.  
+                        const uint64_t ERR_TOL = 20000;   // Гц  
+                        bool better;  
+                        if (err <= ERR_TOL && best_err <= ERR_TOL) {  
+                            better = (clk > best.clk_sys_hz);   // оба точны → берём шину быстрее  
+                        } else {  
+                            better = (err < best_err);          // иначе — минимум ошибки  
+                        }  
+                        if (better) {  
+                            best_err        = err;  
+                            best.refdiv     = refdiv;  
+                            best.p1         = p1;  
+                            best.p2         = p2;  
+                            best.fbdiv      = fbdiv;  
+                            best.clk_sys_hz = clk;  
+                            best.vsel       = (uint32_t)vsel_for(clk);  
+                            best.is_oc      = (clk > VFO_CLK_SYS_NOMINAL_HZ);  
+                        }
+
+                }  
+            }  
+        }  
+    }  
   
-    // Фактическая частота LO при целом делителе и фактической шине.  
+    // Прошиваем выбранную шину тем же путём, что TX (vreg + PLL + flash SSI).  
+    // PLL-переключение рвёт тактирование Core1 — гасим его заранее.  
+    multicore_reset_core1();  
+    uint32_t vsel = best.vsel;  
+    if (vsel == 0 || vsel < (uint32_t)VREG_VOLTAGE_1_10)  
+        vsel = (uint32_t)vsel_for(best.clk_sys_hz);  
+    vfo_set_clk_sys(best, vsel);  
+  
+    // Делитель и фактический LO — ВСЕГДА от РЕАЛЬНО полученной шины.  
+    uint64_t clk_sys_hz = clock_get_hz(clk_sys);  
+    uint64_t num        = clk_sys_hz * 256ull;  
+    uint32_t div_q8     = (uint32_t)(num / (4ull * lo_hz));  
+    div_q8 = (div_q8 + 0x80u) & ~0xFFu;                 // округление до целого, frac=0  
+    if (div_q8 < (2u << 8))      div_q8 = 2u << 8;  
+    if (div_q8 > (0xFFFFu << 8)) div_q8 = 0xFFFFu << 8;  
     quad_lo_actual_hz = (uint32_t)(clk_sys_hz / (4ull * (div_q8 >> 8)));  
   
-    Serial.printf("[QUAD] clk_sys=%lu (ok=%d), D=%lu\n",  
-                  (unsigned long)clk_sys_hz, (int)clk_ok, (unsigned long)(div_q8 >> 8));
+    {  
+        int32_t f_nco = (int32_t)freq_hz - (int32_t)quad_lo_actual_hz;  
+        Serial.printf("[QUAD] clk_sys=%lu, D=%lu, lo_actual=%lu, f_nco=%ld\n",  
+                      (unsigned long)clk_sys_hz,  
+                      (unsigned long)(div_q8 >> 8),  
+                      (unsigned long)quad_lo_actual_hz,  
+                      (long)f_nco);  
+        if (f_nco > 62500 || f_nco < -62500) {  
+            Serial.printf("[QUAD] ВНИМАНИЕ: |f_nco| > 62500 Гц (половина RX_FS_IN_HZ) — "  
+                          "достижимая шина не позволяет подойти ближе, приём невозможен\n");  
+        }  
+    }  
+    Serial.printf("[QUAD] Целевая %lu, целый делитель %lu, фактическая %lu\n",  
+                  (unsigned long)lo_hz,  
+                  (unsigned long)(div_q8 >> 8),  
+                  (unsigned long)quad_lo_actual_hz);
 
     Serial.printf("[QUAD] Целевая %lu, целый делитель %lu, фактическая %lu\n",  
                   (unsigned long)lo_hz,  
