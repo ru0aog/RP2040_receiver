@@ -158,7 +158,7 @@ void loop() {
   
     // Диагностика: загрузка Core 0/Core 1 и дропы, раз в секунду.    
     static uint32_t t_dbg = 0;    
-    if (millis() - t_dbg >= 10000) {    
+    if (millis() - t_dbg >= 60000) {    
         t_dbg = millis();    
         Serial.printf("# CORE0_LOAD=%.1f%% CORE1_LOAD=%.1f%% aud_dropped=%lu out_dropped=%lu clip=%lu\n",  
                       core0_load_permille / 10.0,  
