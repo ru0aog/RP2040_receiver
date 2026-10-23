@@ -197,14 +197,22 @@ static inline int16_t raw_iq_clip(float x) {
     return (int16_t)g;  
 }  
 
-// Кубический Фарроу (Catmull-Rom): интерполяция между y0 и y1, mu∈[0,1).  
-// Нужны по одной точке с краёв (y_m1, y2). Подавляет образы ресемплера  
-// заметно сильнее линейной при near-zero дополнительной стоимости.  
-static inline float farrow_cubic(float ym1, float y0, float y1, float y2, float mu) {  
-    const float c0 = y0;  
-    const float c1 = 0.5f * (y1 - ym1);  
-    const float c2 = ym1 - 2.5f * y0 + 2.0f * y1 - 0.5f * y2;  
-    const float c3 = 0.5f * (y2 - ym1) + 1.5f * (y0 - y1);  
+// Коэффициенты Фарроу (Catmull-Rom). Зависят ТОЛЬКО от окна y[-1..2],  
+// поэтому пересчитываются при сдвиге окна (~15625 Гц), а не на каждый  
+// выходной отсчёт (44100 Гц). В горячем пути остаётся только Горнер.  
+static float rs_c0 = 0.0f, rs_c1 = 0.0f, rs_c2 = 0.0f, rs_c3 = 0.0f;   // SSB / I  
+static float rs_cq0 = 0.0f, rs_cq1 = 0.0f, rs_cq2 = 0.0f, rs_cq3 = 0.0f; // Q (RAW_IQ)  
+  
+static inline void farrow_calc(float ym1, float y0, float y1, float y2,  
+                               float* c0, float* c1, float* c2, float* c3) {  
+    *c0 = y0;  
+    *c1 = 0.5f * (y1 - ym1);  
+    *c2 = ym1 - 2.5f * y0 + 2.0f * y1 - 0.5f * y2;  
+    *c3 = 0.5f * (y2 - ym1) + 1.5f * (y0 - y1);  
+}  
+  
+// Оценка полинома по схеме Горнера — единственное, что считается на 44100 Гц.  
+static inline float farrow_eval(float c0, float c1, float c2, float c3, float mu) {  
     return ((c3 * mu + c2) * mu + c1) * mu + c0;  
 }
 
@@ -261,9 +269,11 @@ static bool next_frame(int16_t* l, int16_t* r) {
                 if (!get_iq_input(&rs_x2, &rs_q2)) return false;  
                 rs_init_count = 4;  
             }  
+            farrow_calc(rs_xm1, rs_x0, rs_x1, rs_x2, &rs_c0, &rs_c1, &rs_c2, &rs_c3);  
+            farrow_calc(rs_qm1, rs_q0, rs_q1, rs_q2, &rs_cq0, &rs_cq1, &rs_cq2, &rs_cq3);  
             rs_phase = 0;  
             rs_advance_pending = false;  
-            rs_started = true;  
+            rs_started = true;
         }
   
         if (rs_advance_pending) {  
@@ -271,13 +281,15 @@ static bool next_frame(int16_t* l, int16_t* r) {
             if (!get_iq_input(&next_i, &next_q)) return false;  
             rs_xm1 = rs_x0;  rs_x0 = rs_x1;  rs_x1 = rs_x2;  rs_x2 = next_i;  
             rs_qm1 = rs_q0;  rs_q0 = rs_q1;  rs_q1 = rs_q2;  rs_q2 = next_q;  
+            farrow_calc(rs_xm1, rs_x0, rs_x1, rs_x2, &rs_c0, &rs_c1, &rs_c2, &rs_c3);  
+            farrow_calc(rs_qm1, rs_q0, rs_q1, rs_q2, &rs_cq0, &rs_cq1, &rs_cq2, &rs_cq3);  
             rs_advance_pending = false;  
-        }  
+        }
   
         // RX_MODE_RAW_IQ  
         const float frac = rs_phase * RS_INV_OUT;  
-        const float yi = farrow_cubic(rs_xm1, rs_x0, rs_x1, rs_x2, frac);  
-        const float yq = farrow_cubic(rs_qm1, rs_q0, rs_q1, rs_q2, frac); 
+        const float yi = farrow_eval(rs_c0, rs_c1, rs_c2, rs_c3, frac);  
+        const float yq = farrow_eval(rs_cq0, rs_cq1, rs_cq2, rs_cq3, frac);
     
         rs_phase += rs_step;  
         if (rs_phase >= 44100.0f) {  
@@ -308,9 +320,10 @@ static bool next_frame(int16_t* l, int16_t* r) {
             if (!get_demod_input(&rs_x2)) return false;  
             rs_init_count = 4;  
         }  
+        farrow_calc(rs_xm1, rs_x0, rs_x1, rs_x2, &rs_c0, &rs_c1, &rs_c2, &rs_c3);  
         rs_phase = 0;  
         rs_advance_pending = false;  
-        rs_started = true;  
+        rs_started = true;
     }
   
     if (rs_advance_pending) {  
@@ -320,12 +333,13 @@ static bool next_frame(int16_t* l, int16_t* r) {
         rs_x0  = rs_x1;  
         rs_x1  = rs_x2;  
         rs_x2  = next_x;  
+        farrow_calc(rs_xm1, rs_x0, rs_x1, rs_x2, &rs_c0, &rs_c1, &rs_c2, &rs_c3);  
         rs_advance_pending = false;  
-    }  
+    }
   
     // RX_MODE_SSB  
     const float frac = rs_phase * RS_INV_OUT;  
-    const float y = farrow_cubic(rs_xm1, rs_x0, rs_x1, rs_x2, frac);
+    const float y = farrow_eval(rs_c0, rs_c1, rs_c2, rs_c3, frac);
   
     rs_phase += rs_step;  
     if (rs_phase >= 44100.0f) {  
