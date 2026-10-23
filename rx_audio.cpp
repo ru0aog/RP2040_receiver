@@ -76,10 +76,8 @@ static uint8_t pos = 0;
   
 // Забирает следующий входной I/Q-отсчёт, демодулирует и фильтрует его.  
 // Блок освобождается ровно один раз — когда все его отсчёты прочитаны.  
-static bool get_demod_input(float* out) {  
-    if (out == nullptr) {  
-        return false;  
-    }  
+static bool get_demod_input(int32_t* out) {  
+    if (out == nullptr) return false;  
   
     while (cur_n == 0 || pos >= cur_n) {  
         if (cur_n != 0) {  
@@ -111,19 +109,16 @@ static bool get_demod_input(float* out) {
         }  
     }  
   
-    const float m = (float)bi[pos];  // уже демодулировано на Core 1 (моно в aud_i)  
+    const int32_t m = (int32_t)bi[pos];  // уже демодулировано на Core 1 (моно в aud_i)  
     ++pos;  
-  
     *out = m;  
     return true;
 }  
   
 // Забирает следующую пару I/Q без демодуляции и фильтрации.  
 // Та же логика освобождения блока, что и в get_demod_input.  
-static bool get_iq_input(float* i_out, float* q_out) {  
-    if (i_out == nullptr || q_out == nullptr) {  
-        return false;  
-    }  
+static bool get_iq_input(int32_t* i_out, int32_t* q_out) {  
+    if (i_out == nullptr || q_out == nullptr) return false;  
   
     while (cur_n == 0 || pos >= cur_n) {  
         if (cur_n != 0) {  
@@ -154,8 +149,8 @@ static bool get_iq_input(float* i_out, float* q_out) {
         }  
     }  
   
-    *i_out = (float)bi[pos];  
-    *q_out = (float)bq[pos];  
+    *i_out = (int32_t)bi[pos];  
+    *q_out = (int32_t)bq[pos]; 
     ++pos;  
     return true;  
 }  
@@ -166,30 +161,18 @@ static bool get_iq_input(float* i_out, float* q_out) {
 // На каждом выходном отсчёте фаза увеличивается на 15625.  
 // Если фаза пересекает 44100, на следующем вызове нужно сдвинуть входную  
 // пару на один отсчёт. Отложенный сдвиг сохраняется при временно пустой очереди.  
-static float rs_xm1 = 0.0f;   // y[-1] для кубического Фарроу  
-static float rs_x0  = 0.0f;   // y[0]  (левая точка интервала)  
-static float rs_x1  = 0.0f;   // y[1]  (правая точка интервала)  
-static float rs_x2  = 0.0f;   // y[2]
+static int32_t rs_xm1 = 0, rs_x0 = 0, rs_x1 = 0, rs_x2 = 0;   // окно I/SSB  
+static int32_t rs_qm1 = 0, rs_q0 = 0, rs_q1 = 0, rs_q2 = 0;   // окно Q (RAW_IQ) 
 static bool rs_started = false;  
 static uint8_t rs_init_count = 0;  
 static bool rs_advance_pending = false;  
 
-// rx_audio.cpp  
-static float rs_phase = 0.0f;  
-// Адаптивный шаг ресемплера. Номинал 15625 (отношение 15625/44100).  
-// Подстраивается по заполнению aud-очереди в rx_audio_poll().  
-static float rs_step = 15625.0f;  
-  
-// 1/Fout: умножение дешевле программного float-деления на RP2040 (нет FPU).  
-static const float RS_INV_OUT = 1.0f / 44100.0f;
+// Фаза: 32-битный аккумулятор, один входной отсчёт = 2^32.  
+// mu(Q15) = старшие 15 бит фазы. rs_step_q задаётся в rx_audio_poll().  
+static uint32_t rs_phase_q = 0;  
+static uint32_t rs_step_q  = 0;  
+static float    rs_step    = 15625.0f;   // адаптивный номинал (Гц), из него считаем rs_step_q
 
-// Второй канал (Q) ресемплера. Фаза rs_phase общая для I и Q,  
-// чтобы каналы не разъехались во времени.  
-static float rs_qm1 = 0.0f;  
-static float rs_q0  = 0.0f;  
-static float rs_q1  = 0.0f;  
-static float rs_q2  = 0.0f;
-  
 static inline int16_t raw_iq_clip(float x) {  
     float g = x * (float)RAW_IQ_GAIN;  
     if (g > 32767.0f)  g = 32767.0f;  
@@ -197,23 +180,28 @@ static inline int16_t raw_iq_clip(float x) {
     return (int16_t)g;  
 }  
 
-// Коэффициенты Фарроу (Catmull-Rom). Зависят ТОЛЬКО от окна y[-1..2],  
-// поэтому пересчитываются при сдвиге окна (~15625 Гц), а не на каждый  
-// выходной отсчёт (44100 Гц). В горячем пути остаётся только Горнер.  
-static float rs_c0 = 0.0f, rs_c1 = 0.0f, rs_c2 = 0.0f, rs_c3 = 0.0f;   // SSB / I  
-static float rs_cq0 = 0.0f, rs_cq1 = 0.0f, rs_cq2 = 0.0f, rs_cq3 = 0.0f; // Q (RAW_IQ)  
-  
-static inline void farrow_calc(float ym1, float y0, float y1, float y2,  
-                               float* c0, float* c1, float* c2, float* c3) {  
-    *c0 = y0;  
-    *c1 = 0.5f * (y1 - ym1);  
-    *c2 = ym1 - 2.5f * y0 + 2.0f * y1 - 0.5f * y2;  
-    *c3 = 0.5f * (y2 - ym1) + 1.5f * (y0 - y1);  
+// Коэффициенты Catmull-Rom, умноженные на 2 (чтобы убрать 0.5). int32.  
+static int32_t rs_c0 = 0, rs_c1 = 0, rs_c2 = 0, rs_c3 = 0;      // SSB / I  
+static int32_t rs_cq0 = 0, rs_cq1 = 0, rs_cq2 = 0, rs_cq3 = 0;  // Q (RAW_IQ)
+
+// 2*c0=2y0; 2*c1=y1-ym1; 2*c2=2ym1-5y0+4y1-y2; 2*c3=3(y0-y1)+y2-ym1  
+static inline void farrow_calc_i(int32_t ym1, int32_t y0, int32_t y1, int32_t y2,  
+                                 int32_t* c0, int32_t* c1, int32_t* c2, int32_t* c3) {  
+    *c0 = 2 * y0;  
+    *c1 = y1 - ym1;  
+    *c2 = 2 * ym1 - 5 * y0 + 4 * y1 - y2;  
+    *c3 = 3 * (y0 - y1) + y2 - ym1;  
 }  
   
 // Оценка полинома по схеме Горнера — единственное, что считается на 44100 Гц.  
-static inline float farrow_eval(float c0, float c1, float c2, float c3, float mu) {  
-    return ((c3 * mu + c2) * mu + c1) * mu + c0;  
+// Горнер в Q15. Возвращает 2*y (деление на 2 с округлением — у вызывающего).  
+static inline int32_t farrow_eval_i(int32_t c0, int32_t c1, int32_t c2, int32_t c3,  
+                                    uint32_t mu_q15) {  
+    int32_t t = c3;  
+    t = (int32_t)(((int64_t)t * mu_q15) >> 15) + c2;  
+    t = (int32_t)(((int64_t)t * mu_q15) >> 15) + c1;  
+    t = (int32_t)(((int64_t)t * mu_q15) >> 15) + c0;  
+    return t;   // = 2*y  
 }
 
 static bool next_frame(int16_t* l, int16_t* r) {  
@@ -228,7 +216,7 @@ static bool next_frame(int16_t* l, int16_t* r) {
         rs_started        = false;  
         rs_init_count     = 0;  
         rs_advance_pending = false;  
-        rs_phase          = 0;  
+        rs_phase_q         = 0;  
         if (cur_n != 0) {  
             rx_dsp_release_audio();  
             cur_n = 0;  
@@ -269,33 +257,33 @@ static bool next_frame(int16_t* l, int16_t* r) {
                 if (!get_iq_input(&rs_x2, &rs_q2)) return false;  
                 rs_init_count = 4;  
             }  
-            farrow_calc(rs_xm1, rs_x0, rs_x1, rs_x2, &rs_c0, &rs_c1, &rs_c2, &rs_c3);  
-            farrow_calc(rs_qm1, rs_q0, rs_q1, rs_q2, &rs_cq0, &rs_cq1, &rs_cq2, &rs_cq3);  
-            rs_phase = 0;  
+            farrow_calc_i(rs_xm1, rs_x0, rs_x1, rs_x2, &rs_c0, &rs_c1, &rs_c2, &rs_c3);  
+            farrow_calc_i(rs_qm1, rs_q0, rs_q1, rs_q2, &rs_cq0, &rs_cq1, &rs_cq2, &rs_cq3);
+            rs_phase_q  = 0;  
             rs_advance_pending = false;  
             rs_started = true;
         }
   
         if (rs_advance_pending) {  
-            float next_i, next_q;  
+            int32_t next_i, next_q; 
             if (!get_iq_input(&next_i, &next_q)) return false;  
             rs_xm1 = rs_x0;  rs_x0 = rs_x1;  rs_x1 = rs_x2;  rs_x2 = next_i;  
             rs_qm1 = rs_q0;  rs_q0 = rs_q1;  rs_q1 = rs_q2;  rs_q2 = next_q;  
-            farrow_calc(rs_xm1, rs_x0, rs_x1, rs_x2, &rs_c0, &rs_c1, &rs_c2, &rs_c3);  
-            farrow_calc(rs_qm1, rs_q0, rs_q1, rs_q2, &rs_cq0, &rs_cq1, &rs_cq2, &rs_cq3);  
+            farrow_calc_i(rs_xm1, rs_x0, rs_x1, rs_x2, &rs_c0, &rs_c1, &rs_c2, &rs_c3);  
+            farrow_calc_i(rs_qm1, rs_q0, rs_q1, rs_q2, &rs_cq0, &rs_cq1, &rs_cq2, &rs_cq3);
             rs_advance_pending = false;  
         }
   
         // RX_MODE_RAW_IQ  
-        const float frac = rs_phase * RS_INV_OUT;  
-        const float yi = farrow_eval(rs_c0, rs_c1, rs_c2, rs_c3, frac);  
-        const float yq = farrow_eval(rs_cq0, rs_cq1, rs_cq2, rs_cq3, frac);
-    
-        rs_phase += rs_step;  
-        if (rs_phase >= 44100.0f) {  
-            rs_phase -= 44100.0f;  
-            rs_advance_pending = true;  
-        }
+        const uint32_t mu_q15 = rs_phase_q >> 17;  
+        const int32_t  yi2 = farrow_eval_i(rs_c0,  rs_c1,  rs_c2,  rs_c3,  mu_q15);  
+        const int32_t  yq2 = farrow_eval_i(rs_cq0, rs_cq1, rs_cq2, rs_cq3, mu_q15);  
+        const float    yi  = (float)((yi2 + 1) >> 1);  
+        const float    yq  = (float)((yq2 + 1) >> 1);  
+        
+        const uint32_t prev = rs_phase_q;  
+        rs_phase_q += rs_step_q;  
+        if (rs_phase_q < prev) rs_advance_pending = true;
   
         *l = raw_iq_clip(yi);  // I -> левый  
         *r = raw_iq_clip(yq);  // Q -> правый  
@@ -320,32 +308,31 @@ static bool next_frame(int16_t* l, int16_t* r) {
             if (!get_demod_input(&rs_x2)) return false;  
             rs_init_count = 4;  
         }  
-        farrow_calc(rs_xm1, rs_x0, rs_x1, rs_x2, &rs_c0, &rs_c1, &rs_c2, &rs_c3);  
-        rs_phase = 0;  
+        farrow_calc_i(rs_xm1, rs_x0, rs_x1, rs_x2, &rs_c0, &rs_c1, &rs_c2, &rs_c3);  
+        rs_phase_q  = 0;  
         rs_advance_pending = false;  
         rs_started = true;
     }
   
     if (rs_advance_pending) {  
-        float next_x;  
+        int32_t next_x; 
         if (!get_demod_input(&next_x)) return false;  
         rs_xm1 = rs_x0;  
         rs_x0  = rs_x1;  
         rs_x1  = rs_x2;  
         rs_x2  = next_x;  
-        farrow_calc(rs_xm1, rs_x0, rs_x1, rs_x2, &rs_c0, &rs_c1, &rs_c2, &rs_c3);  
+        farrow_calc_i(rs_xm1, rs_x0, rs_x1, rs_x2, &rs_c0, &rs_c1, &rs_c2, &rs_c3); 
         rs_advance_pending = false;  
     }
   
     // RX_MODE_SSB  
-    const float frac = rs_phase * RS_INV_OUT;  
-    const float y = farrow_eval(rs_c0, rs_c1, rs_c2, rs_c3, frac);
-  
-    rs_phase += rs_step;  
-    if (rs_phase >= 44100.0f) {  
-        rs_phase -= 44100.0f;  
-        rs_advance_pending = true;  
-    }
+    const uint32_t mu_q15 = rs_phase_q >> 17;          // старшие 15 бит фазы  
+    const int32_t  y2x    = farrow_eval_i(rs_c0, rs_c1, rs_c2, rs_c3, mu_q15);  
+    const float    y      = (float)((y2x + 1) >> 1);   // 2*y -> y с округлением  
+    
+    const uint32_t prev = rs_phase_q;  
+    rs_phase_q += rs_step_q;  
+    if (rs_phase_q < prev) rs_advance_pending = true;  // перенос 2^32 = сдвиг окна
   
     const int16_t s = agc_limit(y);  
     *l = s;  
@@ -392,7 +379,9 @@ void rx_audio_poll(void) {
     if (adj >  LIMIT) adj =  LIMIT;  
     if (adj < -LIMIT) adj = -LIMIT;  
     rs_step = 15625.0f + adj;   // backlog велик → шаг больше → входы читаются чаще  
-  
+    // Целочисленный шаг фазы Фарроу: (rs_step / 44100) * 2^32.  
+    rs_step_q = (uint32_t)((double)rs_step * (4294967296.0 / 44100.0));
+
     for (;;) {  
         int avail_frames = usb_out.availableForWrite() / 4;  
         if (avail_frames <= 0) {  
