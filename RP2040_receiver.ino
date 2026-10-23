@@ -195,7 +195,7 @@ void loop() {
     const uint32_t t_busy_start = time_us_32();    
   
     rx_audio_poll();  
-    fldigi_cat_poll();   // неблокирующий разбор CAT-команд      
+    //fldigi_cat_poll();   // неблокирующий разбор CAT-команд      
     
 #if RTTY_DECODE    
     const int16_t* bi;    
