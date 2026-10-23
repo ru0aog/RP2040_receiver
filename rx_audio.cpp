@@ -166,8 +166,10 @@ static bool get_iq_input(float* i_out, float* q_out) {
 // На каждом выходном отсчёте фаза увеличивается на 15625.  
 // Если фаза пересекает 44100, на следующем вызове нужно сдвинуть входную  
 // пару на один отсчёт. Отложенный сдвиг сохраняется при временно пустой очереди.  
-static float rs_x0 = 0.0f;  
-static float rs_x1 = 0.0f;  
+static float rs_xm1 = 0.0f;   // y[-1] для кубического Фарроу  
+static float rs_x0  = 0.0f;   // y[0]  (левая точка интервала)  
+static float rs_x1  = 0.0f;   // y[1]  (правая точка интервала)  
+static float rs_x2  = 0.0f;   // y[2]
 static bool rs_started = false;  
 static uint8_t rs_init_count = 0;  
 static bool rs_advance_pending = false;  
@@ -183,8 +185,10 @@ static const float RS_INV_OUT = 1.0f / 44100.0f;
 
 // Второй канал (Q) ресемплера. Фаза rs_phase общая для I и Q,  
 // чтобы каналы не разъехались во времени.  
-static float rs_q0 = 0.0f;  
-static float rs_q1 = 0.0f;  
+static float rs_qm1 = 0.0f;  
+static float rs_q0  = 0.0f;  
+static float rs_q1  = 0.0f;  
+static float rs_q2  = 0.0f;
   
 static inline int16_t raw_iq_clip(float x) {  
     float g = x * (float)RAW_IQ_GAIN;  
@@ -193,6 +197,16 @@ static inline int16_t raw_iq_clip(float x) {
     return (int16_t)g;  
 }  
 
+// Кубический Фарроу (Catmull-Rom): интерполяция между y0 и y1, mu∈[0,1).  
+// Нужны по одной точке с краёв (y_m1, y2). Подавляет образы ресемплера  
+// заметно сильнее линейной при near-zero дополнительной стоимости.  
+static inline float farrow_cubic(float ym1, float y0, float y1, float y2, float mu) {  
+    const float c0 = y0;  
+    const float c1 = 0.5f * (y1 - ym1);  
+    const float c2 = ym1 - 2.5f * y0 + 2.0f * y1 - 0.5f * y2;  
+    const float c3 = 0.5f * (y2 - ym1) + 1.5f * (y0 - y1);  
+    return ((c3 * mu + c2) * mu + c1) * mu + c0;  
+}
 
 static bool next_frame(int16_t* l, int16_t* r) {  
     if (l == nullptr || r == nullptr) {  
@@ -232,32 +246,38 @@ static bool next_frame(int16_t* l, int16_t* r) {
         // Сырые I/Q, общая фаза, линейная интерполяция 15625 -> 44100 на оба канала.  
         if (!rs_started) {  
             if (rs_init_count == 0) {  
-                if (!get_iq_input(&rs_x0, &rs_q0)) return false;  
+                if (!get_iq_input(&rs_xm1, &rs_qm1)) return false;  
                 rs_init_count = 1;  
             }  
             if (rs_init_count == 1) {  
-                if (!get_iq_input(&rs_x1, &rs_q1)) return false;  
+                if (!get_iq_input(&rs_x0, &rs_q0)) return false;  
                 rs_init_count = 2;  
+            }  
+            if (rs_init_count == 2) {  
+                if (!get_iq_input(&rs_x1, &rs_q1)) return false;  
+                rs_init_count = 3;  
+            }  
+            if (rs_init_count == 3) {  
+                if (!get_iq_input(&rs_x2, &rs_q2)) return false;  
+                rs_init_count = 4;  
             }  
             rs_phase = 0;  
             rs_advance_pending = false;  
             rs_started = true;  
-        }  
+        }
   
         if (rs_advance_pending) {  
             float next_i, next_q;  
             if (!get_iq_input(&next_i, &next_q)) return false;  
-            rs_x0 = rs_x1;  
-            rs_x1 = next_i;  
-            rs_q0 = rs_q1;  
-            rs_q1 = next_q;  
+            rs_xm1 = rs_x0;  rs_x0 = rs_x1;  rs_x1 = rs_x2;  rs_x2 = next_i;  
+            rs_qm1 = rs_q0;  rs_q0 = rs_q1;  rs_q1 = rs_q2;  rs_q2 = next_q;  
             rs_advance_pending = false;  
         }  
   
         // RX_MODE_RAW_IQ  
         const float frac = rs_phase * RS_INV_OUT;  
-        const float yi = rs_x0 + (rs_x1 - rs_x0) * frac;  
-        const float yq = rs_q0 + (rs_q1 - rs_q0) * frac; 
+        const float yi = farrow_cubic(rs_xm1, rs_x0, rs_x1, rs_x2, frac);  
+        const float yq = farrow_cubic(rs_qm1, rs_q0, rs_q1, rs_q2, frac); 
     
         rs_phase += rs_step;  
         if (rs_phase >= 44100.0f) {  
@@ -273,29 +293,39 @@ static bool next_frame(int16_t* l, int16_t* r) {
     // RX_MODE_SSB: демодулированный моно.  
     if (!rs_started) {  
         if (rs_init_count == 0) {  
-            if (!get_demod_input(&rs_x0)) return false;  
+            if (!get_demod_input(&rs_xm1)) return false;  
             rs_init_count = 1;  
         }  
         if (rs_init_count == 1) {  
-            if (!get_demod_input(&rs_x1)) return false;  
+            if (!get_demod_input(&rs_x0)) return false;  
             rs_init_count = 2;  
+        }  
+        if (rs_init_count == 2) {  
+            if (!get_demod_input(&rs_x1)) return false;  
+            rs_init_count = 3;  
+        }  
+        if (rs_init_count == 3) {  
+            if (!get_demod_input(&rs_x2)) return false;  
+            rs_init_count = 4;  
         }  
         rs_phase = 0;  
         rs_advance_pending = false;  
         rs_started = true;  
-    }  
+    }
   
     if (rs_advance_pending) {  
         float next_x;  
         if (!get_demod_input(&next_x)) return false;  
-        rs_x0 = rs_x1;  
-        rs_x1 = next_x;  
+        rs_xm1 = rs_x0;  
+        rs_x0  = rs_x1;  
+        rs_x1  = rs_x2;  
+        rs_x2  = next_x;  
         rs_advance_pending = false;  
     }  
   
     // RX_MODE_SSB  
     const float frac = rs_phase * RS_INV_OUT;  
-    const float y = rs_x0 + (rs_x1 - rs_x0) * frac; 
+    const float y = farrow_cubic(rs_xm1, rs_x0, rs_x1, rs_x2, frac);
   
     rs_phase += rs_step;  
     if (rs_phase >= 44100.0f) {  
