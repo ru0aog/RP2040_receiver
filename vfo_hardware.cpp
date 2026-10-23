@@ -196,27 +196,38 @@ void vfo_quadrature_start(uint32_t freq_hz) {
     // Целевая частота LO — ниже настраиваемой на величину ПЧ  
     uint32_t lo_hz = (freq_hz > RX_IF_SHIFT_HZ) ? (freq_hz - RX_IF_SHIFT_HZ) : freq_hz;  
     Serial.print("[QUAD] Целевая частота "); Serial.println(lo_hz);
-    // Дробный clkdiv: 24.8 fixed-point. Аппаратный дробный делитель PIO,    
-    // без дизеринга и без core1.    
-    // div_q8 = clk_sys*256 / (4*lo_hz)    
-    // ВАЖНО: current_clk_sys_hz здесь — кэш от последнего TX-init и может    
-    // отставать от реальной шины (наблюдалось 120 MHz vs 125 MHz), что    
-    // давало уход LO на 2.8 кГц. Берём живое значение из clock_get_hz.    
-    uint64_t clk_sys_hz = clock_get_hz(clk_sys);                    // фактическая шина  
-    uint64_t num    = clk_sys_hz * 256;    
-    // === Целочисленный делитель: дробная часть создавала периодический  
-    // джиттер фронтов LO -> спуры-частокол вокруг сигнала.  
-    // Округляем до ближайшего целого, frac-байт обнуляем. ===  
-    uint32_t div_q8 = (uint32_t)(num / (4ull * lo_hz));   // <-- эта строка нужна
-    // === Целочисленный делитель: дробная часть создавала периодический  
-    // джиттер фронтов LO -> спуры-частокол вокруг сигнала ===  
-    div_q8 = (div_q8 + 0x80u) & ~0xFFu;  
+
+    // === Вариант 3: подгоняем clk_sys под ЦЕЛЫЙ делитель LO ===  
+    // Выбираем целый D так, чтобы шина легла в безопасный диапазон разгона,  
+    // затем задаём clk_sys = 4*lo*D. Делитель остаётся целым (нет джиттера),  
+    // а LO ложится ровно на цель — без ухода на сотни кГц/МГц на ВЧ.  
+    // pll_usb (48 МГц, ADC+USB) НЕ трогаем — он на отдельном PLL.  
+    const uint32_t CLK_MIN_HZ = 100000000UL;   // нижняя рабочая граница шины  
+    const uint32_t CLK_MAX_HZ = 136000000UL;   // верхняя безопасная при разгоне  
+  
+    // Минимальный D, дающий clk_sys >= CLK_MIN_HZ, но не ниже 2.  
+    uint32_t D = (uint32_t)((CLK_MIN_HZ + 4ull*lo_hz - 1) / (4ull*lo_hz));  
+    if (D < 2) D = 2;  
+    uint32_t clk_target = (uint32_t)(4ull * lo_hz * D);  
+    // Если D слишком большой и вышли за верх — уменьшаем, пока в окне.  
+    while (clk_target > CLK_MAX_HZ && D > 2) { D--; clk_target = (uint32_t)(4ull * lo_hz * D); }  
+  
+    // Применяем новую шину. required=false: при недостижимой частоте  
+    // set_sys_clock_khz вернёт false и шина останется прежней.  
+    bool clk_ok = set_sys_clock_khz(clk_target / 1000u, false);  
+  
+    uint64_t clk_sys_hz = clock_get_hz(clk_sys);     // фактическая ПОСЛЕ подгонки  
+    uint32_t div_q8 = D << 8;                          // целый делитель, frac=0  
   
     if (div_q8 < (2u << 8))                div_q8 = 2u << 8;  
-    if (div_q8 > (0xFFFFu << 8))           div_q8 = 0xFFFFu << 8;
+    if (div_q8 > (0xFFFFu << 8))           div_q8 = 0xFFFFu << 8;  
   
-    // Фактическая частота LO после округления  
-    quad_lo_actual_hz = (uint32_t)(num / (div_q8 * 4ull));  
+    // Фактическая частота LO при целом делителе и фактической шине.  
+    quad_lo_actual_hz = (uint32_t)(clk_sys_hz / (4ull * (div_q8 >> 8)));  
+  
+    Serial.printf("[QUAD] clk_sys=%lu (ok=%d), D=%lu\n",  
+                  (unsigned long)clk_sys_hz, (int)clk_ok, (unsigned long)(div_q8 >> 8));
+
     Serial.printf("[QUAD] Целевая %lu, целый делитель %lu, фактическая %lu\n",  
                   (unsigned long)lo_hz,  
                   (unsigned long)(div_q8 >> 8),  
