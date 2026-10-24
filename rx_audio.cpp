@@ -49,34 +49,59 @@ void rx_audio_set_mode(uint8_t mode) {
 
 void rx_audio_set_demod(uint8_t demod) { demod_mode = demod; push_demod_to_core1(); }
  
-// АРУ
-// Пик в тех же единицах, что |отсчёт| (0..32767). Целочисленный EMA.  
-static int32_t agc_peak = 4096;  
+// АРУ — два независимых контура:  
+//  A) медленный левелинг по СРЕДНЕМУ |y| (τ≈10 с, симметрично) → объём/динамика  
+//     сохраняются + долговременная подстройка под шум эфира (слабая реакция на средний уровень);  
+//  B) быстрый лимитер поверх → мгновенная защита от «удара по ушам», не трогает обычную динамику.  
+// Состояние в Q16 (значение << 16), коэффициенты EMA в Q24. τ ≈ 2^24/(Q24·44100).  
   
-// Коэффициенты EMA в Q16 (вместо float 0.01 / 0.0002).  
-#define AGC_ATT_Q16   655   // атака  ≈ 0.01  (655/65536)  
-#define AGC_DEC_Q16    13   // спад   ≈ 0.0002 (13/65536)  
-#define AGC_PEAK_MIN  2048  // минимальный порог (потолок усиления 12 крат)  
-#define AGC_CEIL     24576  // потолок усиления = -2.5 дБ
+// --- Контур A: медленное среднее |y| ---  
+static int64_t agc_avg_q16 = (int64_t)4096 << 16;   // среднее уровня, Q16  
+#define AGC_AVG_ATT_Q24  38                 // рост среднего, τ≈10 с  
+#define AGC_AVG_DEC_Q24  38                 // спад среднего,  τ≈10 с (симметрично → слабая реакция)  
+#define AGC_REF        24576                // целевой уровень: base_gain = AGC_REF/avg  
+#define AGC_AVG_MIN  ((int64_t)2048 << 16)  // мин. среднее → потолок усиления 12 крат  
   
+// --- Контур B: быстрый лимитер ---  
+static int64_t lim_peak_q16 = (int64_t)2048 << 16;  // пик лимитера, Q16  
+#define LIMIT_CEIL      28000               // безопасный потолок по модулю (защита ушей)  
+#define LIMIT_ATT_Q24  (1 << 24)            // атака мгновенная (α≈1.0)  
+#define LIMIT_DEC_Q24   1902                // спад лимитера, τ≈0.2 с
+
+// Два контура: A — медленный левелинг по среднему, B — быстрый лимитер.  
 static inline int16_t agc_limit(int32_t x) {  
-    int32_t ax = (x < 0) ? -x : x;  
+    // --- Контур A: медленное среднее |x| (τ≈10 с, симметрично) ---  
+    int64_t ax  = (x < 0) ? -x : x;  
+    int64_t tgt = ax << 16;                              // |отсчёт| в Q16  
+    int64_t da  = tgt - agc_avg_q16;  
+    agc_avg_q16 += (da * (da > 0 ? AGC_AVG_ATT_Q24  
+                                 : AGC_AVG_DEC_Q24)) >> 24;  
+    if (agc_avg_q16 < AGC_AVG_MIN) agc_avg_q16 = AGC_AVG_MIN;  
   
-    // Детектор пиков (атака/спад) — целочисленный EMA в Q16, без float.  
-    int32_t diff = ax - agc_peak;  
-    if (diff > 0) {  
-        agc_peak += (int32_t)(((int64_t)diff * AGC_ATT_Q16) >> 16);  
-    } else {  
-        agc_peak += (int32_t)(((int64_t)diff * AGC_DEC_Q16) >> 16);  
+    int32_t avg = (int32_t)(agc_avg_q16 >> 16);  
+    if (avg < 1) avg = 1;  
+    // Базовое усиление ведём по СРЕДНЕМУ → громкие сигналы остаются громче шума.  
+    // y1 может превышать int16 — держим в int32, клип делает лимитер ниже.  
+    int32_t y1 = (int32_t)(((int64_t)x * AGC_REF) / avg);  
+  
+    // --- Контур B: быстрый лимитер (мгновенная атака, спад τ≈0.2 с) ---  
+    int64_t ay  = (y1 < 0) ? -y1 : y1;  
+    int64_t tp  = ay << 16;                              // |y1| в Q16  
+    int64_t dp  = tp - lim_peak_q16;  
+    lim_peak_q16 += (dp * (dp > 0 ? LIMIT_ATT_Q24  
+                                  : LIMIT_DEC_Q24)) >> 24;  
+    if (lim_peak_q16 < ((int64_t)1 << 16)) lim_peak_q16 = (int64_t)1 << 16;  
+  
+    int32_t lpk = (int32_t)(lim_peak_q16 >> 16);  
+    if (lpk < 1) lpk = 1;  
+    if (lpk > LIMIT_CEIL) {  
+        // Прижимаем ТОЛЬКО когда пик выше безопасного потолка — иначе не вмешиваемся.  
+        y1 = (int32_t)(((int64_t)y1 * LIMIT_CEIL) / lpk);  
     }  
-    if (agc_peak < AGC_PEAK_MIN) agc_peak = AGC_PEAK_MIN;  
   
-    // Деление — аппаратным делителем RP2040 (SIO), а не software float.  
-    // x <= 32767, x*24576 < 8.1e8 — умещается в int32; на всякий случай int64.  
-    int32_t g = (int32_t)(((int64_t)x * AGC_CEIL) / agc_peak);  
-    if (g >  32767) g =  32767;  
-    if (g < -32768) g = -32768;  
-    return (int16_t)g;  
+    if (y1 >  32767) y1 =  32767;                        // финальный клип-страховка  
+    if (y1 < -32768) y1 = -32768;  
+    return (int16_t)y1;  
 }
   
 // ---- Источник аудиоданных от rx_dsp ----  
@@ -406,8 +431,9 @@ static bool next_frame(int16_t* l, int16_t* r) {
 static USBAudioStream usb_out;  
 static int16_t pcm_buffer[192 * 2];  // до 192 stereo frames  
   
-void rx_audio_init(void) {  
-    agc_peak = 4096;
+void rx_audio_init(void) {    
+    agc_avg_q16  = (int64_t)4096 << 16;  
+    lim_peak_q16 = (int64_t)2048 << 16;
     memset(pcm_buffer, 0, sizeof(pcm_buffer));  
     // Синхронизируем демодулятор Core 1 со стартовым режимом (rx_mode/demod_mode),    
     // иначе Core 1 остаётся в RXD_DEMOD_RAW и боковая не давится.    

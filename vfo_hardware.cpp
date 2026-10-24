@@ -216,14 +216,29 @@ void vfo_quadrature_start(uint32_t freq_hz) {
     const uint64_t clk_max = vfo_effective_clk_max();  
     const uint64_t vco_max = vfo_effective_pll_max();  
   
-    PllConfig best     = pll_nominal;   // безопасный дефолт  
-    uint64_t  best_err = UINT64_MAX;    // |LO_факт - lo_hz|  
+    // Веса лексикографики: W2 >> W3 >> W4 >> W5 (старший критерий доминирует).  
+    const uint64_t W2 = 1000000000ull;  // П2: удаление от сладкой зоны (за 1 Гц)  
+    const uint64_t W3 = 1000000ull;     // П3: штраф за дробный делитель  
+    const uint64_t W4 = 1000ull;        // П4: близость дроби к k/8  
+    const uint64_t W5 = 1ull;           // П5: шина ниже максимума (за 1 МГц)  
+  
+    PllConfig best        = pll_nominal;  // безопасный дефолт  
+    uint64_t  best_cost   = UINT64_MAX;   // многокритериальная стоимость  
+    uint32_t  best_div_q8 = 0;            // выбранный делитель Q8  
+    bool      best_is_int = true;  
+    bool      best_legal  = false;  
+  
+    // Fallback «наименьшее зло»: лучший среди НЕлегальных (дырка в 0..5 кГц).  
+    PllConfig fb_best       = pll_nominal;  
+    uint64_t  fb_bad        = UINT64_MAX; // чем меньше — тем ближе дырка к краю 5 кГц  
+    uint32_t  fb_div_q8     = 0;  
+    bool      fb_is_int     = true;  
   
     for (uint32_t refdiv = 1; refdiv <= 3; refdiv++) {  
         uint64_t ref_hz = xosc_hz / refdiv;  
         for (uint32_t p1 = 2; p1 <= 7; p1++) {  
             for (uint32_t p2 = 1; p2 <= 7; p2++) {  
-                if (p1 < p2) continue;                // старший постделитель первым  
+                if (p1 < p2) continue;  
                 uint32_t pdiv = p1 * p2;  
                 for (uint32_t fbdiv = 16; fbdiv <= 320; fbdiv++) {  
                     uint64_t vco = ref_hz * fbdiv;  
@@ -231,39 +246,85 @@ void vfo_quadrature_start(uint32_t freq_hz) {
                     uint64_t clk = vco / pdiv;  
                     if (clk < VFO_CLK_SYS_MIN_HZ || clk > clk_max) continue;  
   
-                    uint64_t D = (clk + 2ull * lo_hz) / (4ull * lo_hz);  // round(clk/(4*lo))  
-                    if (D < 2) D = 2;  
-                    uint64_t lo_got = clk / (4ull * D);  
-                        if (lo_got >= freq_hz) continue;   // LO обязан быть НИЖЕ приёма → ПЧ положительна  
-
-                    uint64_t err = (lo_got > lo_hz) ? (lo_got - lo_hz) : (lo_hz - lo_got);  
-  
-                        // Среди кандидатов с ПРИЕМЛЕМОЙ ошибкой (остаток добирает NCO)  
-                        // предпочитаем БОЛЬШУЮ clk_sys — это запас по Core1 (на низкой  
-                        // шине 100.7 МГц Core1 уходил в 96% и спектр терял крутизну).  
-                        // ERR_TOL << ±62500 Гц окна NCO.  
-                        const uint64_t ERR_TOL = 20000;   // Гц  
-                        bool better;  
-                        if (err <= ERR_TOL && best_err <= ERR_TOL) {  
-                            better = (clk > best.clk_sys_hz);   // оба точны → берём шину быстрее  
-                        } else {  
-                            better = (err < best_err);          // иначе — минимум ошибки  
+                    // Два варианта делителя на эту шину: целый и дробный (Q8).  
+                    for (int frac_mode = 0; frac_mode < 2; frac_mode++) {  
+                        uint32_t div_q8;  
+                        if (frac_mode == 0) {                 // целый  
+                            uint64_t D = (clk + 2ull * lo_hz) / (4ull * lo_hz);  
+                            if (D < 2)      D = 2;  
+                            if (D > 0xFFFF) D = 0xFFFF;  
+                            div_q8 = (uint32_t)(D << 8);  
+                        } else {                              // дробный Q8  
+                            uint64_t q = (clk * 256ull + 2ull * lo_hz) / (4ull * lo_hz);  
+                            if (q < (2u << 8))      q = 2u << 8;  
+                            if (q > (0xFFFFu << 8)) q = 0xFFFFu << 8;  
+                            div_q8 = (uint32_t)q;  
                         }  
-                        if (better) {  
-                            best_err        = err;  
-                            best.refdiv     = refdiv;  
-                            best.p1         = p1;  
-                            best.p2         = p2;  
-                            best.fbdiv      = fbdiv;  
-                            best.clk_sys_hz = clk;  
-                            best.vsel       = (uint32_t)vsel_for(clk);  
-                            best.is_oc      = (clk > VFO_CLK_SYS_NOMINAL_HZ);  
-                        }
-
+                        uint64_t lo_got = (clk * 256ull) / (4ull * (uint64_t)div_q8);  
+                        if (lo_got >= freq_hz) continue;      // ПЧ положительна  
+                        int64_t f_nco = (int64_t)freq_hz - (int64_t)lo_got;  
+                        if (f_nco <= 0 || f_nco >= (int64_t)RX_NCO_MAX_HZ) continue;  
+  
+                        uint32_t frac   = div_q8 & 0xFFu;  
+                        bool     is_int = (frac == 0);  
+  
+                        // --- П1: жёсткий запрет дырки в звуке [0..5000] ---  
+                        if (f_nco >= (int64_t)RX_NCO_FORBID_LO &&  
+                            f_nco <= (int64_t)RX_NCO_FORBID_HI) {  
+                            // нелегален → только fallback; «меньшее зло» = ближе к 5 кГц  
+                            uint64_t bad = (uint64_t)((int64_t)RX_NCO_FORBID_HI - f_nco);  
+                            if (bad < fb_bad) {  
+                                fb_bad = bad; fb_div_q8 = div_q8; fb_is_int = is_int;  
+                                fb_best.refdiv=refdiv; fb_best.p1=p1; fb_best.p2=p2;  
+                                fb_best.fbdiv=fbdiv; fb_best.clk_sys_hz=clk;  
+                                fb_best.vsel=(uint32_t)vsel_for(clk);  
+                                fb_best.is_oc=(clk > VFO_CLK_SYS_NOMINAL_HZ);  
+                            }  
+                            continue;  
+                        }  
+  
+                        // --- стоимость легального кандидата ---  
+                        uint64_t cost = 0;  
+                        // П2: удаление от сладкой зоны  
+                        if      (f_nco < (int64_t)RX_NCO_SWEET_LO)  
+                            cost += (uint64_t)((int64_t)RX_NCO_SWEET_LO - f_nco) * W2;  
+                        else if (f_nco > (int64_t)RX_NCO_SWEET_HI)  
+                            cost += (uint64_t)(f_nco - (int64_t)RX_NCO_SWEET_HI) * W2;  
+                        // П3: штраф за дробность  
+                        if (!is_int) cost += W3;  
+                        // П4: дробь подальше от k/8 (= кратных 32 в Q8)  
+                        if (!is_int) {  
+                            int32_t m    = (int32_t)frac % 32;       // 0..31  
+                            int32_t dist = (m < 16) ? m : 32 - m;    // 0..16 до ближайшего k/8  
+                            cost += (uint64_t)(16 - dist) * W4;      // ближе к k/8 → дороже  
+                        }  
+                        // П5: шина ближе к максимуму  
+                        cost += ((clk_max - clk) / 1000000ull) * W5;  
+  
+                        if (cost < best_cost) {  
+                            best_cost   = cost;  
+                            best_div_q8 = div_q8;  
+                            best_is_int = is_int;  
+                            best_legal  = true;  
+                            best.refdiv=refdiv; best.p1=p1; best.p2=p2;  
+                            best.fbdiv=fbdiv; best.clk_sys_hz=clk;  
+                            best.vsel=(uint32_t)vsel_for(clk);  
+                            best.is_oc=(clk > VFO_CLK_SYS_NOMINAL_HZ);  
+                        }  
+                    }  
                 }  
             }  
         }  
     }  
+  
+    // П6: ничего легального — берём «наименьшее зло» и честно предупреждаем.  
+    if (!best_legal) {  
+        Serial.println("[QUAD] ВНИМАНИЕ: нет кандидата с дыркой вне 0..5 кГц — "  
+                       "ставлю наименьшее зло (дырка в полосе!)");  
+        best        = fb_best;  
+        best_div_q8 = fb_div_q8;  
+        best_is_int = fb_is_int;  
+    }
   
     // Прошиваем выбранную шину тем же путём, что TX (vreg + PLL + flash SSI).  
     // PLL-переключение рвёт тактирование Core1 — гасим его заранее.  
@@ -273,23 +334,34 @@ void vfo_quadrature_start(uint32_t freq_hz) {
         vsel = (uint32_t)vsel_for(best.clk_sys_hz);  
     vfo_set_clk_sys(best, vsel);  
   
-    // Делитель и фактический LO — ВСЕГДА от РЕАЛЬНО полученной шины.  
     uint64_t clk_sys_hz = clock_get_hz(clk_sys);  
-    uint64_t num        = clk_sys_hz * 256ull;  
-    uint32_t div_q8     = (uint32_t)(num / (4ull * lo_hz));  
-    div_q8 = (div_q8 + 0x80u) & ~0xFFu;                 // округление до целого, frac=0  
-    if (div_q8 < (2u << 8))      div_q8 = 2u << 8;  
-    if (div_q8 > (0xFFFFu << 8)) div_q8 = 0xFFFFu << 8;  
-    quad_lo_actual_hz = (uint32_t)(clk_sys_hz / (4ull * (div_q8 >> 8)));  
+    uint32_t div_q8;  
+    if (best_is_int) {  
+        uint64_t D = (clk_sys_hz + 2ull * lo_hz) / (4ull * lo_hz);  
+        if (D < 2)      D = 2;  
+        if (D > 0xFFFF) D = 0xFFFF;  
+        div_q8 = (uint32_t)(D << 8);                    // frac=0 — целый  
+    } else {  
+        uint64_t q = (clk_sys_hz * 256ull + 2ull * lo_hz) / (4ull * lo_hz);  
+        if (q < (2u << 8))      q = 2u << 8;  
+        if (q > (0xFFFFu << 8)) q = 0xFFFFu << 8;  
+        div_q8 = (uint32_t)q;                           // дробный Q8 сохраняется  
+    }  
+    quad_lo_actual_hz = (uint32_t)((clk_sys_hz * 256ull) / (4ull * (uint64_t)div_q8));
   
     {  
         int32_t f_nco = (int32_t)freq_hz - (int32_t)quad_lo_actual_hz;  
-        Serial.printf("[QUAD] clk_sys=%lu, D=%lu, lo_actual=%lu, f_nco=%ld\n",  
+        uint32_t frac = div_q8 & 0xFFu;  
+        bool sweet = (f_nco >= (int32_t)RX_NCO_SWEET_LO &&  
+                      f_nco <= (int32_t)RX_NCO_SWEET_HI);  
+        Serial.printf("[QUAD] clk_sys=%lu, div=%lu+%lu/256 (%s), lo_actual=%lu, "  
+                      "f_nco=%ld, sweet=%d\n",  
                       (unsigned long)clk_sys_hz,  
-                      (unsigned long)(div_q8 >> 8),  
+                      (unsigned long)(div_q8 >> 8), (unsigned long)frac,  
+                      frac ? "дробный" : "целый",  
                       (unsigned long)quad_lo_actual_hz,  
-                      (long)f_nco);  
-        if (f_nco > 62500 || f_nco < -62500) {  
+                      (long)f_nco, sweet ? 1 : 0);  
+        if (f_nco > 62500 || f_nco < -62500) {
             Serial.printf("[QUAD] ВНИМАНИЕ: |f_nco| > 62500 Гц (половина RX_FS_IN_HZ) — "  
                           "достижимая шина не позволяет подойти ближе, приём невозможен\n");  
         }  
