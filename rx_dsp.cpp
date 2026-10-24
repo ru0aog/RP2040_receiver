@@ -358,9 +358,14 @@ static inline int32_t __not_in_flash_func(af_lp_push)(int32_t x) {
 // широкополосный шум (некоррелирован) не предсказывается и подавляется.  
 // Выход = предсказание y. Целиком целочисленно, веса в Q15, без деления.  
 // Вызывать на КАЖДОМ emit в SSB — как af_lp_push (линия задержки).  
-#define NR_N          32    // длина FIR-предсказателя (уменьшить до 24/16 при нехватке CPU)  
-#define NR_DELAY       2    // декорреляционная задержка, отсчётов  
-#define NR_MU_SHIFT   18    // скорость адаптации (больше = медленнее/стабильнее)  
+#define NR_N          16          // длина FIR-предсказателя  
+#define NR_DELAY       5          // декорреляц. задержка: шум уже некоррелирован (4..8)  
+#define NR_MU_Q    13107          // μ в Q15 (≈0.4); NLMS стабилен при μ∈(0,2), старт 0.3..0.5  
+#define NR_LEAK_SHIFT 10          // утечка весов (leaky LMS): меньше = сильнее утечка (8..12)  
+#define NR_EPS  ((int64_t)1<<18)  // регуляризация знаменателя (не даёт раскачку на тихом фоне)  
+#define NR_DEPTH_Q15 24576        // глубина dry/wet: 0=bypass, 32768=полный ALE (≈0.75)  
+  
+static int64_t nr_pow = 0;        // (зарезервировано, если перейдёте на EMA-мощность) 
   
 static volatile bool nr_enabled = false;  
 static int32_t nr_buf[NR_N + NR_DELAY] = {0};   // кольцевой буфер входа  
@@ -372,27 +377,34 @@ static inline int32_t __not_in_flash_func(nr_lms_push)(int32_t x) {
     nr_idx = (nr_idx + 1); if (nr_idx >= NR_N + NR_DELAY) nr_idx = 0;  
     nr_buf[nr_idx] = x;  
   
-    // предсказание по NR_N отсчётам, начиная с задержки NR_DELAY  
-    int64_t acc = 0;  
+    // предсказание + энергия окна одним проходом  
+    int64_t acc = 0, energy = 0;  
     int p = nr_idx - NR_DELAY; if (p < 0) p += NR_N + NR_DELAY;  
-    int taps[NR_N];                              // индексы использованных отсчётов  
+    int taps[NR_N];  
     for (int k = 0; k < NR_N; k++) {  
         taps[k] = p;  
-        acc += (int64_t)nr_w[k] * nr_buf[p];  
+        int32_t xk = nr_buf[p];  
+        acc    += (int64_t)nr_w[k] * xk;  
+        energy += (int64_t)xk * xk;           // ||x||² окна  
         if (--p < 0) p += NR_N + NR_DELAY;  
     }  
-    int32_t y = (int32_t)(acc >> 15);           // Q15 → масштаб отсчёта  
-    int32_t e = x - y;                          // ошибка предсказания (= шум)  
+    int32_t y = (int32_t)(acc >> 15);  
+    int32_t e = x - y;                         // ошибка = шум  
   
-    // LMS: w[k] += mu * e * buf[k]  (mu реализован сдвигом, без деления)  
+    // NLMS: общий масштаб g = μ·e·2^15 / (||x||² + eps) — один делёж SIO на отсчёт  
+    int64_t g = ((int64_t)e * NR_MU_Q << 15) / (energy + NR_EPS);  
+  
     for (int k = 0; k < NR_N; k++) {  
-        int32_t upd = (int32_t)(((int64_t)e * nr_buf[taps[k]]) >> NR_MU_SHIFT);  
-        int32_t w   = (int32_t)nr_w[k] + upd;  
-        if (w >  32767) w =  32767;             // кламп весов в int16  
+        int64_t upd = (g * nr_buf[taps[k]]) >> 15;   // Δw в Q15  
+        int32_t w   = (int32_t)nr_w[k];  
+        w += (int32_t)upd - (w >> NR_LEAK_SHIFT);    // leaky LMS  
+        if (w >  32767) w =  32767;  
         if (w < -32768) w = -32768;  
         nr_w[k] = (int16_t)w;  
     }  
-    return y;                                    // предсказание = сигнал без шума  
+  
+    // dry/wet: out = x − depth·e  (depth=0 → bypass, depth=1 → y)  
+    return x - (int32_t)(((int64_t)e * NR_DEPTH_Q15) >> 15);
 }  
   
 void rx_dsp_set_nr(bool on) {  
