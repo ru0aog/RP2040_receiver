@@ -349,9 +349,61 @@ static inline int32_t __not_in_flash_func(af_lp_push)(int32_t x) {
         if (++lo >= AF_LP_N) lo = 0;    
         if (--hi < 0)        hi = AF_LP_N - 1;    
     }    
-    acc += (int32_t)af_lp_taps[AF_LP_N / 2] * af_lp_buf[lo];  // центральный отвод    
-    return (int32_t)((acc + (1 << 14)) >> 15);    // Q15 → масштаб отсчёта, +0.5 LSB    
-}
+    acc += (int32_t)af_lp_taps[AF_LP_N / 2] * af_lp_buf[lo];  // центральный отвод      
+    return (int32_t)((acc + (1 << 14)) >> 15);    // Q15 → масштаб отсчёта, +0.5 LSB      
+}  
+  
+// ================= LMS Adaptive Line Enhancer (ALE, «NR») =================  
+// Декоррелирует вход: голос/несущие (коррелированы) предсказываются и остаются,  
+// широкополосный шум (некоррелирован) не предсказывается и подавляется.  
+// Выход = предсказание y. Целиком целочисленно, веса в Q15, без деления.  
+// Вызывать на КАЖДОМ emit в SSB — как af_lp_push (линия задержки).  
+#define NR_N          32    // длина FIR-предсказателя (уменьшить до 24/16 при нехватке CPU)  
+#define NR_DELAY       2    // декорреляционная задержка, отсчётов  
+#define NR_MU_SHIFT   18    // скорость адаптации (больше = медленнее/стабильнее)  
+  
+static volatile bool nr_enabled = false;  
+static int32_t nr_buf[NR_N + NR_DELAY] = {0};   // кольцевой буфер входа  
+static int     nr_idx = 0;                      // позиция самого свежего отсчёта  
+static int16_t nr_w[NR_N]  = {0};               // веса Q15  
+  
+static inline int32_t __not_in_flash_func(nr_lms_push)(int32_t x) {  
+    // записать новый отсчёт  
+    nr_idx = (nr_idx + 1); if (nr_idx >= NR_N + NR_DELAY) nr_idx = 0;  
+    nr_buf[nr_idx] = x;  
+  
+    // предсказание по NR_N отсчётам, начиная с задержки NR_DELAY  
+    int64_t acc = 0;  
+    int p = nr_idx - NR_DELAY; if (p < 0) p += NR_N + NR_DELAY;  
+    int taps[NR_N];                              // индексы использованных отсчётов  
+    for (int k = 0; k < NR_N; k++) {  
+        taps[k] = p;  
+        acc += (int64_t)nr_w[k] * nr_buf[p];  
+        if (--p < 0) p += NR_N + NR_DELAY;  
+    }  
+    int32_t y = (int32_t)(acc >> 15);           // Q15 → масштаб отсчёта  
+    int32_t e = x - y;                          // ошибка предсказания (= шум)  
+  
+    // LMS: w[k] += mu * e * buf[k]  (mu реализован сдвигом, без деления)  
+    for (int k = 0; k < NR_N; k++) {  
+        int32_t upd = (int32_t)(((int64_t)e * nr_buf[taps[k]]) >> NR_MU_SHIFT);  
+        int32_t w   = (int32_t)nr_w[k] + upd;  
+        if (w >  32767) w =  32767;             // кламп весов в int16  
+        if (w < -32768) w = -32768;  
+        nr_w[k] = (int16_t)w;  
+    }  
+    return y;                                    // предсказание = сигнал без шума  
+}  
+  
+void rx_dsp_set_nr(bool on) {  
+    if (on && !nr_enabled) {                     // чистый старт → без щелчка  
+        memset(nr_buf, 0, sizeof(nr_buf));  
+        memset(nr_w,   0, sizeof(nr_w));  
+        nr_idx = 0;  
+    }  
+    nr_enabled = on;  
+}  
+bool rx_dsp_get_nr(void) { return nr_enabled; }
 
 
 // ---- Инструментирование загрузки Core 1 ----  
@@ -465,8 +517,13 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
                     if      (rxd_demod_mode == RXD_DEMOD_AM) d = rxd_am_sample(vi, vq);  
                     else if (rxd_demod_mode == RXD_DEMOD_FM) d = rxd_fm_sample(vi, vq);  
                     else                                     d = rxd_demod_sample(vi, vq); // SSB  
-                    int32_t df = af_lp_push(d);             // полосовой AF-фильтр (SH/SL)    
-                    int16_t m  = sat16(df);                 // моно    
+                    int32_t df = af_lp_push(d);             // полосовой AF-фильтр (SH/SL)      
+                    // ALE шумоподавление — только SSB-голос, до sat16 и до очереди/АРУ.  
+                    if (nr_enabled && (rxd_demod_mode == RXD_DEMOD_USB ||  
+                                       rxd_demod_mode == RXD_DEMOD_LSB)) {  
+                        df = nr_lms_push(df);  
+                    }  
+                    int16_t m  = sat16(df);                 // моно 
                     si = m;    
                     sq = m;  
                 }  

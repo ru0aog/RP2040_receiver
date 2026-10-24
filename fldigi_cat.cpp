@@ -191,12 +191,28 @@ static void cat_execute(const char* cmd) {
         } else if (n == 6) {                       // 4 цифры → Гц напрямую  
             f_lo = (uint32_t)strtoul(cmd + 2, nullptr, 10);  
         } else { cat_reply_err(); return; }  
-        rx_dsp_set_af_band(f_lo, rx_dsp_af_hi_hz());  
+        rx_dsp_set_af_band(f_lo, rx_dsp_af_hi_hz());    
+        return;    
+    }  
+  
+    // NR — шумоподавление (ALE). NR; запрос, NR0 выкл, NR1 вкл.  
+    if (cmd[0] == 'N' && cmd[1] == 'R') {  
+        if (n == 2) {                              // запрос состояния  
+            char buf[8];  
+            snprintf(buf, sizeof(buf), "NR%d;", rx_dsp_get_nr() ? 1 : 0);  
+            Serial.print(buf);                     // тот же вывод, что у cat_reply_*  
+            return;  
+        }  
+        if (n == 3) {  
+            if      (cmd[2] == '1') { rx_dsp_set_nr(true);  return; }  
+            else if (cmd[2] == '0') { rx_dsp_set_nr(false); return; }  
+        }  
+        cat_reply_err();  
         return;  
-    }
-
-    // На все остальные неизвестные команды шлем ошибку
-    cat_reply_err();  
+    }  
+  
+    // На все остальные неизвестные команды шлем ошибку  
+    cat_reply_err();    
 }
 
   
