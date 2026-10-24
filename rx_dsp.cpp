@@ -360,12 +360,15 @@ static inline int32_t __not_in_flash_func(af_lp_push)(int32_t x) {
 // Вызывать на КАЖДОМ emit в SSB — как af_lp_push (линия задержки).  
 #define NR_N          16          // длина FIR-предсказателя  
 #define NR_DELAY       5          // декорреляц. задержка: шум уже некоррелирован (4..8)  
-#define NR_MU_Q    13107          // μ в Q15 (≈0.4); NLMS стабилен при μ∈(0,2), старт 0.3..0.5  
+#define NR_MU_Q     1638          // μ в Q15 (≈0.05) — вдвое медленнее: меньше warble/бульканья  
 #define NR_LEAK_SHIFT 10          // утечка весов (leaky LMS): меньше = сильнее утечка (8..12)  
-#define NR_EPS  ((int64_t)1<<18)  // регуляризация знаменателя (не даёт раскачку на тихом фоне)  
-#define NR_DEPTH_Q15 24576        // глубина dry/wet: 0=bypass, 32768=полный ALE (≈0.75)  
-  
-static int64_t nr_pow = 0;        // (зарезервировано, если перейдёте на EMA-мощность) 
+#define NR_EPS  ((int64_t)1<<21)  // регуляризация знаменателя  
+#define NR_G_MAX  ((int64_t)1<<20) // жёсткий предел шага NLMS — защита от щелчков  
+#define NR_PWR_SHIFT  5           // EMA мощности окна: больше = глаже знаменатель (4..7)      
+#define NR_DEPTH_Q15     24576    // глубина вычитания шума (фиксированная, ≈0.75)    
+#define NR_MAKEUP_Q15    49152    // makeup-gain ×1.5 — КОРРЕКЦИЯ ГРОМКОСТИ (компенсация просадки)
+    
+static int64_t nr_pow  = 0;       // сглаженная мощность окна (EMA) для знаменателя NLMS
   
 static volatile bool nr_enabled = false;  
 static int32_t nr_buf[NR_N + NR_DELAY] = {0};   // кольцевой буфер входа  
@@ -391,28 +394,41 @@ static inline int32_t __not_in_flash_func(nr_lms_push)(int32_t x) {
     int32_t y = (int32_t)(acc >> 15);  
     int32_t e = x - y;                         // ошибка = шум  
   
-    // NLMS: общий масштаб g = μ·e·2^15 / (||x||² + eps) — один делёж SIO на отсчёт  
-    int64_t g = ((int64_t)e * NR_MU_Q << 15) / (energy + NR_EPS);  
+    // EMA-сглаживание мощности окна → знаменатель не прыгает от отсчёта  
+    // к отсчёту. Это и есть главное средство против «бульканья»/musical noise.  
+    nr_pow += (energy - nr_pow) >> NR_PWR_SHIFT;    
+    
+    // NLMS: общий масштаб g = μ·e·2^15 / (EMA||x||² + eps) — один делёж SIO на отсчёт      
+    int64_t g = (((int64_t)e * NR_MU_Q) << 15) / (nr_pow + NR_EPS); 
+    if (g >  NR_G_MAX) g =  NR_G_MAX;        // не даём фронту дёрнуть веса → без щелчков    
+    if (g < -NR_G_MAX) g = -NR_G_MAX; 
   
-    for (int k = 0; k < NR_N; k++) {  
-        int64_t upd = (g * nr_buf[taps[k]]) >> 15;   // Δw в Q15  
-        int32_t w   = (int32_t)nr_w[k];  
-        w += (int32_t)upd - (w >> NR_LEAK_SHIFT);    // leaky LMS  
-        if (w >  32767) w =  32767;  
-        if (w < -32768) w = -32768;  
-        nr_w[k] = (int16_t)w;  
-    }  
-  
-    // dry/wet: out = x − depth·e  (depth=0 → bypass, depth=1 → y)  
-    return x - (int32_t)(((int64_t)e * NR_DEPTH_Q15) >> 15);
-}  
+    for (int k = 0; k < NR_N; k++) {    
+        int64_t upd = (g * nr_buf[taps[k]]) >> 15;   // Δw в Q15    
+        int32_t w   = (int32_t)nr_w[k];    
+        w += (int32_t)upd - (w >> NR_LEAK_SHIFT);    // leaky LMS    
+        if (w >  32767) w =  32767;    
+        if (w < -32768) w = -32768;    
+        nr_w[k] = (int16_t)w;    
+    }    
+    
+// dry/wet с ФИКСИРОВАННОЙ глубиной: out = x − NR_DEPTH_Q15·e.    
+    // (версия «почти хорошо»; слабые сигналы могут слегка рассыпаться — ожидаемо.)    
+    int32_t out = x - (int32_t)(((int64_t)e * NR_DEPTH_Q15) >> 15);    
+    // КОРРЕКЦИЯ ГРОМКОСТИ: makeup-gain компенсирует просадку уровня от ШП.    
+    out = (int32_t)(((int64_t)out * NR_MAKEUP_Q15) >> 15);    
+    if (out >  32767) out =  32767;    
+    if (out < -32768) out = -32768;    
+    return out;   
+}
   
 void rx_dsp_set_nr(bool on) {  
-    if (on && !nr_enabled) {                     // чистый старт → без щелчка  
-        memset(nr_buf, 0, sizeof(nr_buf));  
-        memset(nr_w,   0, sizeof(nr_w));  
-        nr_idx = 0;  
-    }  
+    if (on && !nr_enabled) {                     // чистый старт → без щелчка        
+        memset(nr_buf, 0, sizeof(nr_buf));        
+        memset(nr_w,   0, sizeof(nr_w));        
+        nr_idx  = 0;        
+        nr_pow  = 0;        
+    }
     nr_enabled = on;  
 }  
 bool rx_dsp_get_nr(void) { return nr_enabled; }
