@@ -50,8 +50,8 @@ static void rtty_emit(uint8_t code) {
     code &= 31;    
     if (code == 27) { shift_ltrs = false; return; }   // FIGS    
     if (code == 31) { shift_ltrs = true;  return; }   // LTRS    
-    char c = shift_ltrs ? bodo_ltrs[code] : bodo_figs[code];    
-    if (c && c != 27 && c != 31) Serial.write(c);    
+    char c = shift_ltrs ? bodo_ltrs[code] : bodo_figs[code];  
+    if (c && c != 27 && c != 31) { Serial.write(c); extern uint32_t rtty_dbg_emit_hook(void); }
 }    
   
 // ---------- инициализация ----------    
@@ -76,7 +76,21 @@ void rx_rtty_frame_levels(float pm, float ps) {
     noise_pwr = decayavg(noise_pwr, np, 16.0f);    
     const float snr_db = 10.0f * log10f(sig_pwr / (noise_pwr + 1e-6f));    
     present = (snr_db >= MF_SQUELCH_DB);    
-  
+
+    // --- ДИАГНОСТИКА: раз в ~1 с печатаем, что видит автомат ---  
+    static uint32_t dbg_calls = 0;   // сколько отсчётов пришло за секунду  
+    static uint32_t dbg_t     = 0;  
+    static uint32_t dbg_emit  = 0;   // сколько символов декодировано  
+    ++dbg_calls;  
+    if (millis() - dbg_t >= 1000) {  
+        dbg_t = millis();  
+        Serial.printf("# RTTYDBG calls/s=%lu pm=%.0f ps=%.0f snr=%.1f present=%d state=%d emits/s=%lu\n",  
+                      (unsigned long)dbg_calls, pm, ps, snr_db,  
+                      (int)present, state, (unsigned long)dbg_emit);  
+        dbg_calls = 0;  
+        dbg_emit  = 0;  
+    }  
+
     if (!present) { state = RX_IDLE; return; }   // нет сигнала — ждём старт-бит    
   
     const int bit = (pm > ps) ? 1 : 0;   // 1=mark(idle/stop), 0=space(start)    
