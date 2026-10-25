@@ -646,13 +646,18 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
                     if      (rxd_demod_mode == RXD_DEMOD_AM) d = rxd_am_sample(vi, vq);  
                     else if (rxd_demod_mode == RXD_DEMOD_FM) d = rxd_fm_sample(vi, vq);  
                     else                                     d = rxd_demod_sample(vi, vq); // SSB  
-                    int32_t df = af_lp_push(d);             // полосовой AF-фильтр (SH/SL)  
-                    // Автонотч применяем ТОЛЬКО в SSB; вызывать на каждом emit нельзя пропускать  
-                    if (notch_enabled &&  
-                        (rxd_demod_mode == RXD_DEMOD_USB || rxd_demod_mode == RXD_DEMOD_LSB)) {  
-                        df = notch_lms_push(df);  
-                    }  
-                    int16_t m  = sat16(df);                 // моно  
+                    int32_t df = af_lp_push(d);             // полосовой AF-фильтр (SH/SL)    
+                    // Автонотч применяем ТОЛЬКО в SSB; вызывать на каждом emit нельзя пропускать    
+                    if (notch_enabled &&    
+                        (rxd_demod_mode == RXD_DEMOD_USB || rxd_demod_mode == RXD_DEMOD_LSB)) {    
+                        df = notch_lms_push(df);    
+                    }    
+                    // ШП (ALE) — тоже только в SSB, на КАЖДОМ emit (линия задержки)    
+                    if (nr_enabled &&    
+                        (rxd_demod_mode == RXD_DEMOD_USB || rxd_demod_mode == RXD_DEMOD_LSB)) {    
+                        df = nr_lms_push(df);    
+                    }    
+                    int16_t m  = sat16(df);                 // моно
                     si = m;  
                     sq = m;  
                 }
