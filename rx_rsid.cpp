@@ -356,13 +356,8 @@ static void rsid_search(void) {
         aFFTAmpl[i] = (uint64_t)((int64_t)re * re + (int64_t)im * im);  
     }  
   
-    // Поиск центра RTTY по готовому FFT — не чаще раза в ~16 окон (~0.75 с),    
-    // чтобы не тормозить накопление RSID-буферов и не рвать звук.    
-    static uint8_t rtty_srch_div = 0;    
-    if (++rtty_srch_div >= 16) {    
-        rtty_srch_div = 0;    
-        rtty_search_center();    
-    }
+    // Центр RTTY больше НЕ ищем периодически по FFT — он берётся из частоты  
+    // RSID в момент декодирования (см. ниже), т.е. только когда звучит RSID.
   
     int bucket_low  = 3;  
     int bucket_high = RSID_FFT_SIZE - 32;  
@@ -374,13 +369,20 @@ static void rsid_search(void) {
     CalculateBuckets(aFFTAmpl, bucket_low,     bucket_high - RSID_NTIMES);  
     CalculateBuckets(aFFTAmpl, bucket_low + 1, bucket_high - RSID_NTIMES);  
   
-    int sym = -1, bin = -1;  
-    if (search_amp(bin, sym)) {  
-        if (sym != RSID_ESCAPE) {     // escape-набор 2 не реализован  
-            rsid_apply(bin, sym);  
-            rsid_reset_state();  
-        }  
-    }  
+    int sym = -1, bin = -1;    
+    if (search_amp(bin, sym)) {    
+        if (sym != RSID_ESCAPE) {     // escape-набор 2 не реализован    
+            rsid_apply(bin, sym);    
+  
+            // Центр матч-фильтра RTTY берём ПРЯМО из частоты RSID — только  
+            // в момент декодирования бёрста. После этого не подстраиваем.  
+            rtty_center_hz  = (float)((bin + RSID_NSYMBOLS - 0.5)    
+                                      * RSID_SAMPLE_RATE / 2048.0);    
+            rtty_center_new = true;    
+  
+            rsid_reset_state();    
+        }    
+    }
 }  
   
 // ============================================================================  
