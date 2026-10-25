@@ -72,7 +72,8 @@ uint8_t  rx_dsp_aud_fill(void);   // заполнение очереди aud д�
 #define RXD_DEMOD_FM  4   // частотный дискриминатор  
 void rx_dsp_set_demod(uint8_t mode);
 // Перестраиваемая полоса AF-фильтра (SSB), Гц. f_lo=0 → поведение прежнего ФНЧ.  
-void rx_dsp_set_af_band(uint32_t f_lo_hz, uint32_t f_hi_hz);  
+void rx_dsp_set_af_band(uint32_t f_lo_hz, uint32_t f_hi_hz);
+void rx_dsp_set_notch(bool on);   // автоматический notch (ON/OFF)
 void rx_dsp_set_nr(bool on);  
 bool rx_dsp_get_nr(void);
 uint32_t rx_dsp_af_lo_hz(void);  

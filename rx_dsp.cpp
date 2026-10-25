@@ -286,7 +286,46 @@ static volatile uint32_t af_hi_hz = 3100;
   
 static int16_t af_lp_taps[AF_LP_N];  
 static int32_t af_lp_buf[AF_LP_N] = {};  
-static int     af_lp_idx = 0;  
+static int     af_lp_idx = 0;
+
+// ---- Автоматический notch (адаптивный LMS, выход = ошибка) ----  
+#define NOTCH_N          24      // длина предиктора (чем больше — острее нотч, дороже CPU)  
+#define NOTCH_DELAY      8       // декорреляционная задержка: речь уже некоррелирована,  
+                                 // а тон/несущая ещё коррелированы → давится только тон  
+#define NOTCH_MU_Q       2458    // шаг NLMS в Q15 (≈0.075); больше = быстрее ловит, но артефакты  
+#define NOTCH_LEAK_SHIFT 10      // leaky-утечка весов: w -= w>>10 (защита от автоколебаний)  
+#define NOTCH_EPS        4096    // ε в знаменателе NLMS (защита от деления на ~0 в тишине)  
+#define NOTCH_G_MAX      (1<<20) // кламп шагового коэффициента (защита от всплесков)
+
+/*
+Тон давится слабо           → поднять NOTCH_MU_Q или NOTCH_N.
+Подавляется/искажается речь → увеличить NOTCH_DELAY, уменьшить NOTCH_MU_Q.
+Автоколебания/«звон»        → усилить утечку (уменьшить NOTCH_LEAK_SHIFT до 9/8).
+
+Начать с безопасных стартовых значений и проверить, что речь не искажается при выключенном тоне (NT0 → NT1 не должно менять звук голоса заметно).
+NOTCH_N = 32
+NOTCH_DELAY = 1 (декорреляционная задержка; для нотча она должна быть малой — 1, чтобы предиктор ловил узкополосные тоны и не трогал речь)
+NOTCH_MU_Q ≈ 1638 (≈0.05)
+NOTCH_LEAK_SHIFT = 10
+
+Подать стабильный тон (несущую/свист) в полосе и крутить NOTCH_MU_Q:
+тон давится слабо/медленно → поднять NOTCH_MU_Q (3277 ≈ 0.1, 4915 ≈ 0.15);
+появляется «звон», подавляется часть речи, автоколебания → снизить NOTCH_MU_Q.
+
+Глубина/ширина подавления — через NOTCH_N:
+тон давится недостаточно глубоко → увеличить NOTCH_N (48/64), но это дороже по CPU;
+если речь «обедняется» (нотч слишком широкий) → уменьшить NOTCH_N.
+
+Утечка (leaky LMS) — NOTCH_LEAK_SHIFT:
+автоколебания/самовозбуждение, паразитные призвуки → усилить утечку (уменьшить shift: 9, 8);
+нотч «не доходит» до глубокого подавления → ослабить утечку (увеличить shift: 11, 12).
+*/
+
+static volatile bool notch_enabled = false;  
+static int16_t notch_w[NOTCH_N]            = {};  
+static int32_t notch_buf[NOTCH_N + NOTCH_DELAY] = {};  
+static int     notch_idx = 0;  
+static int64_t notch_pow = 0;   // EMA мощности опорного вектора
   
 // Пересчёт таблицы под текущие af_lo_hz/af_hi_hz.  
 // Полосовой = lowpass(fc_hi) - lowpass(fc_lo). При fc_lo=0 → чистый ФНЧ.  
@@ -352,7 +391,62 @@ static inline int32_t __not_in_flash_func(af_lp_push)(int32_t x) {
     acc += (int32_t)af_lp_taps[AF_LP_N / 2] * af_lp_buf[lo];  // центральный отвод      
     return (int32_t)((acc + (1 << 14)) >> 15);    // Q15 → масштаб отсчёта, +0.5 LSB      
 }  
+
+// Один отсчёт автонотча. Вызывать на КАЖДОМ emit в SSB — иначе рвётся  
+// линия задержки предиктора. Возвращает ОШИБКУ e = x - y (тон вычтен).  
+static inline int32_t __not_in_flash_func(notch_lms_push)(int32_t x) {  
+    // 1) записать текущий отсчёт в кольцо  
+    notch_buf[notch_idx] = x;  
   
+    // 2) предсказание y по задержанным отсчётам + мощность опорного вектора  
+    int64_t acc = 0, energy = 0;  
+    int p = notch_idx - NOTCH_DELAY;  
+    if (p < 0) p += NOTCH_N + NOTCH_DELAY;  
+    int32_t taps[NOTCH_N];  
+    for (int k = 0; k < NOTCH_N; k++) {  
+        int32_t v = notch_buf[p];  
+        taps[k] = v;  
+        acc    += (int64_t)notch_w[k] * v;        // y в Q15  
+        energy += (int64_t)v * v;                 // Σ v²  
+        if (--p < 0) p += NOTCH_N + NOTCH_DELAY;  
+    }  
+    int32_t y = (int32_t)(acc >> 15);  
+  
+    // 3) ошибка = ВХОД − предсказание тона  → это и есть выход нотча  
+    int32_t e = x - y;  
+  
+    // 4) EMA мощности (сглаживание знаменателя NLMS, против «журчания»)  
+    notch_pow += (energy - notch_pow) >> 5;  
+    int64_t den = notch_pow + NOTCH_EPS;  
+  
+    // 5) NLMS-шаг с клампом  
+    int64_t g = ((int64_t)e * NOTCH_MU_Q << 15) / den;  
+    if (g >  NOTCH_G_MAX) g =  NOTCH_G_MAX;  
+    if (g < -NOTCH_G_MAX) g = -NOTCH_G_MAX;  
+  
+    // 6) обновление весов с leaky-утечкой  
+    for (int k = 0; k < NOTCH_N; k++) {  
+        int32_t upd = (int32_t)(((int64_t)g * taps[k]) >> 15);  
+        int32_t w   = (int32_t)notch_w[k] + upd - ((int32_t)notch_w[k] >> NOTCH_LEAK_SHIFT);  
+        if (w >  32767) w =  32767;  
+        if (w < -32768) w = -32768;  
+        notch_w[k] = (int16_t)w;  
+    }  
+  
+    if (++notch_idx >= NOTCH_N + NOTCH_DELAY) notch_idx = 0;  
+    return e;  
+}  
+  
+void rx_dsp_set_notch(bool on) {  
+    if (on && !notch_enabled) {           // сброс состояния при включении — без щелчка  
+        memset(notch_buf, 0, sizeof(notch_buf));  
+        memset(notch_w,   0, sizeof(notch_w));  
+        notch_idx = 0;  
+        notch_pow = 0;  
+    }  
+    notch_enabled = on;  
+}
+
 // ================= LMS Adaptive Line Enhancer (ALE, «NR») =================  
 // Декоррелирует вход: голос/несущие (коррелированы) предсказываются и остаются,  
 // широкополосный шум (некоррелирован) не предсказывается и подавляется.  
@@ -547,21 +641,21 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
                 if (rxd_demod_mode == RXD_DEMOD_RAW) {  
                     si = sat16(vi);  
                     sq = sat16(vq);  
-                } else {
+                } else {  
                     int32_t d;  
                     if      (rxd_demod_mode == RXD_DEMOD_AM) d = rxd_am_sample(vi, vq);  
                     else if (rxd_demod_mode == RXD_DEMOD_FM) d = rxd_fm_sample(vi, vq);  
                     else                                     d = rxd_demod_sample(vi, vq); // SSB  
-                    int32_t df = af_lp_push(d);             // полосовой AF-фильтр (SH/SL)      
-                    // ALE шумоподавление — только SSB-голос, до sat16 и до очереди/АРУ.  
-                    if (nr_enabled && (rxd_demod_mode == RXD_DEMOD_USB ||  
-                                       rxd_demod_mode == RXD_DEMOD_LSB)) {  
-                        df = nr_lms_push(df);  
+                    int32_t df = af_lp_push(d);             // полосовой AF-фильтр (SH/SL)  
+                    // Автонотч применяем ТОЛЬКО в SSB; вызывать на каждом emit нельзя пропускать  
+                    if (notch_enabled &&  
+                        (rxd_demod_mode == RXD_DEMOD_USB || rxd_demod_mode == RXD_DEMOD_LSB)) {  
+                        df = notch_lms_push(df);  
                     }  
-                    int16_t m  = sat16(df);                 // моно 
-                    si = m;    
+                    int16_t m  = sat16(df);                 // моно  
+                    si = m;  
                     sq = m;  
-                }  
+                }
             
                 uint8_t anext = (uint8_t)((aud_head + 1) % RX_AUD_BUFS);  
                 if (anext != aud_tail) {  

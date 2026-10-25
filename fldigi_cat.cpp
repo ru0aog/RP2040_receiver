@@ -165,7 +165,17 @@ static void cat_execute(const char* cmd) {
     if (cmd[0] == 'T' && cmd[1] == 'X' && cmd[2] == '1' && n == 3) { return; }
     if (cmd[0] == 'R' && cmd[1] == 'X' && n == 2) { return; }
 
-// SH — верхний срез полосы (high cut). SH; запрос, SHnn индекс, SHnnnn Гц.  
+    // NT — автоматический notch. NT0 выкл, NT1 вкл.  
+    if (cmd[0] == 'N' && cmd[1] == 'T') {  
+        if (n == 3) {  
+            rx_dsp_set_notch(cmd[2] != '0');  
+            return;  
+        }  
+        cat_reply_err();  
+        return;  
+    }
+
+    // SH — верхний срез полосы (high cut). SH; запрос, SHnn индекс, SHnnnn Гц.  
     if (cmd[0] == 'S' && cmd[1] == 'H') {  
         if (n == 2) { cat_reply_sh(); return; }  
         uint32_t f_hi;  
