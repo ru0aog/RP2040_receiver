@@ -58,16 +58,21 @@ static void rx_full_tune(uint32_t freq_hz)
 // сдвиг NCO без перезапуска ядер; большая — полная переустановка LO.  
 void rx_retune(uint32_t freq_hz)  
 {  
-    uint32_t lo_hz      = vfo_quadrature_lo_hz();  
-    uint32_t cur_centre = lo_hz + RX_IF_SHIFT_HZ;  
-    long     delta      = (long)freq_hz - (long)cur_centre;  
+    uint32_t lo_hz = vfo_quadrature_lo_hz();  
+    // Куда попадёт дырка (f_nco), если сделать быстрый сдвиг NCO без ретюна LO.  
+    long     f_nco = (long)freq_hz - (long)lo_hz;  
   
-    if (delta > -7000 && delta < 7000) {  
-        rx_dsp_set_nco_hz((float)freq_hz - (float)lo_hz);  
+    // Быстрый путь РАЗРЕШЁН только пока дырка строго в сладкой зоне  
+    // [RX_NCO_SWEET_LO..RX_NCO_SWEET_HI] = [9600..14500]. Это гарантирует,  
+    // что при подстройке вниз мелкими шагами f_nco НЕ сползёт к 5 кГц и ниже  
+    // (дырка не войдёт в звуковую полосу). Как только f_nco вышел за зону —  
+    // полная переустановка LO вернёт f_nco к центру RX_IF_SHIFT_HZ (11000).  
+    if (f_nco >= (long)RX_NCO_SWEET_LO && f_nco <= (long)RX_NCO_SWEET_HI) {  
+        rx_dsp_set_nco_hz((float)f_nco);  
         current_rx_hz = freq_hz;  
         Serial.printf("# RX_NCO,target_hz=%lu,lo_hz=%lu,nco_hz=%ld\n",  
                       (unsigned long)freq_hz, (unsigned long)lo_hz,  
-                      (long)freq_hz - (long)lo_hz);  
+                      (long)f_nco);  
     } else {  
         rx_full_tune(freq_hz);  
     }  

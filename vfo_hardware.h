@@ -26,6 +26,10 @@
 #define RX_NCO_SWEET_LO       9600UL    // «сладкая» зона = стопбанд HB1 (~90 дБ режекции)  
 #define RX_NCO_SWEET_HI      14500UL    //   ниже фолда у 15625 с запасом  
 #define RX_NCO_MAX_HZ        15000UL    // потолок f_nco (ниже фолда 15625 и << 62500 окна NCO)
+  
+// Нижняя граница системной частоты для RX-гетеродина (квадратурный LO).  
+// Ниже этой шины спур-уровень и загрузка Core1 растут — держим шину высокой.  
+#define RX_CLK_SYS_MIN_HZ   240000000UL // Гц, нижний предел clk_sys в RX-режиме
 
 #define RX_ADC_SAMPLE_RATE_HZ 250000UL  // суммарная частота дискретизации (125 ksps на канал)
 // ADC работает на 48 МГц. adc_set_clkdiv(48000000/250000) даст 192.0 → 250 ksps суммарно = 125 ksps/канал. 
@@ -99,12 +103,6 @@ uint32_t vfo_quadrature_lo_hz(void);   // фактическая квантов�
 
 void quad_test(uint32_t freq_hz);
 void vfo_quadrature_debug(void);
-
-
-
-
-
-
 
 
 // рабочий лимит как переменные — min(дефайн, flash-значение)
@@ -202,25 +200,6 @@ void vfo_test_pll_extreme_shurm(void);
 // отключается (чистые дискретные тоны для Olivia MFSK вместо шумовой полки).  
 extern volatile uint8_t vfo_narrowband_mode;  
 void vfo_set_narrowband(bool on);
-
-
-// --- Энкодер перестройки частоты ---  
-#define ENC_PIN_A            20   // канал A (фаза), INPUT_PULLUP  
-#define ENC_PIN_B            21   // канал B (фаза), INPUT_PULLUP
-#define VFO_ENC_SW_PIN       19        // кнопка (нажатие = замыкание на GND)  
-#define VFO_ENC_TEST_FREQ_HZ 3600000UL // частота генерации по кнопке 
-#define VFO_ENC_DEBOUNCE_MS  30     // щелчков на оборот (справочно, не критично)
-  
-// Шаг перестройки на один щелчок энкодера, Гц. Задаётся снаружи,  
-// можно менять на лету (например, командой из консоли).  
-extern volatile uint32_t vfo_tune_step_hz;  
-// Текущая рабочая частота VFO, Гц — глобальная точка правды для ISR.  
-extern volatile uint32_t vfo_current_freq_hz;  
-// Накопленные тики энкодера со времени последней обработки.  
-extern volatile int32_t  enc_pending_steps;  
-  
-void vfo_encoder_init(void);          // pinMode + attachInterrupt, вызывать из setup()  
-void vfo_encoder_poll(void);          // обработка накопленных тиков, вызывать из loop()
 
 
 

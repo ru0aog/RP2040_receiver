@@ -244,7 +244,7 @@ void vfo_quadrature_start(uint32_t freq_hz) {
                     uint64_t vco = ref_hz * fbdiv;  
                     if (vco < 750000000ULL || vco > vco_max) continue;  
                     uint64_t clk = vco / pdiv;  
-                    if (clk < VFO_CLK_SYS_MIN_HZ || clk > clk_max) continue;  
+                    if (clk < RX_CLK_SYS_MIN_HZ || clk > clk_max) continue;
   
                     // Два варианта делителя на эту шину: целый и дробный (Q8).  
                     for (int frac_mode = 0; frac_mode < 2; frac_mode++) {  
