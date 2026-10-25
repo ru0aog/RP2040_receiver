@@ -14,6 +14,9 @@ static inline int16_t sat16(int32_t x) {
     return (int16_t)x;  
 }
 
+static volatile uint32_t rsid_dropped_windows = 0;  
+uint32_t rsid_rx_dropped(void) { return rsid_dropped_windows; }
+
 // ============================================================================  
 //  Константы RSID (из refs/rsid.h). Вход уже 11025 Гц.  
 // ============================================================================  
@@ -304,21 +307,29 @@ static double rsid_power_density(double f0, double bw) {
   
 // searchUp/searchDown из rtty.cxx: ищем f, где в бинах mark и space мощность  
 // на >RTTY_SNR_RATIO выше, чем в соседней «шумовой» полосе на +shift.  
-static void rtty_search_center(void) {  
-    const double shift = RTTY_SHIFT_HZ;  
-    const double bw    = 2.0 * RTTY_BAUD_HZ;  
-    for (double f = RTTY_SRCH_LO; f <= RTTY_SRCH_HI; f += 5.0) {  
-        double spwrlo = rsid_power_density(f - shift * 0.5, bw);  
-        double spwrhi = rsid_power_density(f + shift * 0.5, bw);  
-        double npwr   = rsid_power_density(f + shift,       bw) + 1e-10;  
-        if ((spwrlo / npwr > RTTY_SNR_RATIO) &&  
-            (spwrhi / npwr > RTTY_SNR_RATIO)) {  
-            rtty_center_hz  = (float)f;  
-            rtty_center_new = true;  
-            Serial.printf("# RTTY center=%.1f Hz\n", f);  
-            break;  
-        }  
-    }  
+static float rtty_center_applied = 0.0f;   // последний применённый центр  
+  
+static void rtty_search_center(void) {    
+    const double shift = RTTY_SHIFT_HZ;    
+    const double bw    = 2.0 * RTTY_BAUD_HZ;    
+    for (double f = RTTY_SRCH_LO; f <= RTTY_SRCH_HI; f += 5.0) {    
+        double spwrlo = rsid_power_density(f - shift * 0.5, bw);    
+        double spwrhi = rsid_power_density(f + shift * 0.5, bw);    
+        double npwr   = rsid_power_density(f + shift,       bw) + 1e-10;    
+        if ((spwrlo / npwr > RTTY_SNR_RATIO) &&    
+            (spwrhi / npwr > RTTY_SNR_RATIO)) {    
+            // Публикуем/печатаем ТОЛЬКО при существенном изменении центра,    
+            // иначе — молча игнорируем (убираем Serial-флуд каждое окно).    
+            if (rtty_center_applied == 0.0f ||    
+                fabsf((float)f - rtty_center_applied) > (RTTY_SHIFT_HZ * 0.5f)) {    
+                rtty_center_hz      = (float)f;    
+                rtty_center_new     = true;    
+                rtty_center_applied = (float)f;    
+                Serial.printf("# RTTY center=%.1f Hz\n", f);    
+            }    
+            break;    
+        }    
+    }    
 }
 
 // ----------------------------------------------------------------------------  
@@ -345,8 +356,13 @@ static void rsid_search(void) {
         aFFTAmpl[i] = (uint64_t)((int64_t)re * re + (int64_t)im * im);  
     }  
   
-    // Поиск центра RTTY по уже готовому FFT (не требует отдельного БПФ).  
-    rtty_search_center();
+    // Поиск центра RTTY по готовому FFT — не чаще раза в ~16 окон (~0.75 с),    
+    // чтобы не тормозить накопление RSID-буферов и не рвать звук.    
+    static uint8_t rtty_srch_div = 0;    
+    if (++rtty_srch_div >= 16) {    
+        rtty_srch_div = 0;    
+        rtty_search_center();    
+    }
   
     int bucket_low  = 3;  
     int bucket_high = RSID_FFT_SIZE - 32;  
@@ -401,20 +417,18 @@ void rsid_rx_push(int16_t sample) {
   
     aInputSamples[inptr++] = (float)sample;  
   
-    if (inptr >= RSID_ARRAY_SIZE) {  
-        // Тяжёлый rsid_search() НЕ вызываем здесь (блокирует наполнение  
-        // USB-аудио → разрывы). Копируем готовое окно в снимок и отдаём  
-        // обработку в rsid_rx_service() из loop(). Если предыдущее окно ещё  
-        // не обработано — пропускаем (лучше потерять окно, чем рвать звук).  
-        if (!rsid_window_ready) {    
-            for (int n = 0; n < RSID_ARRAY_SIZE; n++)  
-                rsid_proc[n] = sat16((int32_t)aInputSamples[n]);  
-            rsid_window_ready = true;    
-        }
-        memmove(&aInputSamples[0], &aInputSamples[RSID_FFT_SAMPLES],  
-                (RSID_BUFFER_SIZE - RSID_FFT_SAMPLES) * sizeof(float));  
-        inptr -= RSID_FFT_SAMPLES;  
-    }  
+    if (inptr >= RSID_ARRAY_SIZE) {    
+        if (!rsid_window_ready) {      
+            for (int n = 0; n < RSID_ARRAY_SIZE; n++)    
+                rsid_proc[n] = sat16((int32_t)aInputSamples[n]);    
+            rsid_window_ready = true;      
+        } else {    
+            rsid_dropped_windows++;   // service не успел — окно потеряно    
+        }    
+        memmove(&aInputSamples[0], &aInputSamples[RSID_FFT_SAMPLES],    
+                (RSID_BUFFER_SIZE - RSID_FFT_SAMPLES) * sizeof(float));    
+        inptr -= RSID_FFT_SAMPLES;    
+    }
 }  
   
 // Выполняется в loop() ПОСЛЕ rx_audio_poll(): тяжёлый БПФ/поиск вне горячего  
