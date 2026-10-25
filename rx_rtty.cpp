@@ -102,20 +102,19 @@ void rx_rtty_frame_levels(float pm, float ps) {
     const float snr_db = 10.0f * log10f(sig_pwr / (noise_pwr + 1e-6f));  
     present = (snr_db >= MF_SQUELCH_DB);  
   
-    const bool bit = (pm > ps);   // true = mark(1), false = space(0)  
-  
-    if (!present) {  
-        // нет сигнала — держим автомат в IDLE  
-        rxstate = RX_IDLE;  
-    } else {  
-        switch (rxstate) {  
-        case RX_IDLE:  
-            // старт-бит = space (bit==0), ждём его фронт  
-            if (!bit) {  
-                rxstate = RX_START;  
-                counter = symbollen * 0.5f;   // строб в середину старт-бита  
-            }  
-            break;  
+    const bool bit = (pm > ps);   // true = mark(1), false = space(0)    
+    
+    // present гейтит ТОЛЬКО старт из IDLE. Уже начатый символ дотактовываем    
+    // до стоп-бита, иначе кратковременные провалы SNR на переходах mark/space    
+    // рвут каждый символ (present моргает 1->0->1 на каждом фронте).    
+    switch (rxstate) {    
+    case RX_IDLE:    
+        // старт-бит = space (bit==0); входим только при наличии сигнала    
+        if (present && !bit) {    
+            rxstate = RX_START;    
+            counter = symbollen * 0.5f;   // строб в середину старт-бита    
+        }    
+        break;
   
         case RX_START:  
             if ((counter -= 1.0f) <= 0.0f) {  
@@ -138,19 +137,18 @@ void rx_rtty_frame_levels(float pm, float ps) {
             }  
             break;  
   
-        case RX_STOP:  
-            if ((counter -= 1.0f) <= 0.0f) {  
-                if (bit) {                     // стоп-бит = mark -> кадр валиден  
-                    rtty_emit(rxdata & 0x1F);  
-                }  
-                rxstate = RX_IDLE;  
-            }  
-            break;  
-        }  
-    }  
-  
-    // --- диагностика раз в секунду (временно) ---  
-    uint32_t now = millis();  
+        case RX_STOP:    
+            if ((counter -= 1.0f) <= 0.0f) {    
+                if (bit) {                     // стоп-бит = mark -> кадр валиден    
+                    rtty_emit(rxdata & 0x1F);    
+                }    
+                rxstate = RX_IDLE;    
+            }    
+            break;    
+    }    
+    
+    // --- диагностика раз в секунду (временно) ---    
+    uint32_t now = millis();
     if (now - dbg_t0 >= 1000) {  
         Serial.printf("# RTTYDBG calls/s=%lu pm=%.0f ps=%.0f snr=%.1f "  
                       "present=%d state=%d emits/s=%lu\n",  
