@@ -123,7 +123,12 @@ static rs_cpx_type    aFFTcmplx[RSID_ARRAY_SIZE];
 static rs_fft_type    aFFTAmpl[RSID_FFT_SIZE];  
 static int16_t        fft_buckets[RSID_NTIMES][RSID_FFT_SIZE];  // ~60 КБ (int16)  
   
-static int   inptr;  
+// Снимок готового окна 2048 отсчётов: наполняется в rsid_rx_push() (звуковой  
+// тракт), обрабатывается в rsid_rx_service() (loop). Оба на Core 0.  
+static float          rsid_proc[RSID_ARRAY_SIZE];     // +8 КБ  
+static volatile bool  rsid_window_ready = false;  
+  
+static int   inptr;
 static int   nBinLow, nBinHigh;  
 static int   hamming_resolution = RSID_HAMMING_RESOLUTION;  
   
@@ -236,7 +241,7 @@ static void rsid_search(void) {
     nBinHigh = RSID_FFT_SIZE - 32;  
   
     for (int i = 0; i < RSID_ARRAY_SIZE; i++)  
-        aFFTcmplx[i] = rs_cpx_type(aInputSamples[i] * fftwindow[i], 0);  
+        aFFTcmplx[i] = rs_cpx_type(rsid_proc[i] * fftwindow[i], 0);
   
     rsfft->ComplexFFT(aFFTcmplx);  
   
@@ -292,9 +297,25 @@ void rsid_rx_push(int16_t sample) {
     aInputSamples[inptr++] = (float)sample;  
   
     if (inptr >= RSID_ARRAY_SIZE) {  
-        rsid_search();  
+        // Тяжёлый rsid_search() НЕ вызываем здесь (блокирует наполнение  
+        // USB-аудио → разрывы). Копируем готовое окно в снимок и отдаём  
+        // обработку в rsid_rx_service() из loop(). Если предыдущее окно ещё  
+        // не обработано — пропускаем (лучше потерять окно, чем рвать звук).  
+        if (!rsid_window_ready) {  
+            memcpy(rsid_proc, aInputSamples, RSID_ARRAY_SIZE * sizeof(float));  
+            rsid_window_ready = true;  
+        }  
         memmove(&aInputSamples[0], &aInputSamples[RSID_FFT_SAMPLES],  
                 (RSID_BUFFER_SIZE - RSID_FFT_SAMPLES) * sizeof(float));  
         inptr -= RSID_FFT_SAMPLES;  
     }  
+}  
+  
+// Выполняется в loop() ПОСЛЕ rx_audio_poll(): тяжёлый БПФ/поиск вне горячего  
+// пути заполнения USB-буфера. Обрабатывает максимум одно окно за вызов.  
+void rsid_rx_service(void) {  
+    if (!rsfft) return;  
+    if (!rsid_window_ready) return;  
+    rsid_search();  
+    rsid_window_ready = false;  
 }
