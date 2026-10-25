@@ -3,10 +3,17 @@
 #include <math.h>  
 #include <string.h>  
 #include <complex>  
+
+// Целочисленный Q15 FFT (порт RP2040_beacon/rx_spectrum.cpp) — без FPU и без g_fft.  
+#define RSID_FFT_N   RSID_ARRAY_SIZE          // 2048  
+#define RSID_FFT_HALF (RSID_FFT_N / 2)  
   
-// FFT-движок из FLDigi (положи refs/gfft.h рядом или поправь путь include).  
-#include "gfft.h"  
-  
+static inline int16_t sat16(int32_t x) {  
+    if (x > 32767) return 32767;  
+    if (x < -32768) return -32768;  
+    return (int16_t)x;  
+}
+
 // ============================================================================  
 //  Константы RSID (из refs/rsid.h). Вход уже 11025 Гц.  
 // ============================================================================  
@@ -111,21 +118,24 @@ static void rsid_encode(int code, unsigned char* rsid /*RSID_NSYMBOLS*/) {
 }  
   
 // ============================================================================  
-//  Состояние детектора (аналог полей cRsId).  
+//  Состояние детектора
 // ============================================================================  
-static g_fft<rs_fft_type>* rsfft = nullptr;  
+static bool           rsid_inited = false;   // вместо проверки (!rsfft)  
   
-static unsigned char  pCodes1[sizeof(rsid_ids_1) / sizeof(rsid_ids_1[0]) * RSID_NSYMBOLS];  
+static unsigned char  pCodes1[sizeof(rsid_ids_1) / sizeof(rsid_ids_1[0]) * RSID_NSYMBOLS];    
   
-static float          aInputSamples[RSID_BUFFER_SIZE];   // кольцо входа 11025 Гц  
-static rs_fft_type    fftwindow[RSID_ARRAY_SIZE];  
-static rs_cpx_type    aFFTcmplx[RSID_ARRAY_SIZE];  
-static rs_fft_type    aFFTAmpl[RSID_FFT_SIZE];  
-static int16_t        fft_buckets[RSID_NTIMES][RSID_FFT_SIZE];  // ~60 КБ (int16)  
+static float          aInputSamples[RSID_BUFFER_SIZE];   // кольцо входа 11025 Гц    
+static int16_t        window_q15[RSID_FFT_N];            // окно Хэмминга в Q15  
+static int16_t        tw_re[RSID_FFT_HALF];              // твиддлы cos, Q15  
+static int16_t        tw_im[RSID_FFT_HALF];              // твиддлы sin, Q15  
+static int16_t        fft_i[RSID_FFT_N];                 // реальная часть (вход/выход FFT)  
+static int16_t        fft_q[RSID_FFT_N];                 // мнимая часть  
+static uint64_t       aFFTAmpl[RSID_FFT_SIZE];           // |X|^2 по бинам  
+static int16_t        fft_buckets[RSID_NTIMES][RSID_FFT_SIZE];  // ~60 КБ (int16)
   
 // Снимок готового окна 2048 отсчётов: наполняется в rsid_rx_push() (звуковой  
 // тракт), обрабатывается в rsid_rx_service() (loop). Оба на Core 0.  
-static float          rsid_proc[RSID_ARRAY_SIZE];     // +8 КБ  
+static int16_t        rsid_proc[RSID_ARRAY_SIZE];     // +4 КБ (Q15 снимок окна)
 static volatile bool  rsid_window_ready = false;  
   
 static int   inptr;
@@ -141,22 +151,58 @@ static inline double rsid_hamming(double x) {
     return 0.54 - 0.46 * cos(2.0 * M_PI * x);  
 }  
   
-static void rsid_reset_state(void) {  
-    inptr = RSID_FFT_SIZE;  
-    memset(aInputSamples, 0, sizeof(aInputSamples));  
-    memset(aFFTAmpl,      0, sizeof(aFFTAmpl));  
-    memset(fft_buckets,   0, sizeof(fft_buckets));  
-    for (int n = 0; n < RSID_ARRAY_SIZE; n++) aFFTcmplx[n] = rs_cpx_type(0, 0);  
-    hamming_resolution = RSID_HAMMING_RESOLUTION;  
-}  
-  
+static void rsid_reset_state(void) {    
+    inptr = RSID_FFT_SIZE;    
+    memset(aInputSamples, 0, sizeof(aInputSamples));    
+    memset(aFFTAmpl,      0, sizeof(aFFTAmpl));    
+    memset(fft_buckets,   0, sizeof(fft_buckets));    
+    hamming_resolution = RSID_HAMMING_RESOLUTION;    
+}
+
+// In-place radix-2 DIT, деление на 2 на каждой стадии (значения в Q15).  
+static void fft_q15(void) {  
+    uint16_t j = 0;  
+    for (uint16_t i = 1; i < RSID_FFT_N; ++i) {  
+        uint16_t bit = RSID_FFT_HALF;  
+        while (j & bit) { j ^= bit; bit >>= 1; }  
+        j ^= bit;  
+        if (i < j) {  
+            int16_t t;  
+            t = fft_i[i]; fft_i[i] = fft_i[j]; fft_i[j] = t;  
+            t = fft_q[i]; fft_q[i] = fft_q[j]; fft_q[j] = t;  
+        }  
+    }  
+    for (uint16_t len = 2; len <= RSID_FFT_N; len <<= 1) {  
+        const uint16_t half = len >> 1;  
+        const uint16_t tw_step = RSID_FFT_N / len;  
+        for (uint16_t base = 0; base < RSID_FFT_N; base += len) {  
+            for (uint16_t j2 = 0; j2 < half; ++j2) {  
+                const uint16_t tw = j2 * tw_step;  
+                const int32_t wr = tw_re[tw];  
+                const int32_t wi = tw_im[tw];  
+                const uint16_t a = base + j2;  
+                const uint16_t b = a + half;  
+                const int32_t br = fft_i[b], bi = fft_q[b];  
+                const int32_t tr = (br * wr - bi * wi) >> 15;  
+                const int32_t ti = (br * wi + bi * wr) >> 15;  
+                const int32_t ar = fft_i[a], ai = fft_q[a];  
+                fft_i[a] = sat16((ar + tr) >> 1);  
+                fft_q[a] = sat16((ai + ti) >> 1);  
+                fft_i[b] = sat16((ar - tr) >> 1);  
+                fft_q[b] = sat16((ai - ti) >> 1);  
+            }  
+        }  
+    }  
+}
+
+
 // ----------------------------------------------------------------------------  
 //  CalculateBuckets (refs/rsid.cxx, без изменений логики).  
 // ----------------------------------------------------------------------------  
-static void CalculateBuckets(const rs_fft_type* pSpectrum, int iBegin, int iEnd) {  
-    rs_fft_type Amp = 0.0f, AmpMax = 0.0f;  
-    int iBucketMax = iBegin - 2;  
-    int j;  
+static void CalculateBuckets(const uint64_t* pSpectrum, int iBegin, int iEnd) {    
+    uint64_t Amp = 0, AmpMax = 0;    
+    int iBucketMax = iBegin - 2;    
+    int j;
     for (int i = iBegin; i < iEnd; i += 2) {  
         if (iBucketMax == i - 2) {  
             AmpMax = pSpectrum[i];  
@@ -240,15 +286,21 @@ static void rsid_search(void) {
     nBinLow  = 3;  
     nBinHigh = RSID_FFT_SIZE - 32;  
   
-    for (int i = 0; i < RSID_ARRAY_SIZE; i++)  
-        aFFTcmplx[i] = rs_cpx_type(rsid_proc[i] * fftwindow[i], 0);
+// Оконирование Q15: вход (int16) * окно (Q15) >> 15. Мнимая часть = 0.  
+    for (int i = 0; i < RSID_FFT_N; i++) {  
+        int32_t xi = (int32_t)rsid_proc[i];          // rsid_proc теперь int16 (см. ниже)  
+        fft_i[i] = (int16_t)(((int32_t)xi * window_q15[i]) >> 15);  
+        fft_q[i] = 0;  
+    }  
   
-    rsfft->ComplexFFT(aFFTcmplx);  
+    fft_q15();  
   
-    memset(aFFTAmpl, 0, sizeof(aFFTAmpl));  
-    const rs_fft_type pscale = (rs_fft_type)(4.0 / ((double)RSID_FFT_SIZE * RSID_FFT_SIZE));  
-    for (int i = 0; i < RSID_FFT_SIZE; i++)  
-        aFFTAmpl[i] = std::norm(aFFTcmplx[i]) * pscale;  
+    // Мощность по бинам (только нижняя половина спектра используется).  
+    for (int i = 0; i < RSID_FFT_SIZE; i++) {  
+        const int32_t re = fft_i[i];  
+        const int32_t im = fft_q[i];  
+        aFFTAmpl[i] = (uint64_t)((int64_t)re * re + (int64_t)im * im);  
+    }
   
     int bucket_low  = 3;  
     int bucket_high = RSID_FFT_SIZE - 32;  
@@ -272,27 +324,34 @@ static void rsid_search(void) {
 // ============================================================================  
 //  Публичный интерфейс (rx_rsid.h).  
 // ============================================================================  
-void rsid_rx_init(float fs_hz) {  
-    (void)fs_hz;   // вход фиксирован RSID_SAMPLE_RATE (ресемплинг в rx_audio.cpp)  
+void rsid_rx_init(float fs_hz) {    
+    (void)fs_hz;   // вход фиксирован RSID_SAMPLE_RATE (ресемплинг в rx_audio.cpp)    
   
-    if (!rsfft) rsfft = new g_fft<rs_fft_type>(RSID_ARRAY_SIZE);  
+    // Окно Хэмминга в Q15.  
+    for (int i = 0; i < RSID_FFT_N; i++)    
+        window_q15[i] = sat16((int32_t)(rsid_hamming(1.0 * i / RSID_FFT_N) * 32767.0 + 0.5));    
   
-    for (int i = 0; i < RSID_ARRAY_SIZE; i++)  
-        fftwindow[i] = (rs_fft_type)rsid_hamming(1.0 * i / RSID_ARRAY_SIZE);  
+    // Твиддлы: e^{-j2πk/N} в Q15.  
+    for (int k = 0; k < RSID_FFT_HALF; k++) {  
+        const double a = -6.2831853071795864769 * (double)k / (double)RSID_FFT_N;  
+        tw_re[k] = sat16((int32_t)(cos(a) * 32767.0));  
+        tw_im[k] = sat16((int32_t)(sin(a) * 32767.0));  
+    }  
   
-    memset(pCodes1, 0, sizeof(pCodes1));  
-    for (int i = 0; i < rsid_ids_size1; i++)  
-        rsid_encode(rsid_ids_1[i].rs, pCodes1 + i * RSID_NSYMBOLS);  
+    memset(pCodes1, 0, sizeof(pCodes1));    
+    for (int i = 0; i < rsid_ids_size1; i++)    
+        rsid_encode(rsid_ids_1[i].rs, pCodes1 + i * RSID_NSYMBOLS);    
   
-    rsid_reset_state();  
-}  
+    rsid_reset_state();    
+    rsid_inited = true;    
+}
   
 void rsid_rx_set_callback(rsid_detect_cb_t cb) { s_cb = cb; }  
   
 void rsid_rx_reset(void) { rsid_reset_state(); }  
   
 void rsid_rx_push(int16_t sample) {  
-    if (!rsfft) return;                      // не инициализирован  
+    if (!rsid_inited) return;                    // не инициализирован  
   
     aInputSamples[inptr++] = (float)sample;  
   
@@ -301,10 +360,11 @@ void rsid_rx_push(int16_t sample) {
         // USB-аудио → разрывы). Копируем готовое окно в снимок и отдаём  
         // обработку в rsid_rx_service() из loop(). Если предыдущее окно ещё  
         // не обработано — пропускаем (лучше потерять окно, чем рвать звук).  
-        if (!rsid_window_ready) {  
-            memcpy(rsid_proc, aInputSamples, RSID_ARRAY_SIZE * sizeof(float));  
-            rsid_window_ready = true;  
-        }  
+        if (!rsid_window_ready) {    
+            for (int n = 0; n < RSID_ARRAY_SIZE; n++)  
+                rsid_proc[n] = sat16((int32_t)aInputSamples[n]);  
+            rsid_window_ready = true;    
+        }
         memmove(&aInputSamples[0], &aInputSamples[RSID_FFT_SAMPLES],  
                 (RSID_BUFFER_SIZE - RSID_FFT_SAMPLES) * sizeof(float));  
         inptr -= RSID_FFT_SAMPLES;  
@@ -314,7 +374,7 @@ void rsid_rx_push(int16_t sample) {
 // Выполняется в loop() ПОСЛЕ rx_audio_poll(): тяжёлый БПФ/поиск вне горячего  
 // пути заполнения USB-буфера. Обрабатывает максимум одно окно за вызов.  
 void rsid_rx_service(void) {  
-    if (!rsfft) return;  
+    if (!rsid_inited) return;
     if (!rsid_window_ready) return;  
     rsid_search();  
     rsid_window_ready = false;  
