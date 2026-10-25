@@ -277,7 +277,50 @@ static void rsid_apply(int iBin, int iSymbol) {
     else Serial.printf("# RSID mode=%s code=%d freq=%.1f\n",  
                        r.mode_name, r.mode_code, r.freq_hz);  
 }  
+
+// ----------------------------------------------------------------------------  
+//  powerDensity поверх текущего FFT (аналог wf->powerDensity в FLDigi rtty.cxx).  
+//  Суммирует |X|^2 по бинам в полосе [f0-bw/2 .. f0+bw/2]. df = 11025/2048.  
+// ----------------------------------------------------------------------------  
+#define RTTY_SHIFT_HZ   170.0  
+#define RTTY_BAUD_HZ    45.45  
+#define RTTY_SNR_RATIO  10.0      // порог spwr/npwr (как в searchUp/Down)  
+#define RTTY_SRCH_LO    300.0  
+#define RTTY_SRCH_HI    3500.0  
   
+static float         rtty_center_hz = 0.0f;  
+static volatile bool rtty_center_new = false;  
+  
+static double rsid_power_density(double f0, double bw) {  
+    const double df = RSID_SAMPLE_RATE / 2048.0;   // ≈5.383 Гц/бин  
+    int b0 = (int)((f0 - bw * 0.5) / df);  
+    int b1 = (int)((f0 + bw * 0.5) / df);  
+    if (b0 < 0) b0 = 0;  
+    if (b1 >= RSID_FFT_SIZE) b1 = RSID_FFT_SIZE - 1;  
+    double s = 0.0;  
+    for (int b = b0; b <= b1; b++) s += (double)aFFTAmpl[b];  
+    return s;  
+}  
+  
+// searchUp/searchDown из rtty.cxx: ищем f, где в бинах mark и space мощность  
+// на >RTTY_SNR_RATIO выше, чем в соседней «шумовой» полосе на +shift.  
+static void rtty_search_center(void) {  
+    const double shift = RTTY_SHIFT_HZ;  
+    const double bw    = 2.0 * RTTY_BAUD_HZ;  
+    for (double f = RTTY_SRCH_LO; f <= RTTY_SRCH_HI; f += 5.0) {  
+        double spwrlo = rsid_power_density(f - shift * 0.5, bw);  
+        double spwrhi = rsid_power_density(f + shift * 0.5, bw);  
+        double npwr   = rsid_power_density(f + shift,       bw) + 1e-10;  
+        if ((spwrlo / npwr > RTTY_SNR_RATIO) &&  
+            (spwrhi / npwr > RTTY_SNR_RATIO)) {  
+            rtty_center_hz  = (float)f;  
+            rtty_center_new = true;  
+            Serial.printf("# RTTY center=%.1f Hz\n", f);  
+            break;  
+        }  
+    }  
+}
+
 // ----------------------------------------------------------------------------  
 //  search (refs/rsid.cxx): FFT окна 2048 -> bucket'ы -> поиск кода.  
 //  bReverse = false (USB, тон в положительной звуковой полосе).  
@@ -300,7 +343,10 @@ static void rsid_search(void) {
         const int32_t re = fft_i[i];  
         const int32_t im = fft_q[i];  
         aFFTAmpl[i] = (uint64_t)((int64_t)re * re + (int64_t)im * im);  
-    }
+    }  
+  
+    // Поиск центра RTTY по уже готовому FFT (не требует отдельного БПФ).  
+    rtty_search_center();
   
     int bucket_low  = 3;  
     int bucket_high = RSID_FFT_SIZE - 32;  
@@ -378,4 +424,11 @@ void rsid_rx_service(void) {
     if (!rsid_window_ready) return;  
     rsid_search();  
     rsid_window_ready = false;  
+}
+
+bool rsid_get_rtty_center(float* f_hz) {  
+    if (!rtty_center_new) return false;  
+    rtty_center_new = false;  
+    if (f_hz) *f_hz = rtty_center_hz;  
+    return true;  
 }

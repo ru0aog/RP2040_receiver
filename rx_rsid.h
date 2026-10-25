@@ -65,6 +65,10 @@ void rsid_rx_set_callback(rsid_detect_cb_t cb);
 // Сбросить внутреннее состояние детектора (например, при ретюне/смене режима).  
 void rsid_rx_reset(void);  
   
+// Вернуть найденный по FFT центр пары mark/space RTTY (Гц). true — если  
+// с прошлого вызова появился новый центр. Подаётся в rx_mf_init().  
+bool rsid_get_rtty_center(float* f_hz);
+  
 #ifdef __cplusplus  
 }  
 #endif

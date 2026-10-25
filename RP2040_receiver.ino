@@ -139,7 +139,14 @@ void loop() {
   
     // Отложенная обработка RSID: тяжёлый БПФ/поиск вне наполнения USB-аудио.  
     rsid_rx_service();  
-      
+
+    // Авто-подстройка матч-фильтра RTTY по центру из FFT-обзора.  
+    float rtty_c;  
+    if (rsid_get_rtty_center(&rtty_c)) {  
+        rx_mf_init(rx_dsp_fs_out(), rtty_c, 170.0f);  
+        Serial.printf("# RTTY MF retuned to %.1f Hz\n", rtty_c);  
+    }
+
     // CAT опрашиваем не каждую итерацию, а раз в ~15 мс: обращения к
     // TinyUSB-CDC (dtr()/available()) в fldigi_cat_poll() дорогие,  
     // а для разбора CAT-команд такой частоты более чем достаточно.  

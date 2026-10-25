@@ -11,15 +11,18 @@
 #include <math.h>  
 #include "rx_rtty.h"  
   
-// Детекция присутствия сигнала.  
-#define MF_MIN_PEAK    1000.0f    // абсолютный порог «есть сигнал»  
-#define MF_SQUELCH_LIN 3.981f     // свелч: 6 дБ по мощности (10^(6/10)) над шумом  
-#define MF_ATTACK      0.25f      // быстрый подъём опорного пика  
-#define MF_DECAY       0.01f      // медленный спад
+// Детекция присутствия сигнала по SNR (аналог rtty.cxx Metric).  
+#define MF_SQUELCH_DB  6.0f       // порог присутствия: сигнал ≥6 дБ над шумом  
   
-// ---------- детекция сигнала ----------  
-static float ref_peak = 0.0f;  
-static bool  present  = false;  
+static inline float decayavg(float avg, float x, float w) {  
+    if (w < 1.0f) return x;  
+    return avg + (x - avg) / w;  
+}
+  
+// ---------- детекция сигнала (SNR-сквелч) ----------  
+static float sig_pwr   = 0.0f;  
+static float noise_pwr = 1e-6f;  
+static bool  present   = false;
   
 // ---------- измерение длительности mark/space ----------  
 static float    samp_rate = 15625.0f;  // Гц, для пересчёта длительности в мс  
@@ -32,8 +35,9 @@ static bool     have_run  = false;     // идёт ли накопление и�
 // чтобы точка вызова (rx_mf_init) не зависела от внутренней единицы.  
 void rx_rtty_init(float fs_hz) {  
     samp_rate = (fs_hz > 1.0f) ? fs_hz : 15625.0f;  
-    ref_peak  = 0.0f;  
-    present   = false;  
+    sig_pwr   = 0.0f;  
+    noise_pwr = 1e-6f;  
+    present   = false;
     have_run  = false;  
     run_len   = 0;  
 }
@@ -41,14 +45,13 @@ void rx_rtty_init(float fs_hz) {
 // ---------- кадр: уровни mark/space ----------  
 // Вызывается каждым отсчётом из rx_mf_sample.  
 void rx_rtty_frame_levels(float pm, float ps) {  
-    const float mx = (pm > ps) ? pm : ps;   // сигнал  
-    const float mn = (pm > ps) ? ps : pm;   // шум (противоположный матч-фильтр)  
-  
-    if (mx > ref_peak) ref_peak += MF_ATTACK * (mx - ref_peak);  
-    else               ref_peak += MF_DECAY  * (mx - ref_peak);  
-  
-    // Свелч: сигнал минимум на 6 дБ (x3.98 по мощности) выше шума.  
-    present = (ref_peak > MF_MIN_PEAK) && (mx > MF_SQUELCH_LIN * mn);  
+// --- SNR-сквелч: сильный тон = сигнал, слабый канал матч-фильтра = шум ---  
+    const float sp = (pm > ps) ? pm : ps;  
+    const float np = (pm < ps) ? pm : ps;  
+    sig_pwr   = decayavg(sig_pwr,   sp, sp > sig_pwr ? 2.0f : 8.0f);  
+    noise_pwr = decayavg(noise_pwr, np, 16.0f);  
+    const float snr_db = 10.0f * log10f(sig_pwr / (noise_pwr + 1e-6f));  
+    present = (snr_db >= MF_SQUELCH_DB);
   
     if (!present) {  
         // при пропадании сигнала вытолкнуть накопленный интервал  
