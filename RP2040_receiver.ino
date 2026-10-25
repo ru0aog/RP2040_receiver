@@ -141,17 +141,8 @@ void loop() {
         fldigi_cat_poll();   // неблокирующий разбор CAT-команд  
     }     
     
-#if RTTY_DECODE    
-    const int16_t* bi;    
-    const int16_t* bq;    
-    uint8_t n;    
-    while (rx_dsp_get_output(&bi, &bq, &n)) {    
-        for (uint8_t k = 0; k < n; k++) {    
-            rx_mf_sample(bi[k], bq[k]);    
-        }    
-        rx_dsp_release_output();    
-    }    
-#endif  
+    // RTTY теперь тактируется из аудио-тракта (rx_audio.cpp::get_demod_input),  
+    // который берёт тот же демодулированный моно-поток, что идёт в USB-аудио.
   
     busy_us_acc += (time_us_32() - t_busy_start);    
   

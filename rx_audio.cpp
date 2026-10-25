@@ -3,7 +3,8 @@
 #include <string.h>  
   
 #include "vfo_hardware.h"  
-#include "rx_audio.h"  
+#include "rx_audio.h"
+#include "rx_mf.h"
 #include "AudioTools.h"  
 #include "AudioTools/Communication/USB/USBAudioStream.h"  
 
@@ -145,8 +146,12 @@ static bool get_demod_input(int32_t* out) {
         }  
     }  
   
-    const int32_t m = (int32_t)bi[pos];  // уже демодулировано на Core 1 (моно в aud_i)  
+const int32_t m = (int32_t)bi[pos];  // уже демодулировано на Core 1 (моно в aud_i)  
     ++pos;  
+#if RTTY_DECODE  
+    // Тап в RTTY-матч-фильтр: тот же моно-поток 15625 Гц, что идёт в USB-аудио.  
+    rx_mf_sample((int16_t)m, 0);  
+#endif  
     *out = m;  
     return true;
 }  
