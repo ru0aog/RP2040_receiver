@@ -164,13 +164,15 @@ void loop() {
     // Диагностика: загрузка Core 0/Core 1 и дропы, раз в секунду.    
     static uint32_t t_dbg = 0;    
     if (millis() - t_dbg >= 10000) {    
-        t_dbg = millis();    
+        t_dbg = millis();
+        /* отключено: диагностика загрузки ядер 
         Serial.printf("# CORE0_LOAD=%.1f%% CORE1_LOAD=%.1f%% aud_dropped=%lu out_dropped=%lu clip=%lu\n",  
                       core0_load_permille / 10.0,  
                       rx_dsp_load_permille() / 10.0,  
                       (unsigned long)rx_dsp_aud_dropped(),  
                       (unsigned long)rx_dsp_out_dropped(),  
-                      (unsigned long)rx_dsp_clip_count());   
+                      (unsigned long)rx_dsp_clip_count());
+        */
     }
 
 }
