@@ -146,16 +146,4 @@ void rx_rtty_frame_levels(float pm, float ps) {
             }    
             break;    
     }    
-    
-    // --- диагностика раз в секунду (временно) ---    
-    uint32_t now = millis();
-    if (now - dbg_t0 >= 1000) {  
-        Serial.printf("# RTTYDBG calls/s=%lu pm=%.0f ps=%.0f snr=%.1f "  
-                      "present=%d state=%d emits/s=%lu\n",  
-                      (unsigned long)dbg_calls, (double)pm, (double)ps,  
-                      (double)snr_db, present ? 1 : 0, rxstate,  
-                      (unsigned long)dbg_emits);  
-        dbg_calls = dbg_emits = 0;  
-        dbg_t0 = now;  
-    }  
 }
