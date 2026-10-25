@@ -12,7 +12,8 @@
 #include "vfo_hardware.h"    
 #include "rx_audio.h"    
 #include "rx_mf.h"    
-#include "rx_rtty.h"    
+#include "rx_rtty.h"
+#include "rx_rsid.h"
 #include "fldigi_cat.h"    
 #include <Adafruit_TinyUSB.h> 
   
@@ -106,10 +107,14 @@ void setup()
     }  
 
     startReceiver();
-  
-    // Второй USB-CDC для CAT (FLDigi, Kenwood TS-2000).    
-    fldigi_cat_init();  
-}  
+ 
+    // RSID-декодер: строит таблицы мод и создаёт FFT-движок (g_fft 2048).  
+    // Без этого вызова rsfft остаётся nullptr и rsid_rx_push() молчит.  
+    rsid_rx_init(RSID_RX_FS_HZ);  
+    
+    // Второй USB-CDC для CAT (FLDigi, Kenwood TS-2000).      
+    fldigi_cat_init();    
+}
   
 // RP2040_receiver.ino  
 void loop() {    
