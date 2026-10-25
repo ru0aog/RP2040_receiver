@@ -1,0 +1,66 @@
+#pragma once  
+#include <stdint.h>  
+  
+// ============================================================================  
+//  Бортовой RSID-декодер (порт refs/rsid.cxx -> cRsId, только RX).  
+//  
+//  Назначение: по короткой RSID-посылке (15 символов MFSK, шаг тона  
+//  11025/1024 ≈ 10.77 Гц) определить МОДУ сигнала и его ЦЕНТРАЛЬНУЮ ЧАСТОТУ,  
+//  чтобы автоматически подстроить матч-фильтр/демодулятор под реальный сигнал.  
+//  
+//  Поток данных:  
+//    Core 1 (DSP) -> демод-моно 15625 Гц -> get_demod_input() (rx_audio.cpp)  
+//      -> ресемплер Фарроу 15625->11025 -> rsid_rx_push() (каждый отсчёт 11025 Гц)  
+//      -> накопление RSID_FFT_SAMPLES (512) -> search() -> (mode, freq).  
+//  
+//  Все вызовы идут из Core 0 (из rx_audio_poll()->next_frame()->get_demod_input()),  
+//  поэтому Serial здесь безопасен (на Core 0 не real-time).  
+// ============================================================================  
+  
+// Частота дискретизации, на которой работает RSID-детектор (после ресемплинга).  
+// Совпадает с RSID_SAMPLE_RATE из refs/rsid.h.  
+#ifndef RSID_RX_FS_HZ  
+#define RSID_RX_FS_HZ   11025.0f  
+#endif  
+  
+// Порог допустимого расстояния Хэмминга при сверке принятой последовательности  
+// с таблицей мод (в FLDigi берётся из progdefaults.RsID_label_type; на МК —  
+// константа). 0 = точное совпадение, больше = мягче (но выше ложные срабатывания).  
+#ifndef RSID_HAMMING_RESOLUTION  
+#define RSID_HAMMING_RESOLUTION   1  
+#endif  
+  
+#ifdef __cplusplus  
+extern "C" {  
+#endif  
+  
+// Результат успешного распознавания RSID.  
+typedef struct {  
+    int         mode_code;   // код moды (trx_mode из refs/globals.h, напр. MODE_RTTY)  
+    const char* mode_name;   // человекочитаемое имя моды (из mode_info[].sname)  
+    float       freq_hz;     // центральная частота сигнала в звуковой полосе, Гц  
+} rsid_result_t;  
+  
+// Тип колбэка, вызываемого при обнаружении RSID.  
+typedef void (*rsid_detect_cb_t)(const rsid_result_t* r);  
+  
+// Инициализация декодера.  
+//   fs_hz — частота входного потока (должна быть RSID_RX_FS_HZ = 11025).  
+// Строит таблицы ожидаемых тон-последовательностей для всех известных мод  
+// (Encode) и готовит FFT-движок.  
+void rsid_rx_init(float fs_hz);  
+  
+// Подать ОДИН отсчёт потока 11025 Гц (из ресемплера в rx_audio.cpp).  
+// Накапливает окно; каждые RSID_FFT_SAMPLES (512) запускает search().  
+void rsid_rx_push(int16_t sample);  
+  
+// Зарегистрировать колбэк обнаружения (необязательно). Если не задан —  
+// результат печатается в Serial строкой "# RSID mode=<имя> freq=<Гц>".  
+void rsid_rx_set_callback(rsid_detect_cb_t cb);  
+  
+// Сбросить внутреннее состояние детектора (например, при ретюне/смене режима).  
+void rsid_rx_reset(void);  
+  
+#ifdef __cplusplus  
+}  
+#endif

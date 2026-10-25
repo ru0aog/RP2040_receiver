@@ -5,10 +5,11 @@
 #include "vfo_hardware.h"  
 #include "rx_audio.h"
 #include "rx_mf.h"
+#include "rx_rsid.h"   // точка входа RSID: rsid_rx_push(int16_t) на 11025 Гц  
 #include "AudioTools.h"  
 #include "AudioTools/Communication/USB/USBAudioStream.h"  
-
-  
+ 
+ 
 // ---- Демодулятор ----  
 #define DEMOD_USB  0  
 #define DEMOD_LSB  1
@@ -18,9 +19,9 @@
 // Фиксированное усиление сырых I/Q перед упаковкой в PCM.  
 #define RAW_IQ_GAIN 16  
   
-// сырой I/Q → rx_dsp_set_demod(RXD_DEMOD_RAW);
-// SSB верхняя → rx_dsp_set_demod(RXD_DEMOD_USB);
-// SSB нижняя → rx_dsp_set_demod(RXD_DEMOD_LSB).
+// Прямое объявление: вызов в get_demod_input() идёт раньше определения ниже.  
+// Спецификатор inline обязан совпадать с определением.  
+static inline void rsid_rs_push(int32_t x);
 
 // ---- Runtime-состояние режима вывода ----  
 // Стартовый режим — сырые I/Q (как раньше при RAW_IQ_OUT=1).  
@@ -147,12 +148,15 @@ static bool get_demod_input(int32_t* out) {
     }  
   
 const int32_t m = (int32_t)bi[pos];  // уже демодулировано на Core 1 (моно в aud_i)  
-    ++pos;  
-#if RTTY_DECODE  
-    // Тап в RTTY-матч-фильтр: тот же моно-поток 15625 Гц, что идёт в USB-аудио.  
-    rx_mf_sample((int16_t)m, 0);  
-#endif  
-    *out = m;  
+    ++pos;    
+#if RTTY_DECODE    
+    // Тап в RTTY-матч-фильтр: тот же моно-поток 15625 Гц, что идёт в USB-аудио.    
+    rx_mf_sample((int16_t)m, 0);    
+#endif    
+
+    // Тап в RSID: тот же моно-поток 15625 Гц, децимируется до 11025 Гц.    
+    rsid_rs_push(m);    
+    *out = m;    
     return true;
 }  
   
@@ -289,6 +293,44 @@ static inline int32_t farrow_eval_i(int32_t c0, int32_t c1, int32_t c2, int32_t 
     t = (int32_t)(((int64_t)t * mu_q15) >> 15) + c0;  
     return t;   // = 2*y  
 }
+
+ 
+// ---- Децимация 15625 -> 11025 Гц для RSID (push-режим, тот же Фарроу) ----  
+// S = 15625/11025 ≈ 1.4172 входных отсчёта на выходной (>1 → децимация),  
+// поэтому аккумулятор звукового тракта (для повышения частоты) здесь НЕ годится.  
+// Антиалиасинг не нужен: AF-тракт Core 1 уже режет полосу ~3 кГц (Найквист 11025 = 5512).  
+static const float RR_STEP = 15625.0f / 11025.0f;   // ≈ 1.41723  
+static int32_t rr_xm1 = 0, rr_x0 = 0, rr_x1 = 0, rr_x2 = 0;  // окно 4 отсчёта  
+static uint8_t rr_init = 0;                                   // прайминг  
+static float   rr_frac = 0.0f;                               // фаза в входных отсчётах  
+  
+// Вызывается на КАЖДЫЙ демод-отсчёт 15625 Гц; выдаёт 0..1 отсчёт на 11025 Гц.  
+static inline void rsid_rs_push(int32_t x) {  
+    // сдвиг окна  
+    rr_xm1 = rr_x0;  rr_x0 = rr_x1;  rr_x1 = rr_x2;  rr_x2 = x;  
+    if (rr_init < 4) { rr_init++; if (rr_init < 4) return; }  // ждём 4 отсчёта  
+  
+    int32_t c0, c1, c2, c3;  
+    farrow_calc_i(rr_xm1, rr_x0, rr_x1, rr_x2, &c0, &c1, &c2, &c3);  
+  
+    // один входной отсчёт «прошёл» → фаза сдвигается  
+    while (rr_frac < 1.0f) {  
+        uint32_t mu_q15 = (uint32_t)(rr_frac * 32768.0f);     // [0..1) -> Q15  
+        int32_t  y2 = farrow_eval_i(c0, c1, c2, c3, mu_q15);  // = 2*y  
+        int32_t  y  = (y2 + 1) >> 1;                          // y с округлением  
+        rsid_rx_push((int16_t)y);                            // -> накопитель RSID 11025 Гц  
+        rr_frac += RR_STEP;  
+    }  
+    rr_frac -= 1.0f;  
+}  
+  
+// Сброс состояния ресемплера (вызывать при смене режима/ретюне, если нужно).  
+static inline void rsid_rs_reset(void) {  
+    rr_xm1 = rr_x0 = rr_x1 = rr_x2 = 0;  
+    rr_init = 0;  
+    rr_frac = 0.0f;  
+}  
+
 
 static bool next_frame(int16_t* l, int16_t* r) {  
     if (l == nullptr || r == nullptr) {  
