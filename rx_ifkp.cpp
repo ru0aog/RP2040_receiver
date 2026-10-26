@@ -16,7 +16,7 @@
 // Окно ~46 мс (512/11025), символ ~500 мс => порог < половины символа.  
 #define IFKP_PEAK_HITS     4  
 // Сглаживание энергии тона между окнами (аналог binfilt Cmovavg в FLDigi).  
-#define IFKP_SMOOTH_A      0.5f
+#define IFKP_SMOOTH_A      0.3f   // ~ movavg 4 окна (как binfilt FLDigi для IFKP 0.5)
   
 static bool   active = false;  
 static float  base_hz = 0.0f, cur_bin_hz = 5.383f;  
@@ -123,11 +123,11 @@ void rx_ifkp_on_fft(const uint64_t* ampl, int nbins, float bin_hz) {
     for (int i = 0; i < IFKP_NTONES; i++) {  
         int b = tone_bin[i];  
         float e = 0.0f;  
-        if (b >= 1 && b < nbins - 1)  
-            e = (float)(ampl[b-1] + ampl[b] + ampl[b+1]);  
-        tpwr[i] += (e - tpwr[i]) * IFKP_SMOOTH_A;   // EMA ~ binfilt FLDigi  
+        if (b >= 0 && b < nbins)  
+            e = (float)ampl[b];   // только центр: тоны ~2.17 бина врозь, ±1 перекрывает соседей  
+        tpwr[i] += (e - tpwr[i]) * IFKP_SMOOTH_A;  
         if (tpwr[i] > bp) { bp = tpwr[i]; best = i; }  
-    }  
+    }
   
     // 2) Детект символа по кромке (порт FLDigi process_tones()):  
     //    пик стабилен peak_hits окон подряд и отличается от прошлого.  
