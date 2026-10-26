@@ -6,21 +6,20 @@
 #include <math.h>  
 #include <string.h>  
 #include "rx_ifkp.h"  
-#include "rx_decoders.h"  
+#include "rx_decoders.h"
+#include "rx_goertzel.h"
   
 #define IFKP_NTONES        33  
 #define IFKP_STEP_HZ       11.697f  
 #define IFKP_OFFSET_HZ     (16.0f * IFKP_STEP_HZ)   // 187.15: центр на 16-м тоне  
 // Детект символа «по кромке» как в FLDigi process_tones(): пик должен  
-// продержаться IFKP_PEAK_HITS окон подряд и отличаться от прошлого.  
-// Окно ~46 мс (512/11025), символ ~500 мс => порог < половины символа.  
-#define IFKP_PEAK_HITS     4  
+// продержаться IFKP_PEAK_HITS окон подряд и отличаться от прошлого
+#define IFKP_PEAK_HITS     2  
 // Сглаживание энергии тона между окнами (аналог binfilt Cmovavg в FLDigi).  
 #define IFKP_SMOOTH_A      0.3f   // ~ movavg 4 окна (как binfilt FLDigi для IFKP 0.5)
   
 static bool   active = false;  
-static float  base_hz = 0.0f, cur_bin_hz = 5.383f;  
-static int    tone_bin[IFKP_NTONES];  
+static float  base_hz = 0.0f;  
   
 static float  tpwr[IFKP_NTONES];     // сглаженная энергия каждого тона  
 static int    peak = 0, prev_peak = -1, last_peak = -1;  
@@ -29,14 +28,6 @@ static int    peak_counter = 0;
 static int    prev_tone = -1;  static bool have_prev = false;  
 static int    base_delta = -1; static bool have_base = false;  
   
-static void compute_bins(float bin_hz) {  
-    cur_bin_hz = bin_hz;  
-    for (int i = 0; i < IFKP_NTONES; i++) {  
-        float f = base_hz + i * IFKP_STEP_HZ;  
-        int b = (int)(f / bin_hz + 0.5f);  
-        tone_bin[i] = (b < 0) ? 0 : b;  
-    }  
-}  
   
 void rx_ifkp_init(float center_hz) {  
     base_hz = center_hz - IFKP_OFFSET_HZ;  
@@ -44,7 +35,8 @@ void rx_ifkp_init(float center_hz) {
     peak = 0; prev_peak = -1; last_peak = -1; peak_counter = 0;  
     prev_tone = -1; have_prev = false;  
     base_delta = -1; have_base = false;  
-    gb_cfg_t cfg = { IFKP_NTONES, base_hz, IFKP_STEP_HZ, 11025.0f, 1024 };  
+  // Конфиг банка Гёрцеля (block_n=2048 => полоса fs/N ≈ 7.6 Гц < шага 11.697; ~3.8 блока/символ):  
+  gb_cfg_t cfg = { IFKP_NTONES, base_hz, IFKP_STEP_HZ, 15625.0f, 2048 };
     gb_init(&cfg);  
     active = true;  
 }

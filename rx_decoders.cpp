@@ -13,6 +13,7 @@
 #include "rx_cw.h"
 #include "rx_rtty.h"
 #include "rx_ifkp.h"
+
   
 // Коды мод из таблицы RSID (см. логи: RTTY-45=39, CW=26).  
 #define RSID_CODE_RTTY45   39  
@@ -36,7 +37,8 @@ void rx_decoders_emit(char c) { if (s_out) s_out(c); }
 void rx_decoders_sample(int16_t m) {  
     switch (active_dec) {  
     case DEC_RTTY: rx_mf_sample(m, 0); break;  
-    case DEC_CW:   rx_cw_sample(m); break;  
+    case DEC_CW:   rx_cw_sample(m); break;
+    case DEC_IFKP: rx_ifkp_push(m); break;   // добавить 
     default:       break;   // DEC_NONE — пока метки нет, не декодируем  
     }  
 }
@@ -78,7 +80,6 @@ void rx_decoders_init(float fs_hz) {
     dec_fs_hz  = (fs_hz > 1.0f) ? fs_hz : 15625.0f;  
     active_dec = DEC_NONE;  
     rsid_rx_set_callback(rx_decoders_on_rsid);   // весь вывод/маршрутизация через нас
-    rsid_rx_set_fft_sink(rx_ifkp_on_fft);   // IFKP питается от того же FFT
 }
 
 
