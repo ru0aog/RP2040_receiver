@@ -163,7 +163,6 @@ static rsid_state_t rsid_sm_state = RSID_STATE_IDLE;
 static uint16_t fft_len = 2;
 static uint16_t fft_base = 0;
 
-
 // ============================================================================  
 //  Состояние детектора  
 // ============================================================================  
@@ -485,39 +484,6 @@ void rsid_rx_dispatch(void) {
                        rsid_det_result.mode_name,  
                        rsid_det_result.mode_code,  
                        rsid_det_result.freq_hz);  
-}
-
-void rsid_rx_service(void) {
-    if (!rsid_inited) return;
-
-    // 1. Выгребаем сэмплы из межъядерной очереди во внутренний буфер БПФ
-    while (rsid_sq_tail != rsid_sq_head) {
-        uint32_t tail = rsid_sq_tail;
-        int16_t sample = rsid_sample_queue[tail];
-        
-        rsid_sq_tail = (tail + 1u) % RSID_SAMPLE_Q_SIZE;
-        __dmb();
-
-        // Старая логика накопления окна, но теперь она безопасно выполняется на Core 1
-        aInputSamples[inptr++] = sample;
-        if (inptr >= RSID_ARRAY_SIZE) {
-            if (!rsid_window_ready) {
-                memcpy(rsid_proc, aInputSamples, RSID_ARRAY_SIZE * sizeof(int16_t));
-                rsid_window_ready = true;
-            } else { 
-                rsid_dropped_windows++; 
-            }
-            memmove(&aInputSamples[0], &aInputSamples[RSID_FFT_SAMPLES],  
-                    (RSID_BUFFER_SIZE - RSID_FFT_SAMPLES) * sizeof(int16_t));  
-            inptr -= RSID_FFT_SAMPLES;  
-        }
-    }
-
-    // 2. Если окно накопилось — запускаем тяжёлый БПФ
-    if (rsid_window_ready) {  
-        rsid_search();  
-        rsid_window_ready = false;  
-    }  
 }
 
   

@@ -555,13 +555,12 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
         t_prev = t_now;  
         // проверяем очередь АЦП (функция в rx_capture.cpp)
         const volatile uint32_t* blk = rx_capture_get_block();
-
-        if (!blk) {
-            // Новых данных от АЦП нет — даём Core 1 поработать над RSID.
-            // Но вызываем не монолитный rsid_rx_service(), а его квантованную версию!
-            rsid_rx_service_sliced(); 
-            tight_loop_contents();
-            continue;
+        if (!blk) {    
+            // Один вычислительный квант стейт-машины RSID. НЕ блокирует ядро на    
+            // весь БПФ+поиск, поэтому не роняет следующий ADC-блок.    
+            rsid_rx_service_sliced();    
+            tight_loop_contents();    
+            continue;    
         }
         // Начало полезной работы: засекаем время обработки блока.  
         const uint32_t t_busy_start = time_us_32();

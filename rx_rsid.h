@@ -54,10 +54,6 @@ void rsid_rx_init(float fs_hz);
 // Накапливает окно; при наборе 2048 отсчётов сохраняет снимок для обработки.  
 void rsid_rx_push(int16_t sample);  
   
-// Выполнить отложенный поиск RSID по готовому окну. Вызывать из loop()  
-// после rx_audio_poll() — тяжёлый БПФ вне звукового тракта.  
-void rsid_rx_service(void);
-
 // Отложенная ДИСПЕТЧЕРИЗАЦИЯ результата RSID (печать метки + смена моды).  
 // Вызывать из loop() на Core 0. Сам тяжёлый поиск идёт на Core 1 (rsid_rx_service).  
 void rsid_rx_dispatch(void);
@@ -109,6 +105,9 @@ void rsid_rx_push(int16_t sample);
 void rsid_rx_service(void);
 
 // Высокопроизводительный пошаговый (квантованный) обработчик для Core 1
+// Выполнить ОДИН вычислительный квант асинхронной стейт-машины RSID  
+// (попутный сбор сэмплов из межъядерной очереди + один шаг БПФ/поиска).  
+// Вызывать из холостой ветки цикла Core 1. 
 void rsid_rx_service_sliced(void);
 
 void rsid_rx_dispatch(void);
