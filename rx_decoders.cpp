@@ -12,11 +12,13 @@
 #include "rx_mf.h"
 #include "rx_cw.h"
 #include "rx_rtty.h"
+#include "rx_ifkp.h"
   
 // Коды мод из таблицы RSID (см. логи: RTTY-45=39, CW=26).  
 #define RSID_CODE_RTTY45   39  
 #define RSID_CODE_CW       26  
-#define RTTY_SHIFT_HZ      170.0f  
+#define RTTY_SHIFT_HZ      170.0f    
+enum { DEC_NONE = 0, DEC_RTTY, DEC_CW, DEC_IFKP }; 
   
 enum { DEC_NONE = 0, DEC_RTTY, DEC_CW };  
 static int   active_dec = DEC_NONE;  
@@ -48,15 +50,22 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
   
     switch (r->mode_code) {  
     case RSID_CODE_RTTY45:  
+        rx_ifkp_stop();  
         active_dec = DEC_RTTY;  
         rx_mf_init(dec_fs_hz, r->freq_hz, RTTY_SHIFT_HZ);  
         rx_rtty_init(dec_fs_hz);  
         Serial.printf("# DECODER=RTTY center=%.1f Hz\n", (double)r->freq_hz);  
         break;  
-    case RSID_CODE_CW:    
-        active_dec = DEC_CW;    
-        rx_cw_init(dec_fs_hz, r->freq_hz);    
-        Serial.printf("# DECODER=CW center=%.1f Hz\n", (double)r->freq_hz);    
+    case RSID_CODE_CW:  
+        rx_ifkp_stop();  
+        active_dec = DEC_CW;  
+        rx_cw_init(dec_fs_hz, r->freq_hz);  
+        Serial.printf("# DECODER=CW center=%.1f Hz\n", (double)r->freq_hz);  
+        break;  
+    case RSID_CODE_IFKP:  
+        active_dec = DEC_IFKP;  
+        rx_ifkp_init(r->freq_hz);           // первично — центр из RSID  
+        Serial.printf("# DECODER=IFKP center=%.1f Hz\n", (double)r->freq_hz);  
         break;
     default:  
         Serial.printf("# DECODER unsupported code=%d\n", r->mode_code);  
@@ -67,7 +76,8 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
 void rx_decoders_init(float fs_hz) {  
     dec_fs_hz  = (fs_hz > 1.0f) ? fs_hz : 15625.0f;  
     active_dec = DEC_NONE;  
-    rsid_rx_set_callback(rx_decoders_on_rsid);   // весь вывод/маршрутизация через нас  
+    rsid_rx_set_callback(rx_decoders_on_rsid);   // весь вывод/маршрутизация через нас
+    rsid_rx_set_fft_sink(rx_ifkp_on_fft);   // IFKP питается от того же FFT
 }
 
 

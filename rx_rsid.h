@@ -68,6 +68,11 @@ void rsid_rx_reset(void);
 // Вернуть найденный по FFT центр пары mark/space RTTY (Гц). true — если  
 // с прошлого вызова появился новый центр. Подаётся в rx_mf_init().  
 bool rsid_get_rtty_center(float* f_hz);
+
+// Сток спектра IFKP: вызывается каждое FFT-окно (нижняя половина спектра).  
+//   ampl[nbins] — мощности бинов, bin_hz = RSID_SAMPLE_RATE/2048 ≈ 5.383 Гц.  
+typedef void (*rsid_fft_sink_t)(const uint64_t* ampl, int nbins, float bin_hz);  
+void rsid_rx_set_fft_sink(rsid_fft_sink_t sink);
   
 #ifdef __cplusplus  
 }  

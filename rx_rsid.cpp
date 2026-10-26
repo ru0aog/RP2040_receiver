@@ -167,7 +167,8 @@ static int   hamming_resolution = RSID_HAMMING_RESOLUTION;
 // Счётчик окон, в течение которых после ESCAPE ищем во втором наборе.  
 static int   rsid_secondary_windows = 0;  
   
-static rsid_detect_cb_t s_cb = nullptr;  
+static rsid_detect_cb_t s_cb = nullptr;
+void rsid_rx_set_fft_sink(rsid_fft_sink_t sink) { s_fft_sink = sink; }  
   
 // ============================================================================  
 //  Окно Хэмминга (refs/rsid.cxx -> filters.h hamming()).  
@@ -335,7 +336,10 @@ static void rsid_search(void) {
         const int32_t im = fft_q[i];  
         aFFTAmpl[i] = (uint64_t)((int64_t)re * re + (int64_t)im * im);  
     }  
-  
+
+    if (s_fft_sink)  
+        s_fft_sink(aFFTAmpl, RSID_FFT_SIZE, (float)(RSID_SAMPLE_RATE / 2048.0));
+
     int bucket_low  = 3;  
     int bucket_high = RSID_FFT_SIZE - 32;  
   
