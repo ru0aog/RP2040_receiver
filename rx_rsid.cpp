@@ -34,7 +34,7 @@ uint32_t rsid_rx_dropped(void) { return rsid_dropped_windows; }
 // Сколько окон поиска держать активным набор 2 после приёма ESCAPE.  
 // fldigi: 27 * RSID_SYMLEN отсчётов (10 gap + 15 символов + 2 на ошибки тайминга);  
 // при шаге окна RSID_FFT_SAMPLES (512) это ~27 окон. Берём с запасом.  
-#define RSID_SECONDARY_WINDOWS   30  
+#define RSID_SECONDARY_WINDOWS   60
   
 // float вместо double — экономия ОЗУ на RP2040.  
 typedef float                       rs_fft_type;  
