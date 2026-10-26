@@ -1,22 +1,23 @@
+// rx_rsid.cpp  
 #include "rx_rsid.h"  
 #include <Arduino.h>  
 #include <math.h>  
 #include <string.h>  
 #include <complex>  
-
+  
 // Целочисленный Q15 FFT (порт RP2040_beacon/rx_spectrum.cpp) — без FPU и без g_fft.  
-#define RSID_FFT_N   RSID_ARRAY_SIZE          // 2048  
+#define RSID_FFT_N    RSID_ARRAY_SIZE          // 2048  
 #define RSID_FFT_HALF (RSID_FFT_N / 2)  
   
 static inline int16_t sat16(int32_t x) {  
     if (x > 32767) return 32767;  
     if (x < -32768) return -32768;  
     return (int16_t)x;  
-}
-
+}  
+  
 static volatile uint32_t rsid_dropped_windows = 0;  
-uint32_t rsid_rx_dropped(void) { return rsid_dropped_windows; }
-
+uint32_t rsid_rx_dropped(void) { return rsid_dropped_windows; }  
+  
 // ============================================================================  
 //  Константы RSID (из refs/rsid.h). Вход уже 11025 Гц.  
 // ============================================================================  
@@ -28,14 +29,22 @@ uint32_t rsid_rx_dropped(void) { return rsid_dropped_windows; }
 #define RSID_NSYMBOLS      15  
 #define RSID_NTIMES        (RSID_NSYMBOLS * 2)      // 30  
 #define RSID_ESCAPE        6  
+#define RSID_NONE2         0   // код-терминатор набора 2 (как RSID_NONE2 в fldigi)  
+  
+// Сколько окон поиска держать активным набор 2 после приёма ESCAPE.  
+// fldigi: 27 * RSID_SYMLEN отсчётов (10 gap + 15 символов + 2 на ошибки тайминга);  
+// при шаге окна RSID_FFT_SAMPLES (512) это ~27 окон. Берём с запасом.  
+#define RSID_SECONDARY_WINDOWS   30  
   
 // float вместо double — экономия ОЗУ на RP2040.  
 typedef float                       rs_fft_type;  
 typedef std::complex<rs_fft_type>   rs_cpx_type;  
   
 // ============================================================================  
-//  Таблица мод RSID (code -> имя). Полный primary-набор из refs/rsid_defs.cxx,  
-//  поле fldigi-mode отброшено — для МК достаточно кода и человекочитаемого тега.  
+//  Таблицы мод RSID (code -> имя).  
+//   rsid_ids_1 — основной (primary) набор из refs/rsid_defs.cxx.  
+//   rsid_ids_2 — расширенный (extended) набор, доступен после ESCAPE (код 6).  
+//     Здесь — только IFKP (1171); при необходимости дополняется по RSID_LIST2.  
 // ============================================================================  
 struct RSIDmap { unsigned short rs; const char* name; };  
   
@@ -85,6 +94,17 @@ static const RSIDmap rsid_ids_1[] = { RSID_LIST };
 static const int rsid_ids_size1 =  
     (int)(sizeof(rsid_ids_1) / sizeof(rsid_ids_1[0])) - 1;  // без NONE  
   
+// Расширенный набор. Терминатор должен иметь код RSID_NONE2 (0).  
+#define RSID_LIST2 \  
+    ELEM2_(1171, "IFKP")  \  
+    ELEM2_(0,    "NONE2")  
+  
+#define ELEM2_(code_, name_) { code_, name_ },  
+static const RSIDmap rsid_ids_2[] = { RSID_LIST2 };  
+#undef ELEM2_  
+static const int rsid_ids_size2 =  
+    (int)(sizeof(rsid_ids_2) / sizeof(rsid_ids_2[0])) - 1;  // без NONE2  
+  
 // ============================================================================  
 //  Reed-Solomon кодер (refs/rsid.cxx: Squares/indices/Encode).  
 // ============================================================================  
@@ -121,29 +141,31 @@ static void rsid_encode(int code, unsigned char* rsid /*RSID_NSYMBOLS*/) {
 }  
   
 // ============================================================================  
-//  Состояние детектора
+//  Состояние детектора  
 // ============================================================================  
-static bool           rsid_inited = false;   // вместо проверки (!rsfft)  
+static bool           rsid_inited = false;  
   
-static unsigned char  pCodes1[sizeof(rsid_ids_1) / sizeof(rsid_ids_1[0]) * RSID_NSYMBOLS];    
+static unsigned char  pCodes1[sizeof(rsid_ids_1) / sizeof(rsid_ids_1[0]) * RSID_NSYMBOLS];  
+static unsigned char  pCodes2[sizeof(rsid_ids_2) / sizeof(rsid_ids_2[0]) * RSID_NSYMBOLS];  
   
-static float          aInputSamples[RSID_BUFFER_SIZE];   // кольцо входа 11025 Гц    
-static int16_t        window_q15[RSID_FFT_N];            // окно Хэмминга в Q15  
-static int16_t        tw_re[RSID_FFT_HALF];              // твиддлы cos, Q15  
-static int16_t        tw_im[RSID_FFT_HALF];              // твиддлы sin, Q15  
-static int16_t        fft_i[RSID_FFT_N];                 // реальная часть (вход/выход FFT)  
-static int16_t        fft_q[RSID_FFT_N];                 // мнимая часть  
-static uint64_t       aFFTAmpl[RSID_FFT_SIZE];           // |X|^2 по бинам  
-static int16_t        fft_buckets[RSID_NTIMES][RSID_FFT_SIZE];  // ~60 КБ (int16)
+static float          aInputSamples[RSID_BUFFER_SIZE];  
+static int16_t        window_q15[RSID_FFT_N];  
+static int16_t        tw_re[RSID_FFT_HALF];  
+static int16_t        tw_im[RSID_FFT_HALF];  
+static int16_t        fft_i[RSID_FFT_N];  
+static int16_t        fft_q[RSID_FFT_N];  
+static uint64_t       aFFTAmpl[RSID_FFT_SIZE];  
+static int16_t        fft_buckets[RSID_NTIMES][RSID_FFT_SIZE];  
   
-// Снимок готового окна 2048 отсчётов: наполняется в rsid_rx_push() (звуковой  
-// тракт), обрабатывается в rsid_rx_service() (loop). Оба на Core 0.  
-static int16_t        rsid_proc[RSID_ARRAY_SIZE];     // +4 КБ (Q15 снимок окна)
+static int16_t        rsid_proc[RSID_ARRAY_SIZE];  
 static volatile bool  rsid_window_ready = false;  
   
-static int   inptr;
+static int   inptr;  
 static int   nBinLow, nBinHigh;  
 static int   hamming_resolution = RSID_HAMMING_RESOLUTION;  
+  
+// Счётчик окон, в течение которых после ESCAPE ищем во втором наборе.  
+static int   rsid_secondary_windows = 0;  
   
 static rsid_detect_cb_t s_cb = nullptr;  
   
@@ -154,14 +176,15 @@ static inline double rsid_hamming(double x) {
     return 0.54 - 0.46 * cos(2.0 * M_PI * x);  
 }  
   
-static void rsid_reset_state(void) {    
-    inptr = RSID_FFT_SIZE;    
-    memset(aInputSamples, 0, sizeof(aInputSamples));    
-    memset(aFFTAmpl,      0, sizeof(aFFTAmpl));    
-    memset(fft_buckets,   0, sizeof(fft_buckets));    
-    hamming_resolution = RSID_HAMMING_RESOLUTION;    
-}
-
+static void rsid_reset_state(void) {  
+    inptr = RSID_FFT_SIZE;  
+    memset(aInputSamples, 0, sizeof(aInputSamples));  
+    memset(aFFTAmpl,      0, sizeof(aFFTAmpl));  
+    memset(fft_buckets,   0, sizeof(fft_buckets));  
+    hamming_resolution = RSID_HAMMING_RESOLUTION;  
+    rsid_secondary_windows = 0;  
+}  
+  
 // In-place radix-2 DIT, деление на 2 на каждой стадии (значения в Q15).  
 static void fft_q15(void) {  
     uint16_t j = 0;  
@@ -196,16 +219,15 @@ static void fft_q15(void) {
             }  
         }  
     }  
-}
-
-
+}  
+  
 // ----------------------------------------------------------------------------  
 //  CalculateBuckets (refs/rsid.cxx, без изменений логики).  
 // ----------------------------------------------------------------------------  
-static void CalculateBuckets(const uint64_t* pSpectrum, int iBegin, int iEnd) {    
-    uint64_t Amp = 0, AmpMax = 0;    
-    int iBucketMax = iBegin - 2;    
-    int j;
+static void CalculateBuckets(const uint64_t* pSpectrum, int iBegin, int iEnd) {  
+    uint64_t Amp = 0, AmpMax = 0;  
+    int iBucketMax = iBegin - 2;  
+    int j;  
     for (int i = iBegin; i < iEnd; i += 2) {  
         if (iBucketMax == i - 2) {  
             AmpMax = pSpectrum[i];  
@@ -236,16 +258,19 @@ static inline int HammingDistance(int iBucket, const unsigned char* p2) {
     return dist;  
 }  
   
-static bool search_amp(int& bin_out, int& symbol_out) {  
+// Параметризованный поиск: по заданной таблице кодов pCodes и её ids/size.  
+static bool search_amp(int& bin_out, int& symbol_out,  
+                       const unsigned char* pCodes,  
+                       const RSIDmap* ids, int ids_size) {  
     int iDistanceMin = 1000;  
     int iBin = -1, iSymbol = -1;  
-    for (int i = 0; i < rsid_ids_size1; i++) {  
-        const unsigned char* pc = pCodes1 + i * RSID_NSYMBOLS;  
+    for (int i = 0; i < ids_size; i++) {  
+        const unsigned char* pc = pCodes + i * RSID_NSYMBOLS;  
         for (int j = nBinLow; j < nBinHigh - RSID_NTIMES; j++) {  
             int d = HammingDistance(j, pc);  
             if (d < iDistanceMin) {  
                 iDistanceMin = d;  
-                iSymbol = rsid_ids_1[i].rs;  
+                iSymbol = ids[i].rs;  
                 iBin = j;  
                 if (iDistanceMin == 0) break;  
             }  
@@ -260,14 +285,15 @@ static bool search_amp(int& bin_out, int& symbol_out) {
 }  
   
 // ----------------------------------------------------------------------------  
-//  apply: выдать (имя моды, частоту). Вместо GUI/init_modem — колбэк/Serial.  
+//  apply: выдать (имя моды, частоту) из заданной таблицы.  
 // ----------------------------------------------------------------------------  
-static void rsid_apply(int iBin, int iSymbol) {  
+static void rsid_apply(int iBin, int iSymbol,  
+                       const RSIDmap* ids, int ids_size) {  
     double rsidfreq = (iBin + RSID_NSYMBOLS - 0.5) * RSID_SAMPLE_RATE / 2048.0;  
   
     const char* name = nullptr;  
-    for (int n = 0; n < rsid_ids_size1; n++) {  
-        if (rsid_ids_1[n].rs == iSymbol) { name = rsid_ids_1[n].name; break; }  
+    for (int n = 0; n < ids_size; n++) {  
+        if (ids[n].rs == iSymbol) { name = ids[n].name; break; }  
     }  
     if (!name) return;   // неизвестный код  
   
@@ -280,58 +306,13 @@ static void rsid_apply(int iBin, int iSymbol) {
     else Serial.printf("# RSID mode=%s code=%d freq=%.1f\n",  
                        r.mode_name, r.mode_code, r.freq_hz);  
 }  
-
-// ----------------------------------------------------------------------------  
-//  powerDensity поверх текущего FFT (аналог wf->powerDensity в FLDigi rtty.cxx).  
-//  Суммирует |X|^2 по бинам в полосе [f0-bw/2 .. f0+bw/2]. df = 11025/2048.  
-// ----------------------------------------------------------------------------  
-#define RTTY_SHIFT_HZ   170.0  
-#define RTTY_BAUD_HZ    45.45  
-#define RTTY_SNR_RATIO  10.0      // порог spwr/npwr (как в searchUp/Down)  
-#define RTTY_SRCH_LO    300.0  
-#define RTTY_SRCH_HI    3500.0  
   
+// ----------------------------------------------------------------------------  
+//  Центр RTTY берётся из частоты RSID в момент декодирования.  
+// ----------------------------------------------------------------------------  
 static float         rtty_center_hz = 0.0f;  
 static volatile bool rtty_center_new = false;  
   
-static double rsid_power_density(double f0, double bw) {  
-    const double df = RSID_SAMPLE_RATE / 2048.0;   // ≈5.383 Гц/бин  
-    int b0 = (int)((f0 - bw * 0.5) / df);  
-    int b1 = (int)((f0 + bw * 0.5) / df);  
-    if (b0 < 0) b0 = 0;  
-    if (b1 >= RSID_FFT_SIZE) b1 = RSID_FFT_SIZE - 1;  
-    double s = 0.0;  
-    for (int b = b0; b <= b1; b++) s += (double)aFFTAmpl[b];  
-    return s;  
-}  
-  
-// searchUp/searchDown из rtty.cxx: ищем f, где в бинах mark и space мощность  
-// на >RTTY_SNR_RATIO выше, чем в соседней «шумовой» полосе на +shift.  
-static float rtty_center_applied = 0.0f;   // последний применённый центр  
-  
-static void rtty_search_center(void) {    
-    const double shift = RTTY_SHIFT_HZ;    
-    const double bw    = 2.0 * RTTY_BAUD_HZ;    
-    for (double f = RTTY_SRCH_LO; f <= RTTY_SRCH_HI; f += 5.0) {    
-        double spwrlo = rsid_power_density(f - shift * 0.5, bw);    
-        double spwrhi = rsid_power_density(f + shift * 0.5, bw);    
-        double npwr   = rsid_power_density(f + shift,       bw) + 1e-10;    
-        if ((spwrlo / npwr > RTTY_SNR_RATIO) &&    
-            (spwrhi / npwr > RTTY_SNR_RATIO)) {    
-            // Публикуем/печатаем ТОЛЬКО при существенном изменении центра,    
-            // иначе — молча игнорируем (убираем Serial-флуд каждое окно).    
-            if (rtty_center_applied == 0.0f ||    
-                fabsf((float)f - rtty_center_applied) > (RTTY_SHIFT_HZ * 0.5f)) {    
-                rtty_center_hz      = (float)f;    
-                rtty_center_new     = true;    
-                rtty_center_applied = (float)f;    
-                Serial.printf("# RTTY center=%.1f Hz\n", f);    
-            }    
-            break;    
-        }    
-    }    
-}
-
 // ----------------------------------------------------------------------------  
 //  search (refs/rsid.cxx): FFT окна 2048 -> bucket'ы -> поиск кода.  
 //  bReverse = false (USB, тон в положительной звуковой полосе).  
@@ -340,24 +321,20 @@ static void rsid_search(void) {
     nBinLow  = 3;  
     nBinHigh = RSID_FFT_SIZE - 32;  
   
-// Оконирование Q15: вход (int16) * окно (Q15) >> 15. Мнимая часть = 0.  
+    // Оконирование Q15: вход (int16) * окно (Q15) >> 15. Мнимая часть = 0.  
     for (int i = 0; i < RSID_FFT_N; i++) {  
-        int32_t xi = (int32_t)rsid_proc[i];          // rsid_proc теперь int16 (см. ниже)  
+        int32_t xi = (int32_t)rsid_proc[i];  
         fft_i[i] = (int16_t)(((int32_t)xi * window_q15[i]) >> 15);  
         fft_q[i] = 0;  
     }  
   
     fft_q15();  
   
-    // Мощность по бинам (только нижняя половина спектра используется).  
     for (int i = 0; i < RSID_FFT_SIZE; i++) {  
         const int32_t re = fft_i[i];  
         const int32_t im = fft_q[i];  
         aFFTAmpl[i] = (uint64_t)((int64_t)re * re + (int64_t)im * im);  
     }  
-  
-    // Центр RTTY больше НЕ ищем периодически по FFT — он берётся из частоты  
-    // RSID в момент декодирования (см. ниже), т.е. только когда звучит RSID.
   
     int bucket_low  = 3;  
     int bucket_high = RSID_FFT_SIZE - 32;  
@@ -369,79 +346,102 @@ static void rsid_search(void) {
     CalculateBuckets(aFFTAmpl, bucket_low,     bucket_high - RSID_NTIMES);  
     CalculateBuckets(aFFTAmpl, bucket_low + 1, bucket_high - RSID_NTIMES);  
   
-    int sym = -1, bin = -1;    
-    if (search_amp(bin, sym)) {    
-        if (sym != RSID_ESCAPE) {     // escape-набор 2 не реализован    
-            rsid_apply(bin, sym);    
+    int sym = -1, bin = -1;  
   
-            // Центр матч-фильтра RTTY берём ПРЯМО из частоты RSID — только  
-            // в момент декодирования бёрста. После этого не подстраиваем.  
-            rtty_center_hz  = (float)((bin + RSID_NSYMBOLS - 0.5)    
-                                      * RSID_SAMPLE_RATE / 2048.0);    
-            rtty_center_new = true;    
+    // ---- Набор 1 (primary), пока не активен приём набора 2 ----  
+    if (rsid_secondary_windows <= 0) {  
+        if (search_amp(bin, sym, pCodes1, rsid_ids_1, rsid_ids_size1)) {  
+            if (sym != RSID_ESCAPE) {  
+                rsid_apply(bin, sym, rsid_ids_1, rsid_ids_size1);  
   
-            rsid_reset_state();    
-        }    
-    }
+                // Центр матч-фильтра RTTY — прямо из частоты RSID.  
+                rtty_center_hz  = (float)((bin + RSID_NSYMBOLS - 0.5)  
+                                          * RSID_SAMPLE_RATE / 2048.0);  
+                rtty_center_new = true;  
+  
+                rsid_reset_state();  
+            } else {  
+                // ESCAPE: следующие окна ищем в расширенном наборе.  
+                rsid_secondary_windows = RSID_SECONDARY_WINDOWS;  
+            }  
+        }  
+        return;  
+    }  
+  
+    // ---- Набор 2 (extended), активен RSID_SECONDARY_WINDOWS окон ----  
+    rsid_secondary_windows--;  
+    if (search_amp(bin, sym, pCodes2, rsid_ids_2, rsid_ids_size2)) {  
+        if (sym != RSID_NONE2) {  
+            rsid_apply(bin, sym, rsid_ids_2, rsid_ids_size2);  
+  
+            // Частота известна и для расширенных мод; RTTY-центр  
+            // для не-RTTY мод не задаём (routing по моде в rx_decoders).  
+            rsid_reset_state();   // сбросит и rsid_secondary_windows  
+        }  
+    }  
+    if (rsid_secondary_windows <= 0) {  
+        // Таймаут истёк — возвращаемся к поиску набора 1.  
+        rsid_secondary_windows = 0;  
+    }  
 }  
   
 // ============================================================================  
 //  Публичный интерфейс (rx_rsid.h).  
 // ============================================================================  
-void rsid_rx_init(float fs_hz) {    
-    (void)fs_hz;   // вход фиксирован RSID_SAMPLE_RATE (ресемплинг в rx_audio.cpp)    
+void rsid_rx_init(float fs_hz) {  
+    (void)fs_hz;  
   
-    // Окно Хэмминга в Q15.  
-    for (int i = 0; i < RSID_FFT_N; i++)    
-        window_q15[i] = sat16((int32_t)(rsid_hamming(1.0 * i / RSID_FFT_N) * 32767.0 + 0.5));    
+    for (int i = 0; i < RSID_FFT_N; i++)  
+        window_q15[i] = sat16((int32_t)(rsid_hamming(1.0 * i / RSID_FFT_N) * 32767.0 + 0.5));  
   
-    // Твиддлы: e^{-j2πk/N} в Q15.  
     for (int k = 0; k < RSID_FFT_HALF; k++) {  
         const double a = -6.2831853071795864769 * (double)k / (double)RSID_FFT_N;  
         tw_re[k] = sat16((int32_t)(cos(a) * 32767.0));  
         tw_im[k] = sat16((int32_t)(sin(a) * 32767.0));  
     }  
   
-    memset(pCodes1, 0, sizeof(pCodes1));    
-    for (int i = 0; i < rsid_ids_size1; i++)    
-        rsid_encode(rsid_ids_1[i].rs, pCodes1 + i * RSID_NSYMBOLS);    
+    memset(pCodes1, 0, sizeof(pCodes1));  
+    for (int i = 0; i < rsid_ids_size1; i++)  
+        rsid_encode(rsid_ids_1[i].rs, pCodes1 + i * RSID_NSYMBOLS);  
   
-    rsid_reset_state();    
-    rsid_inited = true;    
-}
+    memset(pCodes2, 0, sizeof(pCodes2));  
+    for (int i = 0; i < rsid_ids_size2; i++)  
+        rsid_encode(rsid_ids_2[i].rs, pCodes2 + i * RSID_NSYMBOLS);  
+  
+    rsid_reset_state();  
+    rsid_inited = true;  
+}  
   
 void rsid_rx_set_callback(rsid_detect_cb_t cb) { s_cb = cb; }  
   
 void rsid_rx_reset(void) { rsid_reset_state(); }  
   
 void rsid_rx_push(int16_t sample) {  
-    if (!rsid_inited) return;                    // не инициализирован  
+    if (!rsid_inited) return;  
   
     aInputSamples[inptr++] = (float)sample;  
   
-    if (inptr >= RSID_ARRAY_SIZE) {    
-        if (!rsid_window_ready) {      
-            for (int n = 0; n < RSID_ARRAY_SIZE; n++)    
-                rsid_proc[n] = sat16((int32_t)aInputSamples[n]);    
-            rsid_window_ready = true;      
-        } else {    
-            rsid_dropped_windows++;   // service не успел — окно потеряно    
-        }    
-        memmove(&aInputSamples[0], &aInputSamples[RSID_FFT_SAMPLES],    
-                (RSID_BUFFER_SIZE - RSID_FFT_SAMPLES) * sizeof(float));    
-        inptr -= RSID_FFT_SAMPLES;    
-    }
+    if (inptr >= RSID_ARRAY_SIZE) {  
+        if (!rsid_window_ready) {  
+            for (int n = 0; n < RSID_ARRAY_SIZE; n++)  
+                rsid_proc[n] = sat16((int32_t)aInputSamples[n]);  
+            rsid_window_ready = true;  
+        } else {  
+            rsid_dropped_windows++;  
+        }  
+        memmove(&aInputSamples[0], &aInputSamples[RSID_FFT_SAMPLES],  
+                (RSID_BUFFER_SIZE - RSID_FFT_SAMPLES) * sizeof(float));  
+        inptr -= RSID_FFT_SAMPLES;  
+    }  
 }  
   
-// Выполняется в loop() ПОСЛЕ rx_audio_poll(): тяжёлый БПФ/поиск вне горячего  
-// пути заполнения USB-буфера. Обрабатывает максимум одно окно за вызов.  
 void rsid_rx_service(void) {  
-    if (!rsid_inited) return;
+    if (!rsid_inited) return;  
     if (!rsid_window_ready) return;  
     rsid_search();  
     rsid_window_ready = false;  
-}
-
+}  
+  
 bool rsid_get_rtty_center(float* f_hz) {  
     if (!rtty_center_new) return false;  
     rtty_center_new = false;  
