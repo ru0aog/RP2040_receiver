@@ -163,6 +163,12 @@ static rsid_state_t rsid_sm_state = RSID_STATE_IDLE;
 static uint16_t fft_len = 2;
 static uint16_t fft_base = 0;
 
+// Нарезанный поиск: аккумуляторы между квантами.  
+static int rsid_srch_i   = 0;      // индекс текущего кода в таблице  
+static int rsid_srch_min = 1000;   // текущий минимум расстояния Хэмминга  
+static int rsid_srch_bin = -1;  
+static int rsid_srch_sym = -1;
+
 // ============================================================================  
 //  Состояние детектора  
 // ============================================================================  
@@ -211,14 +217,16 @@ static void rsid_reset_detect(void) {
     memset(aFFTAmpl,    0, sizeof(aFFTAmpl));  
     memset(fft_buckets, 0, sizeof(fft_buckets));  
     hamming_resolution = RSID_HAMMING_RESOLUTION;  
-    rsid_secondary_windows = 0;  
+    rsid_secondary_windows = 0;
+    rsid_srch_i = 0;
 }  
   
 // Полный сброс (только с Core 0: init / retune) — сбрасывает и накопитель.  
 static void rsid_reset_state(void) {  
     inptr = RSID_FFT_SIZE;  
     memset(aInputSamples, 0, sizeof(aInputSamples));  
-    rsid_reset_detect();  
+    rsid_reset_detect();
+    rsid_srch_i = 0;
 }
   
 // In-place radix-2 DIT, деление на 2 на каждой стадии (значения в Q15).  
@@ -319,7 +327,23 @@ static bool search_amp(int& bin_out, int& symbol_out,
     }  
     return false;  
 }  
-  
+
+// Один шаг: полный перебор бинов для ОДНОГО кода pCodes[i].  
+// Результат копится в rsid_srch_min/bin/sym между вызовами.  
+static void search_amp_step(int i, const unsigned char* pCodes,  
+                            const RSIDmap* ids) {  
+    const unsigned char* pc = pCodes + i * RSID_NSYMBOLS;  
+    for (int j = nBinLow; j < nBinHigh - RSID_NTIMES; j++) {  
+        int d = HammingDistance(j, pc);  
+        if (d < rsid_srch_min) {  
+            rsid_srch_min = d;  
+            rsid_srch_sym = ids[i].rs;  
+            rsid_srch_bin = j;  
+            if (rsid_srch_min == 0) break;   // идеальное совпадение  
+        }  
+    }  
+}
+
 // ----------------------------------------------------------------------------  
 //  apply: выдать (имя моды, частоту) из заданной таблицы.  
 // ----------------------------------------------------------------------------  
@@ -618,37 +642,57 @@ void rsid_rx_service_sliced(void) {
             break;
         }
 
-        case RSID_STATE_SEARCH: {
-            int sym = -1, bin = -1;  
-          
-            if (rsid_secondary_windows <= 0) {  
-                if (search_amp(bin, sym, pCodes1, rsid_ids_1, rsid_ids_size1)) {  
-                    if (sym != RSID_ESCAPE) {  
-                        rsid_apply(bin, sym, rsid_ids_1, rsid_ids_size1);  
-                        rtty_center_hz = (float)((bin + RSID_NSYMBOLS - 0.5) * RSID_SAMPLE_RATE / 2048.0);  
-                        __dmb();  
-                        rtty_center_new = true;
-                        rsid_reset_detect(); 
-                    } else {  
-                        rsid_secondary_windows = RSID_SECONDARY_WINDOWS;  
-                    }  
+        case RSID_STATE_SEARCH: {  
+            // Выбор таблицы набора на всё время фазы поиска.  
+            const unsigned char* pCodes;  
+            const RSIDmap*       ids;  
+            int                  ids_size;  
+            const bool set2 = (rsid_secondary_windows > 0);  
+            if (!set2) { pCodes = pCodes1; ids = rsid_ids_1; ids_size = rsid_ids_size1; }  
+            else       { pCodes = pCodes2; ids = rsid_ids_2; ids_size = rsid_ids_size2; }  
+  
+            // Первый шаг фазы: инициализация аккумуляторов. Для набора 2  
+            // уменьшаем счётчик окон ровно один раз на окно (как в оригинале).  
+            if (rsid_srch_i == 0) {  
+                rsid_srch_min = 1000;  
+                rsid_srch_bin = -1;  
+                rsid_srch_sym = -1;  
+                if (set2) rsid_secondary_windows--;  
+            }  
+  
+            // Обсчитываем ОДИН код за квант.  
+            search_amp_step(rsid_srch_i, pCodes, ids);  
+            rsid_srch_i++;  
+  
+            // Ещё не все коды — остаёмся в SEARCH, следующий код на след. кванте.  
+            if (rsid_srch_i < ids_size) break;  
+  
+            // Все коды перебраны — применяем результат, как в монолите.  
+            rsid_srch_i = 0;  
+            const bool hit = (rsid_srch_min <= hamming_resolution);  
+  
+            if (!set2) {  
+                if (hit && rsid_srch_sym != RSID_ESCAPE) {  
+                    rsid_apply(rsid_srch_bin, rsid_srch_sym, rsid_ids_1, rsid_ids_size1);  
+                    rtty_center_hz = (float)((rsid_srch_bin + RSID_NSYMBOLS - 0.5)  
+                                             * RSID_SAMPLE_RATE / 2048.0);  
+                    __dmb();  
+                    rtty_center_new = true;  
+                    rsid_reset_detect();  
+                } else if (hit) {   // sym == RSID_ESCAPE  
+                    rsid_secondary_windows = RSID_SECONDARY_WINDOWS;  
                 }  
-            } else {
-                rsid_secondary_windows--;  
-                if (search_amp(bin, sym, pCodes2, rsid_ids_2, rsid_ids_size2)) {  
-                    if (sym != RSID_NONE2) {  
-                        rsid_apply(bin, sym, rsid_ids_2, rsid_ids_size2);  
-                        rsid_reset_detect();   
-                    }  
+            } else {  
+                if (hit && rsid_srch_sym != RSID_NONE2) {  
+                    rsid_apply(rsid_srch_bin, rsid_srch_sym, rsid_ids_2, rsid_ids_size2);  
+                    rsid_reset_detect();  
                 }  
-                if (rsid_secondary_windows <= 0) {  
-                    rsid_secondary_windows = 0;  
-                }  
-            }
-
+                if (rsid_secondary_windows <= 0) rsid_secondary_windows = 0;  
+            }  
+  
             rsid_window_ready = false;  
-            rsid_sm_state = RSID_STATE_IDLE; // Цикл обработки кадра завершен
-            break;
+            rsid_sm_state = RSID_STATE_IDLE; // Цикл обработки кадра завершён  
+            break;  
         }
     }
 }
