@@ -17,10 +17,11 @@
 // Коды мод из таблицы RSID (см. логи: RTTY-45=39, CW=26).  
 #define RSID_CODE_RTTY45   39  
 #define RSID_CODE_CW       26  
-#define RTTY_SHIFT_HZ      170.0f    
+#define RTTY_SHIFT_HZ      170.0f
+#define RSID_CODE_IFKP     1171 
+
 enum { DEC_NONE = 0, DEC_RTTY, DEC_CW, DEC_IFKP }; 
   
-enum { DEC_NONE = 0, DEC_RTTY, DEC_CW };  
 static int   active_dec = DEC_NONE;  
 static float dec_fs_hz  = 15625.0f;  
   

@@ -49,43 +49,43 @@ typedef std::complex<rs_fft_type>   rs_cpx_type;
 struct RSIDmap { unsigned short rs; const char* name; };  
   
 #define RSID_LIST \  
-    ELEM_(263, "EOT")            ELEM_(6,   "ESCAPE")        \  
-    ELEM_(1,   "BPSK31")         ELEM_(110, "QPSK31")        \  
-    ELEM_(2,   "BPSK63")         ELEM_(3,   "QPSK63")        \  
-    ELEM_(4,   "BPSK125")        ELEM_(5,   "QPSK125")       \  
-    ELEM_(126, "BPSK250")        ELEM_(127, "QPSK250")       \  
-    ELEM_(173, "BPSK500")                                    \  
-    ELEM_(183, "PSK125R")        ELEM_(186, "PSK250R")       \  
-    ELEM_(187, "PSK500R")                                    \  
-    ELEM_(9,  "MT63-500L")       ELEM_(10, "MT63-500S")      \  
-    ELEM_(12, "MT63-1000L")      ELEM_(13, "MT63-1000S")     \  
-    ELEM_(15, "MT63-2000L")      ELEM_(17, "MT63-2000S")     \  
-    ELEM_(22, "PSK63F")          ELEM_(26, "CW")             \  
-    ELEM_(37, "RTTY-ASCII7")     ELEM_(38, "RTTY-ASCII8")    \  
-    ELEM_(39, "RTTY-45")         ELEM_(40, "RTTY-50")        \  
-    ELEM_(41, "RTTY-75")                                     \  
-    ELEM_(43, "THROB1")          ELEM_(44, "THROB2")         \  
-    ELEM_(45, "THROB4")                                      \  
-    ELEM_(204,"CONT-4/125")      ELEM_(55, "CONT-4/250")     \  
-    ELEM_(54, "CONT-4/500")      ELEM_(169,"CONT-8/125")     \  
-    ELEM_(49, "CONT-8/250")      ELEM_(52, "CONT-8/500")     \  
-    ELEM_(50, "CONT-16/500")     ELEM_(53, "CONT-16/1000")   \  
-    ELEM_(51, "CONT-32/1000")                                \  
-    ELEM_(60, "MFSK8")           ELEM_(57, "MFSK16")         \  
-    ELEM_(147,"MFSK32")          ELEM_(148,"MFSK11")         \  
-    ELEM_(152,"MFSK22")                                      \  
-    ELEM_(203,"OLIVIA-4/125")    ELEM_(75, "OLIVIA-4/250")   \  
-    ELEM_(74, "OLIVIA-4/500")    ELEM_(163,"OLIVIA-8/125")   \  
-    ELEM_(69, "OLIVIA-8/250")    ELEM_(72, "OLIVIA-8/500")   \  
-    ELEM_(70, "OLIVIA-16/500")   ELEM_(73, "OLIVIA-16/1000") \  
-    ELEM_(84, "DOMEX4")          ELEM_(85, "DOMEX5")         \  
-    ELEM_(86, "DOMEX8")          ELEM_(87, "DOMEX11")        \  
-    ELEM_(88, "DOMEX16")         ELEM_(90, "DOMEX22")        \  
-    ELEM_(97, "DOMEX8-FEC")                                  \  
-    ELEM_(104,"FELD-HELL")       ELEM_(106,"HELL80")         \  
-    ELEM_(136,"THOR4")           ELEM_(137,"THOR8")          \  
-    ELEM_(138,"THOR16")          ELEM_(139,"THOR5")          \  
-    ELEM_(143,"THOR11")          ELEM_(145,"THOR22")         \  
+    ELEM_(263, "EOT")            ELEM_(6,   "ESCAPE")        \
+    ELEM_(1,   "BPSK31")         ELEM_(110, "QPSK31")        \
+    ELEM_(2,   "BPSK63")         ELEM_(3,   "QPSK63")        \
+    ELEM_(4,   "BPSK125")        ELEM_(5,   "QPSK125")       \
+    ELEM_(126, "BPSK250")        ELEM_(127, "QPSK250")       \
+    ELEM_(173, "BPSK500")                                    \
+    ELEM_(183, "PSK125R")        ELEM_(186, "PSK250R")       \
+    ELEM_(187, "PSK500R")                                    \
+    ELEM_(9,  "MT63-500L")       ELEM_(10, "MT63-500S")      \
+    ELEM_(12, "MT63-1000L")      ELEM_(13, "MT63-1000S")     \
+    ELEM_(15, "MT63-2000L")      ELEM_(17, "MT63-2000S")     \
+    ELEM_(22, "PSK63F")          ELEM_(26, "CW")             \
+    ELEM_(37, "RTTY-ASCII7")     ELEM_(38, "RTTY-ASCII8")    \
+    ELEM_(39, "RTTY-45")         ELEM_(40, "RTTY-50")        \
+    ELEM_(41, "RTTY-75")                                     \
+    ELEM_(43, "THROB1")          ELEM_(44, "THROB2")         \
+    ELEM_(45, "THROB4")                                      \
+    ELEM_(204,"CONT-4/125")      ELEM_(55, "CONT-4/250")     \
+    ELEM_(54, "CONT-4/500")      ELEM_(169,"CONT-8/125")     \
+    ELEM_(49, "CONT-8/250")      ELEM_(52, "CONT-8/500")     \
+    ELEM_(50, "CONT-16/500")     ELEM_(53, "CONT-16/1000")   \
+    ELEM_(51, "CONT-32/1000")                                \
+    ELEM_(60, "MFSK8")           ELEM_(57, "MFSK16")         \
+    ELEM_(147,"MFSK32")          ELEM_(148,"MFSK11")         \
+    ELEM_(152,"MFSK22")                                      \
+    ELEM_(203,"OLIVIA-4/125")    ELEM_(75, "OLIVIA-4/250")   \
+    ELEM_(74, "OLIVIA-4/500")    ELEM_(163,"OLIVIA-8/125")   \
+    ELEM_(69, "OLIVIA-8/250")    ELEM_(72, "OLIVIA-8/500")   \
+    ELEM_(70, "OLIVIA-16/500")   ELEM_(73, "OLIVIA-16/1000") \
+    ELEM_(84, "DOMEX4")          ELEM_(85, "DOMEX5")         \
+    ELEM_(86, "DOMEX8")          ELEM_(87, "DOMEX11")        \
+    ELEM_(88, "DOMEX16")         ELEM_(90, "DOMEX22")        \
+    ELEM_(97, "DOMEX8-FEC")                                  \
+    ELEM_(104,"FELD-HELL")       ELEM_(106,"HELL80")         \
+    ELEM_(136,"THOR4")           ELEM_(137,"THOR8")          \
+    ELEM_(138,"THOR16")          ELEM_(139,"THOR5")          \
+    ELEM_(143,"THOR11")          ELEM_(145,"THOR22")         \
     ELEM_(0,   "NONE")  
   
 #define ELEM_(code_, name_) { code_, name_ },  
@@ -167,8 +167,9 @@ static int   hamming_resolution = RSID_HAMMING_RESOLUTION;
 // Счётчик окон, в течение которых после ESCAPE ищем во втором наборе.  
 static int   rsid_secondary_windows = 0;  
   
-static rsid_detect_cb_t s_cb = nullptr;
-void rsid_rx_set_fft_sink(rsid_fft_sink_t sink) { s_fft_sink = sink; }  
+static rsid_detect_cb_t s_cb = nullptr;  
+static rsid_fft_sink_t  s_fft_sink = nullptr;  
+void rsid_rx_set_fft_sink(rsid_fft_sink_t sink) { s_fft_sink = sink; }
   
 // ============================================================================  
 //  Окно Хэмминга (refs/rsid.cxx -> filters.h hamming()).  
