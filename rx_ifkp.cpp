@@ -39,14 +39,15 @@ static void compute_bins(float bin_hz) {
 }  
   
 void rx_ifkp_init(float center_hz) {  
-    base_hz = center_hz - IFKP_OFFSET_HZ;    
+    base_hz = center_hz - IFKP_OFFSET_HZ;  
     memset(tpwr, 0, sizeof(tpwr));  
     peak = 0; prev_peak = -1; last_peak = -1; peak_counter = 0;  
-    prev_tone = -1; have_prev = false;
+    prev_tone = -1; have_prev = false;  
     base_delta = -1; have_base = false;  
+    gb_cfg_t cfg = { IFKP_NTONES, base_hz, IFKP_STEP_HZ, 11025.0f, 1024 };  
+    gb_init(&cfg);  
     active = true;  
-    compute_bins(cur_bin_hz);  
-}  
+}
   
 void rx_ifkp_stop(void) { active = false; }  
   
@@ -112,33 +113,26 @@ static void on_symbol_tone(int tone) {
     prev_tone = tone;  
     on_delta(d);  
 }  
-  
-void rx_ifkp_on_fft(const uint64_t* ampl, int nbins, float bin_hz) {  
+
+void rx_ifkp_push(int16_t sample) {  
     if (!active) return;  
-    if (fabsf(bin_hz - cur_bin_hz) > 1e-3f) compute_bins(bin_hz);  
+    static float pwr[IFKP_NTONES];  
+    if (!gb_push(sample, pwr)) return;         // ждём границу блока  
   
-    // 1) Энергия каждого тона в этом окне (бин ±1), сглаживаем между окнами.  
-    int   best = 0;  
-    float bp   = -1.0f;  
+    int best = 0; float bp = -1.0f;  
     for (int i = 0; i < IFKP_NTONES; i++) {  
-        int b = tone_bin[i];  
-        float e = 0.0f;  
-        if (b >= 0 && b < nbins)  
-            e = (float)ampl[b];   // только центр: тоны ~2.17 бина врозь, ±1 перекрывает соседей  
-        tpwr[i] += (e - tpwr[i]) * IFKP_SMOOTH_A;  
+        tpwr[i] += (pwr[i] - tpwr[i]) * IFKP_SMOOTH_A;   // сглаживание как было  
         if (tpwr[i] > bp) { bp = tpwr[i]; best = i; }  
-    }
-  
-    // 2) Детект символа по кромке (порт FLDigi process_tones()):  
-    //    пик стабилен peak_hits окон подряд и отличается от прошлого.  
+    }  
+    // детект символа по кромке (peak_counter/last_peak) — без изменений  
     peak = best;  
     if (peak == prev_peak) peak_counter++;  
     else                   peak_counter = 0;  
-  
     if (peak_counter >= IFKP_PEAK_HITS && peak != last_peak) {  
         on_symbol_tone(peak);  
         peak_counter = 0;  
         last_peak = peak;  
     }  
-    prev_peak = peak;
+    prev_peak = peak;  
 }
+

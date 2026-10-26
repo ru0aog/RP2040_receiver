@@ -5,5 +5,5 @@
 void rx_ifkp_init(float center_hz);  
 // Остановить (при переключении на другую моду).  
 void rx_ifkp_stop(void);  
-// Сток спектра из rx_rsid (каждое FFT-окно ~46 мс), сигнатура rsid_fft_sink_t.  
-void rx_ifkp_on_fft(const uint64_t* ampl, int nbins, float bin_hz);
+// Подать один отсчёт потока 15625 Гц. Внутри — банк Гёрцеля.  
+void rx_ifkp_push(int16_t sample);
