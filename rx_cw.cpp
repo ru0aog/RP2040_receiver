@@ -1,8 +1,12 @@
+// path: rx_cw.cpp  (ru0aog/RP2040_receiver)  
 // ============================================================================  
 // rx_cw.cpp — декодер CW (Морзе) по одному тону.  
 // Вход: отсчёты базовой полосы 15625 Гц из rx_cw_sample. Тон сносится в DC  
 // собственным гетеродином + однополюсный НЧ (как канал rx_mf). Огибающая  
-// копится за окно (~5 мс), затем AGC + гистерезис + дебаунс (порт из beacon).  
+// копится за окно (~5 мс). Детекция ключа — порт FLDigi cw.cxx:  
+//   sig_avg / noise_floor / agc_peak (быстрый attack, медленный decay),  
+//   нормализация value /= agc_peak, асимметричные пороги гистерезиса,  
+//   отсев шумовых всплесков, порог точки/тире two_dots от WPM + трекинг.  
 // Границы ключа дают точки/тире -> символы Морзе -> rx_decoders_emit().  
 // ============================================================================  
 #include <Arduino.h>  
@@ -10,16 +14,15 @@
 #include "rx_cw.h"  
 #include "rx_decoders.h"   // единая точка вывода  
   
-// ---- параметры ----    
-#define CW_LP_FC_HZ    80.0f     // полоса НЧ детектора тона    
-#define CW_WIN_MS      5.0f      // окно огибающей    
-#define CW_EMA_SHIFT   3         // EMA огибающей ~8 окон    
+// ---- параметры фронта ----  
+#define CW_LP_FC_HZ    80.0f     // полоса НЧ детектора тона  
+#define CW_WIN_MS      5.0f      // окно огибающей (мс)  
   
-// Стартовая длина точки (в окнах): 5 мс/окно, ~60 мс точка ≈ 20 WPM.    
-// Предзасев, чтобы первый элемент не задавал dot_win сам по себе.    
-#define CW_DEFAULT_DOT_WIN  12.0f    
-// Число окон прогрева AGC: быстрое схождение sig/noise в начале посылки.    
-#define CW_WARMUP_WINDOWS   16
+// ---- параметры тайминга (в окнах по CW_WIN_MS) ----  
+#define CW_DEFAULT_WPM     20.0f     // стартовая скорость; dot = 1200/WPM мс  
+// attack/decay AGC в окнах: быстрый подъём, медленный спад  
+#define CW_AGC_ATTACK      4.0f      // ~20 мс — агрессивно к пику/провалу  
+#define CW_AGC_DECAY       64.0f     // ~320 мс — медленный возврат  
   
 static float fs_hz = 15625.0f;  
   
@@ -30,17 +33,28 @@ static float osc_re, osc_im, rot_re, rot_im, lp_re, lp_im, lp_alpha;
 static int   win_div = 78, win_cnt = 0;  
 static float win_acc = 0.0f;  
   
-// огибающая/AGC (float-версия beacon)  
-static float p_ema = 0.0f, sig_avg = 0.0f, noise_avg = 0.0f;  
-static bool  tone_on = false;  
-static int   low_cnt = 0;
-static int   warmup  = 0;   // счётчик окон прогрева AGC
+// AGC (порт FLDigi decode_stream)  
+static float sig_avg, noise_floor, agc_peak;  
   
 // тайминг Морзе (в окнах)  
-static uint32_t win_idx = 0, on_start = 0, off_start = 0;  
-static float    dot_win = 0.0f;   // адаптивная длина точки (в окнах)  
-static uint8_t  code = 1;         // сборка: 1 = старт-бит, dot=0, dash=1  
-static bool     in_char = false;  
+static uint32_t win_idx;          // счётчик окон  
+static uint32_t tone_start;       // окно начала тона  
+static uint32_t key_up_at;        // окно последнего спада ключа  
+static float    dot_win;          // длина точки (окон), адаптивная  
+static float    two_dots;         // порог точка/тире (окон)  
+static float    spike_win;        // мин. длительность элемента (окон)  
+static int      last_elem;        // длительность предыдущего элемента (окон)  
+static uint8_t  code;             // сборка: 1 = старт-бит, dot=0, dash=1  
+static bool     space_sent;  
+  
+// состояние приёма (как cw_receive_state в FLDigi)  
+enum { RS_IDLE = 0, RS_IN_TONE, RS_AFTER_TONE };  
+static int rx_state;  
+  
+static inline float decayavg(float a, float in, float w) {  
+    if (w < 1.0f) w = 1.0f;  
+    return a + (in - a) / w;  
+}  
   
 // ---- таблица Морзе: индекс = собранный код (старт-бит слева) ----  
 static char morse_decode(uint8_t c) {  
@@ -57,7 +71,14 @@ static char morse_decode(uint8_t c) {
     case 0b111111: return '0'; case 0b101111: return '1'; case 0b100111: return '2';  
     case 0b100011: return '3'; case 0b100001: return '4'; case 0b100000: return '5';  
     case 0b110000: return '6'; case 0b111000: return '7'; case 0b111100: return '8';  
-    case 0b111110: return '9';  
+    case 0b111110: return '9';
+    // знаки препинания (как в FLDigi morse.cxx)  
+    case 0b110010:  return '/';  case 0b1110011: return ','; case 0b1001100: return '?';
+    case 0b110001:  return '=';  case 0b101010:  return '+'; case 0b1010101: return '.';
+    case 0b1100001: return '-';  case 0b1011010: return '@'; case 0b110110:  return '(';
+    case 0b1101101: return ')';  case 0b1111000: return ':'; case 0b1101010: return ';';
+    case 0b1001101: return '_';  case 0b1011110: return '\''; case 0b1010010: return '\\';
+    case 0b1101011: return '!';  case 0b10001001: return '$';
     default: return 0;  
     }  
 }  
@@ -68,7 +89,18 @@ static void emit_char(void) {
         if (ch) rx_decoders_emit(ch);  
     }  
     code = 1;  
-    in_char = false;  
+}  
+  
+// Подстройка two_dots по парам точка-тире / тире-точка (FLDigi update_tracking)  
+static void update_tracking(int d1, int d2) {  
+    if (d1 <= 0 || d2 <= 0) return;  
+    if (d1 > d2 && d1 > 4 * d2) return;  
+    if (d2 > d1 && d2 > 4 * d1) return;  
+    float avg = (float)(d1 + d2) * 0.5f;      // ≈ (dot+dash)/2 ≈ 2*dot  
+    two_dots = decayavg(two_dots, avg, 16.0f);  
+    dot_win  = two_dots * 0.5f;  
+    if (dot_win < 1.0f) dot_win = 1.0f;  
+    spike_win = dot_win * 0.5f;               // отсев всплесков < полуточки  
 }  
   
 void rx_cw_init(float fs, float tone_hz) {  
@@ -84,68 +116,86 @@ void rx_cw_init(float fs, float tone_hz) {
     if (win_div < 1) win_div = 1;  
     win_cnt = 0; win_acc = 0.0f;  
   
-    p_ema = sig_avg = noise_avg = 0.0f;    
-    tone_on = false; low_cnt = 0;    
-    win_idx = on_start = off_start = 0;    
-    dot_win = CW_DEFAULT_DOT_WIN;   // стартовая длина точки, адаптируется дальше    
-    code = 1; in_char = false;    
-    warmup = CW_WARMUP_WINDOWS;     // окна быстрого схода AGC
+    // AGC: agc_peak стартует с 1, чтобы деление было корректным сразу  
+    sig_avg = 0.0f; noise_floor = 0.0f; agc_peak = 1.0f;  
+  
+    // тайминг от стартовой WPM: dot(мс)=1200/WPM; в окнах = dot/CW_WIN_MS  
+    dot_win   = (1200.0f / CW_DEFAULT_WPM) / CW_WIN_MS;   // ≈ 12 окон @20WPM  
+    if (dot_win < 1.0f) dot_win = 1.0f;  
+    two_dots  = dot_win * 2.0f;  
+    spike_win = dot_win * 0.5f;  
+  
+    win_idx = 0; tone_start = 0; key_up_at = 0;  
+    last_elem = 0; code = 1; space_sent = true;  
+    rx_state = RS_IDLE;  
 }  
   
-static void process_window(float pe) {    
-    // Прогрев: пока AGC не набрала разброс, быстро тянем sig вверх к пикам,    
-    // а noise — вниз к провалам, чтобы пороги стали валидны за первые окна.    
-    if (warmup > 0) {    
-        warmup--;    
-        if (pe > sig_avg)   sig_avg   = pe;              // мгновенно к пику    
-        else                sig_avg  -= sig_avg * (1.0f/64.0f);    
-        if (pe < noise_avg || noise_avg == 0.0f) noise_avg = pe;  // мгновенно к провалу    
-        else                noise_avg += (pe - noise_avg) * (1.0f/16.0f);    
-    } else {    
-        // двухуровневая AGC + гистерезис (порт beacon)    
-        if (pe > noise_avg) noise_avg += (pe - noise_avg) * (1.0f/256.0f);    
-        else                noise_avg += (pe - noise_avg) * (1.0f/8.0f);    
-        if (tone_on && pe > sig_avg) sig_avg += (pe - sig_avg) * 0.5f;    
-        else                         sig_avg -= sig_avg * (1.0f/256.0f);    
-        if (!tone_on)                noise_avg += (pe - noise_avg) * (1.0f/16.0f);    
-    }    
+static void process_window(float value) {  
+    // --- AGC (FLDigi decode_stream) ---  
+    sig_avg = decayavg(sig_avg, value, CW_AGC_DECAY);  
   
-    float range = sig_avg - noise_avg; if (range < 1.0f) range = 1.0f;    
-    float thr_hi = noise_avg + range * 0.6f;    
-    float thr_lo = noise_avg + range * 0.4f; 
+    if (value < sig_avg) {  
+        noise_floor = decayavg(noise_floor, value,  
+                     (value < noise_floor) ? CW_AGC_ATTACK : CW_AGC_DECAY);  
+    }  
+    if (value > sig_avg) {  
+        agc_peak = decayavg(agc_peak, value,  
+                   (value > agc_peak) ? CW_AGC_ATTACK : CW_AGC_DECAY);  
+    }  
+    if (agc_peak < 1e-6f) agc_peak = 1e-6f;  
   
-    bool key;  
-    if      (pe > thr_hi) key = true;  
-    else if (pe < thr_lo) key = false;  
-    else                  key = tone_on;  
+    float norm_noise = noise_floor / agc_peak;  
+    float norm_sig   = sig_avg     / agc_peak;  
+    float v          = value       / agc_peak;  
   
-    bool key_deb;  
-    if (key) { low_cnt = 0; key_deb = true; }  
-    else { if (low_cnt < 3) { low_cnt++; key_deb = tone_on; } else key_deb = false; }  
+    float diff  = norm_sig - norm_noise;  
+    float upper = norm_sig   - 0.2f * diff;   // порог keydown  
+    float lower = norm_noise + 0.7f * diff;   // порог keyup (ближе к шуму)  
   
     win_idx++;  
   
-    if (key_deb != tone_on) {  
-        if (key_deb) {  
-            // старт тона: оценить длину предыдущей паузы  
-            uint32_t off = win_idx - off_start;  
-            if (in_char && dot_win > 0.0f) {  
-                if (off >= dot_win * 2.0f) emit_char();        // пауза >= 3 эл. -> конец буквы  
-                if (off >= dot_win * 5.0f) rx_decoders_emit(' ');  // пауза слова  
-            }  
-            on_start = win_idx;  
-        } else {  
-            // конец тона: длительность -> точка/тире  
-            uint32_t on = win_idx - on_start;  
-            if (dot_win <= 0.0f) dot_win = (float)on;           // инициализация  
-            bool dash = ((float)on > dot_win * 2.0f);  
-            // адаптация длины точки по короткому элементу  
-            if (!dash) dot_win += ((float)on - dot_win) * 0.2f;  
-            code = (uint8_t)((code << 1) | (dash ? 1 : 0));  
-            in_char = true;  
-            off_start = win_idx;  
+    // --- гистерезисный детектор ключа ---  
+    if (v > upper && rx_state != RS_IN_TONE) {  
+        // keydown  
+        if (rx_state == RS_IDLE) { code = 1; }  
+        tone_start = win_idx;  
+        rx_state   = RS_IN_TONE;  
+    } else if (v < lower && rx_state == RS_IN_TONE) {  
+        // keyup — измеряем длительность элемента  
+        int elem = (int)(win_idx - tone_start);  
+        key_up_at = win_idx;  
+  
+        if ((float)elem < spike_win) {        // шумовой всплеск — игнор  
+            rx_state = RS_IDLE;  
+            return;  
         }  
-        tone_on = key_deb;  
+        // трекинг скорости по паре элементов  
+        if (last_elem > 0) {  
+            if (elem > 2 * last_elem && elem < 4 * last_elem)  
+                update_tracking(last_elem, elem);  
+            if (last_elem > 2 * elem && last_elem < 4 * elem)  
+                update_tracking(elem, last_elem);  
+        }  
+        last_elem = elem;  
+  
+        bool dash = ((float)elem > two_dots);  
+        code = (uint8_t)((code << 1) | (dash ? 1 : 0));  
+        space_sent = false;  
+        rx_state = RS_AFTER_TONE;  
+    }  
+  
+    // --- тайминг пауз (char gap / word space) ---  
+    if (rx_state != RS_IN_TONE) {  
+        float gap = (float)(win_idx - key_up_at);  
+        if (rx_state == RS_AFTER_TONE && gap >= two_dots) {  
+            emit_char();                       // пауза >= 2*dot -> конец буквы  
+            rx_state  = RS_IDLE;  
+            last_elem = 0;  
+        }  
+        if (!space_sent && gap > two_dots * 2.0f) {  
+            rx_decoders_emit(' ');             // пауза > 4*dot -> слово  
+            space_sent = true;  
+        }  
     }  
 }  
   
@@ -162,11 +212,10 @@ void rx_cw_sample(int16_t x) {
     win_acc += lp_re * lp_re + lp_im * lp_im;  
   
     if (++win_cnt >= win_div) {  
-        float p = win_acc / (float)win_div;  
+        // огибающая = модуль (как abs(zp) в FLDigi), sqrtf раз в окно (~200/с)  
+        float mag = sqrtf(win_acc / (float)win_div);  
         win_cnt = 0; win_acc = 0.0f;  
-        // EMA огибающей ~8 окон  
-        p_ema += (p - p_ema) * (1.0f / (1 << CW_EMA_SHIFT));  
-        process_window(p_ema);  
+        process_window(mag);  
         // ренорм фазора  
         float m = osc_re*osc_re + osc_im*osc_im;  
         float g = 1.5f - 0.5f * m;  
