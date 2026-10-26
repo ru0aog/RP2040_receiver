@@ -77,7 +77,50 @@ bool rsid_get_rtty_center(float* f_hz);
 //   ampl[nbins] — мощности бинов, bin_hz = RSID_SAMPLE_RATE/2048 ≈ 5.383 Гц.  
 typedef void (*rsid_fft_sink_t)(const uint64_t* ampl, int nbins, float bin_hz);  
 void rsid_rx_set_fft_sink(rsid_fft_sink_t sink);
+
+
+
+
+#pragma once  
+#include <stdint.h>  
   
+#ifndef RSID_RX_FS_HZ  
+#define RSID_RX_FS_HZ   11025.0f  
+#endif  
+  
+#ifndef RSID_HAMMING_RESOLUTION  
+#define RSID_HAMMING_RESOLUTION   1  
+#endif  
+  
+#ifdef __cplusplus  
+extern "C" {  
+#endif  
+  
+typedef struct {  
+    int         mode_code;   
+    const char* mode_name;   
+    float       freq_hz;     
+} rsid_result_t;  
+  
+typedef void (*rsid_detect_cb_t)(const rsid_result_t* r);  
+  
+void rsid_rx_init(float fs_hz);  
+void rsid_rx_push(int16_t sample);  
+void rsid_rx_service(void);
+
+// Высокопроизводительный пошаговый (квантованный) обработчик для Core 1
+void rsid_rx_service_sliced(void);
+
+void rsid_rx_dispatch(void);
+void rsid_rx_set_callback(rsid_detect_cb_t cb);  
+void rsid_rx_reset(void);  
+bool rsid_get_rtty_center(float* f_hz);
+
+typedef void (*rsid_fft_sink_t)(const uint64_t* ampl, int nbins, float bin_hz);  
+void rsid_rx_set_fft_sink(rsid_fft_sink_t sink);  
+  
+
+
 #ifdef __cplusplus  
 }  
 #endif

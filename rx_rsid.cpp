@@ -139,7 +139,31 @@ static void rsid_encode(int code, unsigned char* rsid /*RSID_NSYMBOLS*/) {
         rsid[0] = Squares[(rsid[0] << 4) + indices[i]];  
     }  
 }  
-  
+
+// --- Межъядерный шлюз для сэмплов 11025 Гц ---
+#define RSID_SAMPLE_Q_SIZE 1024u
+static int16_t rsid_sample_queue[RSID_SAMPLE_Q_SIZE];
+static volatile uint32_t rsid_sq_head = 0; // Пишет Core 0
+static volatile uint32_t rsid_sq_tail = 0; // Читает Core 1
+
+// --- Переменные асинхронной стейт-машины RSID ---
+enum rsid_state_t {
+    RSID_STATE_IDLE = 0,
+    RSID_STATE_WINDOWING,
+    RSID_STATE_FFT_BITREVERSE,
+    RSID_STATE_FFT_STAGE,
+    RSID_STATE_CALC_AMPL,
+    RSID_STATE_SINK_AND_BUCKETS,
+    RSID_STATE_SEARCH
+};
+
+static rsid_state_t rsid_sm_state = RSID_STATE_IDLE;
+
+// Переменные итераторов для сохранения контекста между вызовами
+static uint16_t fft_len = 2;
+static uint16_t fft_base = 0;
+
+
 // ============================================================================  
 //  Состояние детектора  
 // ============================================================================  
@@ -434,20 +458,21 @@ void rsid_rx_set_callback(rsid_detect_cb_t cb) { s_cb = cb; }
   
 void rsid_rx_reset(void) { rsid_reset_state(); }  
   
-void rsid_rx_push(int16_t sample) {  
-    if (!rsid_inited) return;  
-  
-    aInputSamples[inptr++] = (int16_t)sample;  
-    if (inptr >= RSID_ARRAY_SIZE) {  
-        if (!rsid_window_ready) {  
-            memcpy(rsid_proc, aInputSamples, RSID_ARRAY_SIZE * sizeof(int16_t));  
-            rsid_window_ready = true;  
-        } else { rsid_dropped_windows++; }  
-        memmove(&aInputSamples[0], &aInputSamples[RSID_FFT_SAMPLES],  
-                (RSID_BUFFER_SIZE - RSID_FFT_SAMPLES) * sizeof(int16_t));  
-        inptr -= RSID_FFT_SAMPLES;  
+void rsid_rx_push(int16_t sample) {
+    if (!rsid_inited) return;
+
+    uint32_t head = rsid_sq_head;
+    uint32_t next = (head + 1u) % RSID_SAMPLE_Q_SIZE;
+
+    if (next != rsid_sq_tail) {
+        rsid_sample_queue[head] = sample;
+        __dmb(); // Гарантируем запись сэмпла до сдвига head
+        rsid_sq_head = next;
+    } else {
+        // Очередь переполнена (Core 1 слишком долго считал БПФ)
+        rsid_dropped_windows++; 
     }
-}  
+}
 
 // Вызывается из loop() (Core 0): забирает результат детекта, сделанного на Core 1,  
 // и выполняет Serial-печать + смену моды в безопасном (не real-time) контексте.  
@@ -462,12 +487,39 @@ void rsid_rx_dispatch(void) {
                        rsid_det_result.freq_hz);  
 }
 
-void rsid_rx_service(void) {  
-    if (!rsid_inited) return;  
-    if (!rsid_window_ready) return;  
-    rsid_search();  
-    rsid_window_ready = false;  
-}  
+void rsid_rx_service(void) {
+    if (!rsid_inited) return;
+
+    // 1. Выгребаем сэмплы из межъядерной очереди во внутренний буфер БПФ
+    while (rsid_sq_tail != rsid_sq_head) {
+        uint32_t tail = rsid_sq_tail;
+        int16_t sample = rsid_sample_queue[tail];
+        
+        rsid_sq_tail = (tail + 1u) % RSID_SAMPLE_Q_SIZE;
+        __dmb();
+
+        // Старая логика накопления окна, но теперь она безопасно выполняется на Core 1
+        aInputSamples[inptr++] = sample;
+        if (inptr >= RSID_ARRAY_SIZE) {
+            if (!rsid_window_ready) {
+                memcpy(rsid_proc, aInputSamples, RSID_ARRAY_SIZE * sizeof(int16_t));
+                rsid_window_ready = true;
+            } else { 
+                rsid_dropped_windows++; 
+            }
+            memmove(&aInputSamples[0], &aInputSamples[RSID_FFT_SAMPLES],  
+                    (RSID_BUFFER_SIZE - RSID_FFT_SAMPLES) * sizeof(int16_t));  
+            inptr -= RSID_FFT_SAMPLES;  
+        }
+    }
+
+    // 2. Если окно накопилось — запускаем тяжёлый БПФ
+    if (rsid_window_ready) {  
+        rsid_search();  
+        rsid_window_ready = false;  
+    }  
+}
+
   
 bool rsid_get_rtty_center(float* f_hz) {  
     if (!rtty_center_new) return false;  
@@ -475,3 +527,163 @@ bool rsid_get_rtty_center(float* f_hz) {
     if (f_hz) *f_hz = rtty_center_hz;  
     return true;  
 }
+
+
+void rsid_rx_service_sliced(void) {
+    if (!rsid_inited) return;
+
+    // --- ФАЗА 0: Попутный сбор сэмплов из Lock-Free шлюза (всегда на полной скорости) ---
+    while (rsid_sq_tail != rsid_sq_head) {
+        uint32_t tail = rsid_sq_tail;
+        int16_t sample = rsid_sample_queue[tail];
+        
+        rsid_sq_tail = (tail + 1u) % RSID_SAMPLE_Q_SIZE;
+        __dmb();
+
+        aInputSamples[inptr++] = sample;
+        if (inptr >= RSID_ARRAY_SIZE) {
+            if (rsid_sm_state == RSID_STATE_IDLE && !rsid_window_ready) {
+                memcpy(rsid_proc, aInputSamples, RSID_ARRAY_SIZE * sizeof(int16_t));
+                rsid_window_ready = true;
+            } else {
+                rsid_dropped_windows++; // Процессор не успел обсчитать прошлое окно
+            }
+            memmove(&aInputSamples[0], &aInputSamples[RSID_FFT_SAMPLES],  
+                    (RSID_BUFFER_SIZE - RSID_FFT_SAMPLES) * sizeof(int16_t));  
+            inptr -= RSID_FFT_SAMPLES;  
+        }
+    }
+
+    // --- ФАЗА 1: Выполнение ровно одного вычислительного кванта стейт-машины ---
+    switch (rsid_sm_state) {
+        
+        case RSID_STATE_IDLE:
+            if (rsid_window_ready) {
+                rsid_sm_state = RSID_STATE_WINDOWING;
+            }
+            break;
+
+        case RSID_STATE_WINDOWING:
+            nBinLow  = 3;  
+            nBinHigh = RSID_FFT_SIZE - 32;  
+            for (int i = 0; i < RSID_FFT_N; i++) {  
+                int32_t xi = (int32_t)rsid_proc[i];  
+                fft_i[i] = (int16_t)(((int32_t)xi * window_q15[i]) >> 15);  
+                fft_q[i] = 0;  
+            }
+            rsid_sm_state = RSID_STATE_FFT_BITREVERSE;
+            break;
+
+        case RSID_STATE_FFT_BITREVERSE: {
+            uint16_t j = 0;  
+            for (uint16_t i = 1; i < RSID_FFT_N; ++i) {  
+                uint16_t bit = RSID_FFT_HALF;  
+                while (j & bit) { j ^= bit; bit >>= 1; }  
+                j ^= bit;  
+                if (i < j) {  
+                    int16_t t;  
+                    t = fft_i[i]; fft_i[i] = fft_i[j]; fft_i[j] = t;  
+                    t = fft_q[i]; fft_q[i] = fft_q[j]; fft_q[j] = t;  
+                }  
+            }
+            fft_len = 2; // Инициализируем итераторы для стадий БПФ
+            fft_base = 0;
+            rsid_sm_state = RSID_STATE_FFT_STAGE;
+            break;
+        }
+
+        case RSID_STATE_FFT_STAGE: {
+            // Считаем только ОДНУ базовую группу бабочек за один вызов функции
+            const uint16_t half = fft_len >> 1;  
+            const uint16_t tw_step = RSID_FFT_N / fft_len;  
+            
+            for (uint16_t j2 = 0; j2 < half; ++j2) {  
+                const uint16_t tw = j2 * tw_step;  
+                const int32_t wr = tw_re[tw];  
+                const int32_t wi = tw_im[tw];  
+                const uint16_t a = fft_base + j2;  
+                const uint16_t b = a + half;  
+                const int32_t br = fft_i[b], bi = fft_q[b];  
+                const int32_t tr = (br * wr - bi * wi) >> 15;  
+                const int32_t ti = (br * wi + bi * wr) >> 15;  
+                const int32_t ar = fft_i[a], ai = fft_q[a];  
+                fft_i[a] = sat16((ar + tr) >> 1);  
+                fft_q[a] = sat16((ai + ti) >> 1);  
+                fft_i[b] = sat16((ar - tr) >> 1);  
+                fft_q[b] = sat16((ai - ti) >> 1);  
+            }  
+
+            fft_base += fft_len;
+            if (fft_base >= RSID_FFT_N) {
+                fft_base = 0;
+                fft_len <<= 1;
+                if (fft_len > RSID_FFT_N) {
+                    rsid_sm_state = RSID_STATE_CALC_AMPL;
+                }
+            }
+            break;
+        }
+
+        case RSID_STATE_CALC_AMPL:
+            for (int i = 0; i < RSID_FFT_SIZE; i++) {  
+                const int32_t re = fft_i[i];  
+                const int32_t im = fft_q[i];  
+                aFFTAmpl[i] = (uint64_t)((int64_t)re * re + (int64_t)im * im);  
+            }
+            rsid_sm_state = RSID_STATE_SINK_AND_BUCKETS;
+            break;
+
+        case RSID_STATE_SINK_AND_BUCKETS: {
+            if (s_fft_sink) {
+                s_fft_sink(aFFTAmpl, RSID_FFT_SIZE, (float)(RSID_SAMPLE_RATE / 2048.0));
+            }
+
+            int bucket_low  = 3;  
+            int bucket_high = RSID_FFT_SIZE - 32;  
+          
+            memmove(fft_buckets, &(fft_buckets[1][0]),  
+                    (RSID_NTIMES - 1) * RSID_FFT_SIZE * sizeof(fft_buckets[0][0]));  
+            memset(&(fft_buckets[RSID_NTIMES - 1][0]), 0, RSID_FFT_SIZE * sizeof(fft_buckets[0][0]));  
+          
+            CalculateBuckets(aFFTAmpl, bucket_low,     bucket_high - RSID_NTIMES);  
+            CalculateBuckets(aFFTAmpl, bucket_low + 1, bucket_high - RSID_NTIMES);  
+            
+            rsid_sm_state = RSID_STATE_SEARCH;
+            break;
+        }
+
+        case RSID_STATE_SEARCH: {
+            int sym = -1, bin = -1;  
+          
+            if (rsid_secondary_windows <= 0) {  
+                if (search_amp(bin, sym, pCodes1, rsid_ids_1, rsid_ids_size1)) {  
+                    if (sym != RSID_ESCAPE) {  
+                        rsid_apply(bin, sym, rsid_ids_1, rsid_ids_size1);  
+                        rtty_center_hz = (float)((bin + RSID_NSYMBOLS - 0.5) * RSID_SAMPLE_RATE / 2048.0);  
+                        __dmb();  
+                        rtty_center_new = true;
+                        rsid_reset_detect(); 
+                    } else {  
+                        rsid_secondary_windows = RSID_SECONDARY_WINDOWS;  
+                    }  
+                }  
+            } else {
+                rsid_secondary_windows--;  
+                if (search_amp(bin, sym, pCodes2, rsid_ids_2, rsid_ids_size2)) {  
+                    if (sym != RSID_NONE2) {  
+                        rsid_apply(bin, sym, rsid_ids_2, rsid_ids_size2);  
+                        rsid_reset_detect();   
+                    }  
+                }  
+                if (rsid_secondary_windows <= 0) {  
+                    rsid_secondary_windows = 0;  
+                }  
+            }
+
+            rsid_window_ready = false;  
+            rsid_sm_state = RSID_STATE_IDLE; // Цикл обработки кадра завершен
+            break;
+        }
+    }
+}
+
