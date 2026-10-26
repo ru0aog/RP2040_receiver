@@ -33,7 +33,7 @@ void rx_decoders_emit(char c) { if (s_out) s_out(c); }
 void rx_decoders_sample(int16_t m) {  
     switch (active_dec) {  
     case DEC_RTTY: rx_mf_sample(m, 0); break;  
-    case DEC_CW:   /* rx_cw_sample(m); — когда появится модуль rx_cw */ break;  
+    case DEC_CW:   rx_cw_sample(m); break;  
     default:       break;   // DEC_NONE — пока метки нет, не декодируем  
     }  
 }
