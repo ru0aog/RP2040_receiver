@@ -9,7 +9,8 @@
   
 #include <Arduino.h>  
 #include <math.h>  
-#include "rx_rtty.h"  
+#include "rx_rtty.h"
+#include "rx_decoders.h"
   
 // ---------------- параметры RTTY ----------------  
 #define RTTY_BAUD       45.45f  
@@ -64,11 +65,11 @@ static void rtty_emit(uint8_t c) {
     c &= 0x1F;  
     if (c == RTTY_LTRS) { figs_mode = false; return; }  
     if (c == RTTY_FIGS) { figs_mode = true;  return; }  
-    char out = figs_mode ? figures[c] : letters[c];  
-    if (out) {  
-        Serial.print(out);  
-        dbg_emits++;  
-    }  
+    char out = figs_mode ? figures[c] : letters[c];    
+    if (out) {    
+        rx_decoders_emit(out);   // единая точка вывода  
+        dbg_emits++;    
+    }
 }  
   
 // ---------------- инициализация ----------------  

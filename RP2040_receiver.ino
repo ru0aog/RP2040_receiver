@@ -14,6 +14,7 @@
 #include "rx_mf.h"    
 #include "rx_rtty.h"
 #include "rx_rsid.h"
+#include "rx_decoders.h" 
 #include "fldigi_cat.h"    
 #include <Adafruit_TinyUSB.h> 
   
@@ -111,7 +112,10 @@ void setup()
     // RSID-декодер: строит таблицы мод и создаёт FFT-движок (g_fft 2048).  
     // Без этого вызова rsfft остаётся nullptr и rsid_rx_push() молчит.  
     rsid_rx_init(RSID_RX_FS_HZ);  
-    
+
+    // Маршрутизатор декодеров: единая точка вывода + смена моды по RSID.  
+    rx_decoders_init(rx_dsp_fs_out());  
+
     // Второй USB-CDC для CAT (FLDigi, Kenwood TS-2000).      
     fldigi_cat_init();    
 }
@@ -137,15 +141,10 @@ void loop() {
   
     rx_audio_poll();  
   
-    // Отложенная обработка RSID: тяжёлый БПФ/поиск вне наполнения USB-аудио.  
-    rsid_rx_service();  
-
-    // Авто-подстройка матч-фильтра RTTY по центру из FFT-обзора.  
-    float rtty_c;  
-    if (rsid_get_rtty_center(&rtty_c)) {  
-        rx_mf_init(rx_dsp_fs_out(), rtty_c, 170.0f);  
-        Serial.printf("# RTTY MF retuned to %.1f Hz\n", rtty_c);  
-    }
+    // Отложенная обработка RSID: тяжёлый БПФ/поиск вне наполнения USB-аудио.    
+    // Внутри при обнаружении метки сработает rx_decoders_on_rsid():    
+    // печать метки + смена моды + перенастройка фильтров активного декодера.    
+    rsid_rx_service();
 
     // CAT опрашиваем не каждую итерацию, а раз в ~15 мс: обращения к
     // TinyUSB-CDC (dtr()/available()) в fldigi_cat_poll() дорогие,  
