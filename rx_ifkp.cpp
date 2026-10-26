@@ -11,16 +11,20 @@
 #define IFKP_NTONES        33  
 #define IFKP_STEP_HZ       11.697f  
 #define IFKP_OFFSET_HZ     (16.0f * IFKP_STEP_HZ)   // 187.15: центр на 16-м тоне  
-#define IFKP_SYM_MS        500.0f  
-#define IFKP_WIN_MS        46.4f                    // 512/11025 c  
-#define IFKP_WINS_PER_SYM  (IFKP_SYM_MS / IFKP_WIN_MS)   // ~10.78  
+// Детект символа «по кромке» как в FLDigi process_tones(): пик должен  
+// продержаться IFKP_PEAK_HITS окон подряд и отличаться от прошлого.  
+// Окно ~46 мс (512/11025), символ ~500 мс => порог < половины символа.  
+#define IFKP_PEAK_HITS     4  
+// Сглаживание энергии тона между окнами (аналог binfilt Cmovavg в FLDigi).  
+#define IFKP_SMOOTH_A      0.5f
   
 static bool   active = false;  
 static float  base_hz = 0.0f, cur_bin_hz = 5.383f;  
 static int    tone_bin[IFKP_NTONES];  
   
-static float  acc[IFKP_NTONES];  
-static float  wins_acc = 0.0f;  
+static float  tpwr[IFKP_NTONES];     // сглаженная энергия каждого тона  
+static int    peak = 0, prev_peak = -1, last_peak = -1;  
+static int    peak_counter = 0; 
   
 static int    prev_tone = -1;  static bool have_prev = false;  
 static int    base_delta = -1; static bool have_base = false;  
@@ -35,10 +39,10 @@ static void compute_bins(float bin_hz) {
 }  
   
 void rx_ifkp_init(float center_hz) {  
-    base_hz = center_hz - IFKP_OFFSET_HZ;  
-    memset(acc, 0, sizeof(acc));  
-    wins_acc = 0.0f;  
-    prev_tone = -1; have_prev = false;  
+    base_hz = center_hz - IFKP_OFFSET_HZ;    
+    memset(tpwr, 0, sizeof(tpwr));  
+    peak = 0; prev_peak = -1; last_peak = -1; peak_counter = 0;  
+    prev_tone = -1; have_prev = false;
     base_delta = -1; have_base = false;  
     active = true;  
     compute_bins(cur_bin_hz);  
@@ -113,18 +117,28 @@ void rx_ifkp_on_fft(const uint64_t* ampl, int nbins, float bin_hz) {
     if (!active) return;  
     if (fabsf(bin_hz - cur_bin_hz) > 1e-3f) compute_bins(bin_hz);  
   
-    for (int i = 0; i < IFKP_NTONES; i++) {    // мощность тона = бин ±1  
+    // 1) Энергия каждого тона в этом окне (бин ±1), сглаживаем между окнами.  
+    int   best = 0;  
+    float bp   = -1.0f;  
+    for (int i = 0; i < IFKP_NTONES; i++) {  
         int b = tone_bin[i];  
-        if (b < 1 || b >= nbins - 1) continue;  
-        acc[i] += (float)(ampl[b-1] + ampl[b] + ampl[b+1]);  
+        float e = 0.0f;  
+        if (b >= 1 && b < nbins - 1)  
+            e = (float)(ampl[b-1] + ampl[b] + ampl[b+1]);  
+        tpwr[i] += (e - tpwr[i]) * IFKP_SMOOTH_A;   // EMA ~ binfilt FLDigi  
+        if (tpwr[i] > bp) { bp = tpwr[i]; best = i; }  
     }  
-    wins_acc += 1.0f;  
-    if (wins_acc >= IFKP_WINS_PER_SYM) {       // граница символа  
-        wins_acc -= IFKP_WINS_PER_SYM;  
-        int best = -1; float bp = -1.0f;  
-        for (int i = 0; i < IFKP_NTONES; i++)  
-            if (acc[i] > bp) { bp = acc[i]; best = i; }  
-        memset(acc, 0, sizeof(acc));  
-        if (best >= 0) on_symbol_tone(best);  
+  
+    // 2) Детект символа по кромке (порт FLDigi process_tones()):  
+    //    пик стабилен peak_hits окон подряд и отличается от прошлого.  
+    peak = best;  
+    if (peak == prev_peak) peak_counter++;  
+    else                   peak_counter = 0;  
+  
+    if (peak_counter >= IFKP_PEAK_HITS && peak != last_peak) {  
+        on_symbol_tone(peak);  
+        peak_counter = 0;  
+        last_peak = peak;  
     }  
+    prev_peak = peak;
 }
