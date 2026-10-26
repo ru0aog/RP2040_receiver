@@ -15,7 +15,8 @@
   
 #include <Arduino.h>  
 #include "vfo_hardware.h"  
-#include "pico/multicore.h"  
+#include "pico/multicore.h"
+#include "rx_rsid.h"
   
 // ---- Параметры тракта ----  
 #define RX_FS_IN_HZ           (RX_ADC_SAMPLE_RATE_HZ / 2.0f)  
@@ -553,11 +554,14 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
         total_us_acc += (t_now - t_prev);  
         t_prev = t_now;  
         // проверяем очередь АЦП (функция в rx_capture.cpp)
-        const volatile uint32_t* blk = rx_capture_get_block();
-        // если данных ещё нет - на следующую итерацию
-        if (!blk) {
-            tight_loop_contents();  // подсказка компилятору для цикла ожидания; в этой итерации новых данных нет
-            continue;
+        const volatile uint32_t* blk = rx_capture_get_block();  
+        // если данных ещё нет — используем простой Core 1 под тяжёлый БПФ+поиск RSID.  
+        if (!blk) {  
+            // Поиск атомарный; результат уедет на Core 0 через почтовый ящик  
+            // (rsid_rx_dispatch). Запускаем ТОЛЬКО когда нет новых ADC-данных.  
+            rsid_rx_service();  
+            tight_loop_contents();  
+            continue;  
         }
         // Начало полезной работы: засекаем время обработки блока.  
         const uint32_t t_busy_start = time_us_32();

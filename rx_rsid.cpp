@@ -48,7 +48,7 @@ typedef std::complex<rs_fft_type>   rs_cpx_type;
 // ============================================================================  
 struct RSIDmap { unsigned short rs; const char* name; };  
   
-#define RSID_LIST \  
+#define RSID_LIST \
     ELEM_(263, "EOT")            ELEM_(6,   "ESCAPE")        \
     ELEM_(1,   "BPSK31")         ELEM_(110, "QPSK31")        \
     ELEM_(2,   "BPSK63")         ELEM_(3,   "QPSK63")        \
@@ -95,8 +95,8 @@ static const int rsid_ids_size1 =
     (int)(sizeof(rsid_ids_1) / sizeof(rsid_ids_1[0])) - 1;  // без NONE  
   
 // Расширенный набор. Терминатор должен иметь код RSID_NONE2 (0).  
-#define RSID_LIST2 \  
-    ELEM2_(1171, "IFKP")  \  
+#define RSID_LIST2 \
+    ELEM2_(1171, "IFKP")  \
     ELEM2_(0,    "NONE2")  
   
 #define ELEM2_(code_, name_) { code_, name_ },  
@@ -170,7 +170,11 @@ static int   rsid_secondary_windows = 0;
 static rsid_detect_cb_t s_cb = nullptr;  
 static rsid_fft_sink_t  s_fft_sink = nullptr;  
 void rsid_rx_set_fft_sink(rsid_fft_sink_t sink) { s_fft_sink = sink; }
-  
+
+// --- Почтовый ящик детекта: пишется на Core 1 (rsid_search), читается на Core 0.  
+static volatile bool rsid_det_pending = false;  
+static rsid_result_t rsid_det_result;
+
 // ============================================================================  
 //  Окно Хэмминга (refs/rsid.cxx -> filters.h hamming()).  
 // ============================================================================  
@@ -178,14 +182,21 @@ static inline double rsid_hamming(double x) {
     return 0.54 - 0.46 * cos(2.0 * M_PI * x);  
 }  
   
-static void rsid_reset_state(void) {  
-    inptr = RSID_FFT_SIZE;  
-    memset(aInputSamples, 0, sizeof(aInputSamples));  
-    memset(aFFTAmpl,      0, sizeof(aFFTAmpl));  
-    memset(fft_buckets,   0, sizeof(fft_buckets));  
+// Сброс ТОЛЬКО детекторного состояния (владелец — Core 1). НЕ трогает  
+// накопитель aInputSamples/inptr, которым владеет Core 0.  
+static void rsid_reset_detect(void) {  
+    memset(aFFTAmpl,    0, sizeof(aFFTAmpl));  
+    memset(fft_buckets, 0, sizeof(fft_buckets));  
     hamming_resolution = RSID_HAMMING_RESOLUTION;  
     rsid_secondary_windows = 0;  
 }  
+  
+// Полный сброс (только с Core 0: init / retune) — сбрасывает и накопитель.  
+static void rsid_reset_state(void) {  
+    inptr = RSID_FFT_SIZE;  
+    memset(aInputSamples, 0, sizeof(aInputSamples));  
+    rsid_reset_detect();  
+}
   
 // In-place radix-2 DIT, деление на 2 на каждой стадии (значения в Q15).  
 static void fft_q15(void) {  
@@ -304,9 +315,10 @@ static void rsid_apply(int iBin, int iSymbol,
     r.mode_name = name;  
     r.freq_hz   = (float)rsidfreq;  
   
-    if (s_cb) s_cb(&r);  
-    else Serial.printf("# RSID mode=%s code=%d freq=%.1f\n",  
-                       r.mode_name, r.mode_code, r.freq_hz);  
+    // Диспетчеризацию (Serial + смена моды) делает Core 0 в rsid_rx_dispatch().  
+    rsid_det_result = r;  
+    __dmb();  
+    rsid_det_pending = true;
 }  
   
 // ----------------------------------------------------------------------------  
@@ -362,9 +374,10 @@ static void rsid_search(void) {
                 // Центр матч-фильтра RTTY — прямо из частоты RSID.  
                 rtty_center_hz  = (float)((bin + RSID_NSYMBOLS - 0.5)  
                                           * RSID_SAMPLE_RATE / 2048.0);  
-                rtty_center_new = true;  
+                __dmb();  
+                rtty_center_new = true;
   
-                rsid_reset_state();  
+                rsid_reset_detect(); 
             } else {  
                 // ESCAPE: следующие окна ищем в расширенном наборе.  
                 rsid_secondary_windows = RSID_SECONDARY_WINDOWS;  
@@ -381,7 +394,7 @@ static void rsid_search(void) {
   
             // Частота известна и для расширенных мод; RTTY-центр  
             // для не-RTTY мод не задаём (routing по моде в rx_decoders).  
-            rsid_reset_state();   // сбросит и rsid_secondary_windows  
+            rsid_reset_detect();   // сбросит и rsid_secondary_windows  
         }  
     }  
     if (rsid_secondary_windows <= 0) {  
@@ -435,7 +448,20 @@ void rsid_rx_push(int16_t sample) {
         inptr -= RSID_FFT_SAMPLES;  
     }
 }  
-  
+
+// Вызывается из loop() (Core 0): забирает результат детекта, сделанного на Core 1,  
+// и выполняет Serial-печать + смену моды в безопасном (не real-time) контексте.  
+void rsid_rx_dispatch(void) {  
+    if (!rsid_det_pending) return;  
+    rsid_det_pending = false;  
+    __dmb();  
+    if (s_cb) s_cb(&rsid_det_result);  
+    else Serial.printf("# RSID mode=%s code=%d freq=%.1f\n",  
+                       rsid_det_result.mode_name,  
+                       rsid_det_result.mode_code,  
+                       rsid_det_result.freq_hz);  
+}
+
 void rsid_rx_service(void) {  
     if (!rsid_inited) return;  
     if (!rsid_window_ready) return;  
