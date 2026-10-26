@@ -43,11 +43,6 @@ static void rx_full_tune(uint32_t freq_hz)
     // Последним запускаем DSP на Core 1.  
     rx_dsp_start((float)freq_hz);  
   
-#if RTTY_DECODE  
-    // matched-filter детектор: центр +2450 Гц, разнос 170 Гц (RTTY-45)  
-    rx_mf_init(rx_dsp_fs_out(), 2450.0f, 170.0f);  
-#endif  
-  
     current_rx_hz = freq_hz;  
   
     Serial.printf("# RX_RETUNE,target_hz=%lu,lo_actual_hz=%lu,fs_out_hz=%.2f\n",  

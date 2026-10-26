@@ -15,4 +15,7 @@ void rx_decoders_set_output(rx_output_cb_t cb);
 void rx_decoders_emit(char c);  
   
 // Колбэк результата RSID: переключение моды + перенастройка фильтров.  
-void rx_decoders_on_rsid(const rsid_result_t* r);
+void rx_decoders_on_rsid(const rsid_result_t* r);  
+  
+// Подать один отсчёт базовой полосы в активный декодер (из rx_audio.cpp).  
+void rx_decoders_sample(int16_t m);

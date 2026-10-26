@@ -83,11 +83,6 @@ bool rx_dsp_get_nr(void);
 uint32_t rx_dsp_af_lo_hz(void);  
 uint32_t rx_dsp_af_hi_hz(void);
 
-// Бортовой RTTY-декодер: единая точка правды, видна и в .ino, и в rx_dsp.cpp.  
-#ifndef RTTY_DECODE  
-#define RTTY_DECODE 1  
-#endif  
-
 // Перестройка приёмного тракта на лету (CAT/FLDigi):  
 // малая отстройка — сдвиг NCO, большая — полная переустановка LO.  
 void     rx_retune(uint32_t freq_hz);  

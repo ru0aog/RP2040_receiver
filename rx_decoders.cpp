@@ -9,8 +9,9 @@
 #include "vfo_hardware.h"  
 #include "rx_decoders.h"  
 #include "rx_rsid.h"  
-#include "rx_mf.h"  
-#include "rx_rtty.h"  
+#include "rx_mf.h"
+#include "rx_cw.h"
+#include "rx_rtty.h"
   
 // Коды мод из таблицы RSID (см. логи: RTTY-45=39, CW=26).  
 #define RSID_CODE_RTTY45   39  
@@ -26,7 +27,17 @@ static rx_output_cb_t s_out = default_output;
   
 void rx_decoders_set_output(rx_output_cb_t cb) { s_out = cb ? cb : default_output; }  
 void rx_decoders_emit(char c) { if (s_out) s_out(c); }  
-  
+
+// Один отсчёт базовой полосы (15625 Гц) в активный декодер
+// Мода выбирается рантайм по результату RSID
+void rx_decoders_sample(int16_t m) {  
+    switch (active_dec) {  
+    case DEC_RTTY: rx_mf_sample(m, 0); break;  
+    case DEC_CW:   /* rx_cw_sample(m); — когда появится модуль rx_cw */ break;  
+    default:       break;   // DEC_NONE — пока метки нет, не декодируем  
+    }  
+}
+
 // Вызывается из rsid_rx_service() (Core 0, loop) — Serial безопасен.  
 void rx_decoders_on_rsid(const rsid_result_t* r) {  
     if (!r) return;  
@@ -42,11 +53,11 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
         rx_rtty_init(dec_fs_hz);  
         Serial.printf("# DECODER=RTTY center=%.1f Hz\n", (double)r->freq_hz);  
         break;  
-    case RSID_CODE_CW:  
-        active_dec = DEC_CW;  
-        // TODO: rx_cw_init(dec_fs_hz, r->freq_hz);  — когда появится модуль rx_cw  
-        Serial.printf("# DECODER=CW center=%.1f Hz (not implemented)\n", (double)r->freq_hz);  
-        break;  
+    case RSID_CODE_CW:    
+        active_dec = DEC_CW;    
+        rx_cw_init(dec_fs_hz, r->freq_hz);    
+        Serial.printf("# DECODER=CW center=%.1f Hz\n", (double)r->freq_hz);    
+        break;
     default:  
         Serial.printf("# DECODER unsupported code=%d\n", r->mode_code);  
         break;  
