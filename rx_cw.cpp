@@ -10,10 +10,16 @@
 #include "rx_cw.h"  
 #include "rx_decoders.h"   // единая точка вывода  
   
-// ---- параметры ----  
-#define CW_LP_FC_HZ    80.0f     // полоса НЧ детектора тона  
-#define CW_WIN_MS      5.0f      // окно огибающей  
-#define CW_EMA_SHIFT   3         // EMA огибающей ~8 окон  
+// ---- параметры ----    
+#define CW_LP_FC_HZ    80.0f     // полоса НЧ детектора тона    
+#define CW_WIN_MS      5.0f      // окно огибающей    
+#define CW_EMA_SHIFT   3         // EMA огибающей ~8 окон    
+  
+// Стартовая длина точки (в окнах): 5 мс/окно, ~60 мс точка ≈ 20 WPM.    
+// Предзасев, чтобы первый элемент не задавал dot_win сам по себе.    
+#define CW_DEFAULT_DOT_WIN  12.0f    
+// Число окон прогрева AGC: быстрое схождение sig/noise в начале посылки.    
+#define CW_WARMUP_WINDOWS   16
   
 static float fs_hz = 15625.0f;  
   
@@ -27,7 +33,8 @@ static float win_acc = 0.0f;
 // огибающая/AGC (float-версия beacon)  
 static float p_ema = 0.0f, sig_avg = 0.0f, noise_avg = 0.0f;  
 static bool  tone_on = false;  
-static int   low_cnt = 0;  
+static int   low_cnt = 0;
+static int   warmup  = 0;   // счётчик окон прогрева AGC
   
 // тайминг Морзе (в окнах)  
 static uint32_t win_idx = 0, on_start = 0, off_start = 0;  
@@ -77,23 +84,35 @@ void rx_cw_init(float fs, float tone_hz) {
     if (win_div < 1) win_div = 1;  
     win_cnt = 0; win_acc = 0.0f;  
   
-    p_ema = sig_avg = noise_avg = 0.0f;  
-    tone_on = false; low_cnt = 0;  
-    win_idx = on_start = off_start = 0;  
-    dot_win = 0.0f; code = 1; in_char = false;  
+    p_ema = sig_avg = noise_avg = 0.0f;    
+    tone_on = false; low_cnt = 0;    
+    win_idx = on_start = off_start = 0;    
+    dot_win = CW_DEFAULT_DOT_WIN;   // стартовая длина точки, адаптируется дальше    
+    code = 1; in_char = false;    
+    warmup = CW_WARMUP_WINDOWS;     // окна быстрого схода AGC
 }  
   
-static void process_window(float pe) {  
-    // двухуровневая AGC + гистерезис (порт beacon)  
-    if (pe > noise_avg) noise_avg += (pe - noise_avg) * (1.0f/256.0f);  
-    else                noise_avg += (pe - noise_avg) * (1.0f/8.0f);  
-    if (tone_on && pe > sig_avg) sig_avg += (pe - sig_avg) * 0.5f;  
-    else                         sig_avg -= sig_avg * (1.0f/256.0f);  
-    if (!tone_on)                noise_avg += (pe - noise_avg) * (1.0f/16.0f);  
+static void process_window(float pe) {    
+    // Прогрев: пока AGC не набрала разброс, быстро тянем sig вверх к пикам,    
+    // а noise — вниз к провалам, чтобы пороги стали валидны за первые окна.    
+    if (warmup > 0) {    
+        warmup--;    
+        if (pe > sig_avg)   sig_avg   = pe;              // мгновенно к пику    
+        else                sig_avg  -= sig_avg * (1.0f/64.0f);    
+        if (pe < noise_avg || noise_avg == 0.0f) noise_avg = pe;  // мгновенно к провалу    
+        else                noise_avg += (pe - noise_avg) * (1.0f/16.0f);    
+    } else {    
+        // двухуровневая AGC + гистерезис (порт beacon)    
+        if (pe > noise_avg) noise_avg += (pe - noise_avg) * (1.0f/256.0f);    
+        else                noise_avg += (pe - noise_avg) * (1.0f/8.0f);    
+        if (tone_on && pe > sig_avg) sig_avg += (pe - sig_avg) * 0.5f;    
+        else                         sig_avg -= sig_avg * (1.0f/256.0f);    
+        if (!tone_on)                noise_avg += (pe - noise_avg) * (1.0f/16.0f);    
+    }    
   
-    float range = sig_avg - noise_avg; if (range < 1.0f) range = 1.0f;  
-    float thr_hi = noise_avg + range * 0.6f;  
-    float thr_lo = noise_avg + range * 0.4f;  
+    float range = sig_avg - noise_avg; if (range < 1.0f) range = 1.0f;    
+    float thr_hi = noise_avg + range * 0.6f;    
+    float thr_lo = noise_avg + range * 0.4f; 
   
     bool key;  
     if      (pe > thr_hi) key = true;  
