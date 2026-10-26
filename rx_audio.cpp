@@ -298,10 +298,12 @@ static inline int32_t farrow_eval_i(int32_t c0, int32_t c1, int32_t c2, int32_t 
 // S = 15625/11025 ≈ 1.4172 входных отсчёта на выходной (>1 → децимация),  
 // поэтому аккумулятор звукового тракта (для повышения частоты) здесь НЕ годится.  
 // Антиалиасинг не нужен: AF-тракт Core 1 уже режет полосу ~3 кГц (Найквист 11025 = 5512).  
-static const float RR_STEP = 15625.0f / 11025.0f;   // ≈ 1.41723  
-static int32_t rr_xm1 = 0, rr_x0 = 0, rr_x1 = 0, rr_x2 = 0;  // окно 4 отсчёта  
-static uint8_t rr_init = 0;                                   // прайминг  
-static float   rr_frac = 0.0f;                               // фаза в входных отсчётах  
+static int32_t rr_xm1 = 0, rr_x0 = 0, rr_x1 = 0, rr_x2 = 0;  
+static uint8_t rr_init = 0;  
+// Фаза в Q32 (доля входного отсчёта). Шаг 15625/11025 ≈ 1.41723 — константа времени компиляции.  
+#define RR_ONE_Q32    ((uint64_t)1 << 32)  
+static const uint64_t RR_STEP_Q32 = (uint64_t)((15625.0 / 11025.0) * 4294967296.0);  
+static uint64_t rr_frac_q = 0; 
   
 // Вызывается на КАЖДЫЙ демод-отсчёт 15625 Гц; выдаёт 0..1 отсчёт на 11025 Гц.  
 static inline void rsid_rs_push(int32_t x) {  
@@ -312,22 +314,22 @@ static inline void rsid_rs_push(int32_t x) {
     int32_t c0, c1, c2, c3;  
     farrow_calc_i(rr_xm1, rr_x0, rr_x1, rr_x2, &c0, &c1, &c2, &c3);  
   
-    // один входной отсчёт «прошёл» → фаза сдвигается  
-    while (rr_frac < 1.0f) {  
-        uint32_t mu_q15 = (uint32_t)(rr_frac * 32768.0f);     // [0..1) -> Q15  
+    // один входной отсчёт «прошёл» → фаза сдвигается (всё целое)  
+    while (rr_frac_q < RR_ONE_Q32) {  
+        uint32_t mu_q15 = (uint32_t)(rr_frac_q >> 17);        // Q32 -> Q15 (rr_frac<2^32)  
         int32_t  y2 = farrow_eval_i(c0, c1, c2, c3, mu_q15);  // = 2*y  
         int32_t  y  = (y2 + 1) >> 1;                          // y с округлением  
-        rsid_rx_push((int16_t)y);                            // -> накопитель RSID 11025 Гц  
-        rr_frac += RR_STEP;  
+        rsid_rx_push((int16_t)y);  
+        rr_frac_q += RR_STEP_Q32;  
     }  
-    rr_frac -= 1.0f;  
+    rr_frac_q -= RR_ONE_Q32;
 }  
   
 // Сброс состояния ресемплера (вызывать при смене режима/ретюне, если нужно).  
 static inline void rsid_rs_reset(void) {  
     rr_xm1 = rr_x0 = rr_x1 = rr_x2 = 0;  
     rr_init = 0;  
-    rr_frac = 0.0f;  
+    rr_frac_q = 0;  
 }  
 
 
