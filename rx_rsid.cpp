@@ -148,7 +148,7 @@ static bool           rsid_inited = false;
 static unsigned char  pCodes1[sizeof(rsid_ids_1) / sizeof(rsid_ids_1[0]) * RSID_NSYMBOLS];  
 static unsigned char  pCodes2[sizeof(rsid_ids_2) / sizeof(rsid_ids_2[0]) * RSID_NSYMBOLS];  
   
-static float          aInputSamples[RSID_BUFFER_SIZE];  
+static int16_t        aInputSamples[RSID_BUFFER_SIZE];
 static int16_t        window_q15[RSID_FFT_N];  
 static int16_t        tw_re[RSID_FFT_HALF];  
 static int16_t        tw_im[RSID_FFT_HALF];  
@@ -424,20 +424,16 @@ void rsid_rx_reset(void) { rsid_reset_state(); }
 void rsid_rx_push(int16_t sample) {  
     if (!rsid_inited) return;  
   
-    aInputSamples[inptr++] = (float)sample;  
-  
+    aInputSamples[inptr++] = (int16_t)sample;  
     if (inptr >= RSID_ARRAY_SIZE) {  
         if (!rsid_window_ready) {  
-            for (int n = 0; n < RSID_ARRAY_SIZE; n++)  
-                rsid_proc[n] = sat16((int32_t)aInputSamples[n]);  
+            memcpy(rsid_proc, aInputSamples, RSID_ARRAY_SIZE * sizeof(int16_t));  
             rsid_window_ready = true;  
-        } else {  
-            rsid_dropped_windows++;  
-        }  
+        } else { rsid_dropped_windows++; }  
         memmove(&aInputSamples[0], &aInputSamples[RSID_FFT_SAMPLES],  
-                (RSID_BUFFER_SIZE - RSID_FFT_SAMPLES) * sizeof(float));  
+                (RSID_BUFFER_SIZE - RSID_FFT_SAMPLES) * sizeof(int16_t));  
         inptr -= RSID_FFT_SAMPLES;  
-    }  
+    }
 }  
   
 void rsid_rx_service(void) {  
