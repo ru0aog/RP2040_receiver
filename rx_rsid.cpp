@@ -159,9 +159,22 @@ enum rsid_state_t {
 
 static rsid_state_t rsid_sm_state = RSID_STATE_IDLE;
 
-// Переменные итераторов для сохранения контекста между вызовами
-static uint16_t fft_len = 2;
-static uint16_t fft_base = 0;
+// Переменные итераторов для сохранения контекста между вызовами  
+static uint16_t fft_len = 2;  
+static uint16_t fft_base = 0;  
+  
+// Бюджет времени на один заход rsid_rx_service_sliced() (мкс).  
+// Несколько коротких квантов, но суммарно < интервала ADC-блока (4.096 мс).  
+#ifndef RSID_SLICE_BUDGET_US  
+#define RSID_SLICE_BUDGET_US 120u  
+#endif  
+  
+// --- Итераторы нарезанного поиска (один код таблицы за квант) ---  
+static bool srch_active    = false;  
+static int  srch_i         = 0;  
+static int  srch_best_dist = 1000;  
+static int  srch_best_bin  = -1;  
+static int  srch_best_sym  = -1;
 
 // Нарезанный поиск: аккумуляторы между квантами.  
 static int rsid_srch_i   = 0;      // индекс текущего кода в таблице  
@@ -224,11 +237,11 @@ static void rsid_reset_detect(void) {
 // Полный сброс (только с Core 0: init / retune) — сбрасывает и накопитель.  
 static void rsid_reset_state(void) {  
     inptr = RSID_FFT_SIZE;  
-    memset(aInputSamples, 0, sizeof(aInputSamples));  
+    memset(aInputSamples, 0, sizeof(aInputSamples));
     rsid_reset_detect();
     rsid_srch_i = 0;
 }
-  
+
 // In-place radix-2 DIT, деление на 2 на каждой стадии (значения в Q15).  
 static void fft_q15(void) {  
     uint16_t j = 0;  
@@ -326,7 +339,38 @@ static bool search_amp(int& bin_out, int& symbol_out,
         return true;  
     }  
     return false;  
-}  
+}
+
+// Пошаговый поиск: обрабатывает ОДИН код таблицы за вызов (один квант).  
+// Возвращает true, когда перебор всей таблицы завершён; результат — в srch_best_*.  
+static bool search_amp_step(const unsigned char* pCodes,  
+                            const RSIDmap* ids, int ids_size) {  
+    if (!srch_active) {               // старт нового перебора  
+        srch_i = 0;  
+        srch_best_dist = 1000;  
+        srch_best_bin  = -1;  
+        srch_best_sym  = -1;  
+        srch_active = true;  
+    }  
+  
+    const unsigned char* pc = pCodes + srch_i * RSID_NSYMBOLS;  
+    for (int j = nBinLow; j < nBinHigh - RSID_NTIMES; j++) {  
+        int d = HammingDistance(j, pc);  
+        if (d < srch_best_dist) {  
+            srch_best_dist = d;  
+            srch_best_sym  = ids[srch_i].rs;  
+            srch_best_bin  = j;  
+            if (srch_best_dist == 0) break;  
+        }  
+    }  
+  
+    srch_i++;  
+    if (srch_i >= ids_size || srch_best_dist == 0) {  
+        srch_active = false;          // перебор завершён  
+        return true;  
+    }  
+    return false;                     // остались ещё коды  
+}
 
 // Один шаг: полный перебор бинов для ОДНОГО кода pCodes[i].  
 // Результат копится в rsid_srch_min/bin/sym между вызовами.  
@@ -544,13 +588,21 @@ void rsid_rx_service_sliced(void) {
         }
     }
 
-    // --- ФАЗА 1: Выполнение ровно одного вычислительного кванта стейт-машины ---
-    switch (rsid_sm_state) {
-        
-        case RSID_STATE_IDLE:
-            if (rsid_window_ready) {
-                rsid_sm_state = RSID_STATE_WINDOWING;
-            }
+    // --- ФАЗА 1: Выполняем кванты стейт-машины в пределах таймбюджета ---  
+    // Несколько лёгких квантов за один заход «!blk», но суммарно ограничиваем  
+    // время, чтобы не задержать Core 1 и не уронить аудио. Каждый квант сам по  
+    // себе короткий (FFT_STAGE — одна группа бабочек, SEARCH — один код).  
+    const uint32_t t_slice_start = micros();  
+    do {  
+        // Делать нечего — выходим немедленно.  
+        if (rsid_sm_state == RSID_STATE_IDLE && !rsid_window_ready) break;  
+  
+    switch (rsid_sm_state) {  
+          
+        case RSID_STATE_IDLE:  
+            if (rsid_window_ready) {  
+                rsid_sm_state = RSID_STATE_WINDOWING;  
+            }  
             break;
 
         case RSID_STATE_WINDOWING:
@@ -643,57 +695,53 @@ void rsid_rx_service_sliced(void) {
         }
 
         case RSID_STATE_SEARCH: {  
-            // Выбор таблицы набора на всё время фазы поиска.  
-            const unsigned char* pCodes;  
-            const RSIDmap*       ids;  
-            int                  ids_size;  
-            const bool set2 = (rsid_secondary_windows > 0);  
-            if (!set2) { pCodes = pCodes1; ids = rsid_ids_1; ids_size = rsid_ids_size1; }  
-            else       { pCodes = pCodes2; ids = rsid_ids_2; ids_size = rsid_ids_size2; }  
+            // Выбор таблицы фиксирован на всё время перебора окна  
+            // (rsid_secondary_windows меняется только после завершения поиска).  
+            const bool            primary  = (rsid_secondary_windows <= 0);  
+            const unsigned char*  pCodes   = primary ? pCodes1       : pCodes2;  
+            const RSIDmap*        ids      = primary ? rsid_ids_1     : rsid_ids_2;  
+            const int             ids_size = primary ? rsid_ids_size1 : rsid_ids_size2;  
   
-            // Первый шаг фазы: инициализация аккумуляторов. Для набора 2  
-            // уменьшаем счётчик окон ровно один раз на окно (как в оригинале).  
-            if (rsid_srch_i == 0) {  
-                rsid_srch_min = 1000;  
-                rsid_srch_bin = -1;  
-                rsid_srch_sym = -1;  
-                if (set2) rsid_secondary_windows--;  
+            // ОДИН код таблицы за квант. Пока не завершено — остаёмся в SEARCH.  
+            if (!search_amp_step(pCodes, ids, ids_size)) {  
+                break;  
             }  
   
-            // Обсчитываем ОДИН код за квант.  
-            search_amp_step(rsid_srch_i, pCodes, ids);  
-            rsid_srch_i++;  
+            // Перебор завершён — оцениваем лучший результат.  
+            const bool found = (srch_best_dist <= hamming_resolution);  
+            const int  bin   = srch_best_bin;  
+            const int  sym   = srch_best_sym;  
   
-            // Ещё не все коды — остаёмся в SEARCH, следующий код на след. кванте.  
-            if (rsid_srch_i < ids_size) break;  
-  
-            // Все коды перебраны — применяем результат, как в монолите.  
-            rsid_srch_i = 0;  
-            const bool hit = (rsid_srch_min <= hamming_resolution);  
-  
-            if (!set2) {  
-                if (hit && rsid_srch_sym != RSID_ESCAPE) {  
-                    rsid_apply(rsid_srch_bin, rsid_srch_sym, rsid_ids_1, rsid_ids_size1);  
-                    rtty_center_hz = (float)((rsid_srch_bin + RSID_NSYMBOLS - 0.5)  
-                                             * RSID_SAMPLE_RATE / 2048.0);  
-                    __dmb();  
-                    rtty_center_new = true;  
-                    rsid_reset_detect();  
-                } else if (hit) {   // sym == RSID_ESCAPE  
-                    rsid_secondary_windows = RSID_SECONDARY_WINDOWS;  
+            if (primary) {  
+                if (found) {  
+                    if (sym != RSID_ESCAPE) {  
+                        rsid_apply(bin, sym, rsid_ids_1, rsid_ids_size1);  
+                        rtty_center_hz = (float)((bin + RSID_NSYMBOLS - 0.5) * RSID_SAMPLE_RATE / 2048.0);  
+                        __dmb();  
+                        rtty_center_new = true;  
+                        rsid_reset_detect();  
+                    } else {  
+                        rsid_secondary_windows = RSID_SECONDARY_WINDOWS;  
+                    }  
                 }  
             } else {  
-                if (hit && rsid_srch_sym != RSID_NONE2) {  
-                    rsid_apply(rsid_srch_bin, rsid_srch_sym, rsid_ids_2, rsid_ids_size2);  
-                    rsid_reset_detect();  
+                rsid_secondary_windows--;  
+                if (found) {  
+                    if (sym != RSID_NONE2) {  
+                        rsid_apply(bin, sym, rsid_ids_2, rsid_ids_size2);  
+                        rsid_reset_detect();  
+                    }  
                 }  
-                if (rsid_secondary_windows <= 0) rsid_secondary_windows = 0;  
+                if (rsid_secondary_windows <= 0) {  
+                    rsid_secondary_windows = 0;  
+                }  
             }  
   
             rsid_window_ready = false;  
             rsid_sm_state = RSID_STATE_IDLE; // Цикл обработки кадра завершён  
             break;  
         }
-    }
+    }  
+    } while ((uint32_t)(micros() - t_slice_start) < RSID_SLICE_BUDGET_US);  
 }
 
