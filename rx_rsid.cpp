@@ -199,8 +199,13 @@ static int16_t        fft_q[RSID_FFT_N];
 static uint64_t       aFFTAmpl[RSID_FFT_SIZE];  
 static int16_t        fft_buckets[RSID_NTIMES][RSID_FFT_SIZE];  
   
-static int16_t        rsid_proc[RSID_ARRAY_SIZE];  
-static volatile bool  rsid_window_ready = false;  
+// Кольцо снимков окон: приём (ФАЗА 0) пишет head, стейт-машина читает tail.  
+// Оба на Core 1 и работают последовательно, поэтому volatile/__dmb не нужны.  
+#define RSID_WIN_SLOTS 4  
+static int16_t rsid_proc[RSID_WIN_SLOTS][RSID_ARRAY_SIZE];  
+static uint8_t rsid_win_head = 0;   // куда класть следующий снимок  
+static uint8_t rsid_win_tail = 0;   // какой снимок обрабатывать  
+static uint8_t rsid_cur_slot = 0;   // слот, обрабатываемый прямо сейчас
   
 static int   inptr;  
 static int   nBinLow, nBinHigh;  
@@ -230,9 +235,12 @@ static void rsid_reset_detect(void) {
     memset(aFFTAmpl,    0, sizeof(aFFTAmpl));  
     memset(fft_buckets, 0, sizeof(fft_buckets));  
     hamming_resolution = RSID_HAMMING_RESOLUTION;  
-    rsid_secondary_windows = 0;
-    rsid_srch_i = 0;
-}  
+    rsid_secondary_windows = 0;  
+    rsid_srch_i = 0;  
+    rsid_win_head = rsid_win_tail = rsid_cur_slot = 0;  // <-- добавить  
+    srch_active = false;                                // <-- добавить (чистый старт поиска)  
+    rsid_sm_state = RSID_STATE_IDLE;                    // <-- добавить  
+}
   
 // Полный сброс (только с Core 0: init / retune) — сбрасывает и накопитель.  
 static void rsid_reset_state(void) {  
@@ -575,13 +583,15 @@ void rsid_rx_service_sliced(void) {
         __dmb();
 
         aInputSamples[inptr++] = sample;
-        if (inptr >= RSID_ARRAY_SIZE) {
-            if (rsid_sm_state == RSID_STATE_IDLE && !rsid_window_ready) {
-                memcpy(rsid_proc, aInputSamples, RSID_ARRAY_SIZE * sizeof(int16_t));
-                rsid_window_ready = true;
-            } else {
-                rsid_dropped_windows++; // Процессор не успел обсчитать прошлое окно
-            }
+        if (inptr >= RSID_ARRAY_SIZE) {  
+            uint8_t nh = (uint8_t)((rsid_win_head + 1) % RSID_WIN_SLOTS);  
+            if (nh != rsid_win_tail) {                 // в кольце есть место  
+                memcpy(rsid_proc[rsid_win_head], aInputSamples,  
+                    RSID_ARRAY_SIZE * sizeof(int16_t));  
+                rsid_win_head = nh;  
+            } else {  
+                rsid_dropped_windows++;                // кольцо переполнено — реальный дроп  
+            }  
             memmove(&aInputSamples[0], &aInputSamples[RSID_FFT_SAMPLES],  
                     (RSID_BUFFER_SIZE - RSID_FFT_SAMPLES) * sizeof(int16_t));  
             inptr -= RSID_FFT_SAMPLES;  
@@ -595,26 +605,27 @@ void rsid_rx_service_sliced(void) {
     const uint32_t t_slice_start = micros();  
     do {  
         // Делать нечего — выходим немедленно.  
-        if (rsid_sm_state == RSID_STATE_IDLE && !rsid_window_ready) break;  
+        if (rsid_sm_state == RSID_STATE_IDLE && rsid_win_tail == rsid_win_head) break;
   
     switch (rsid_sm_state) {  
           
         case RSID_STATE_IDLE:  
-            if (rsid_window_ready) {  
-                rsid_sm_state = RSID_STATE_WINDOWING;  
-            }  
-            break;
+        if (rsid_win_tail != rsid_win_head) {       // есть готовое окно  
+            rsid_cur_slot = rsid_win_tail;          // фиксируем слот на весь конвейер  
+            rsid_sm_state = RSID_STATE_WINDOWING;  
+        }  
+        break;
 
-        case RSID_STATE_WINDOWING:
-            nBinLow  = 3;  
-            nBinHigh = RSID_FFT_SIZE - 32;  
-            for (int i = 0; i < RSID_FFT_N; i++) {  
-                int32_t xi = (int32_t)rsid_proc[i];  
-                fft_i[i] = (int16_t)(((int32_t)xi * window_q15[i]) >> 15);  
-                fft_q[i] = 0;  
-            }
-            rsid_sm_state = RSID_STATE_FFT_BITREVERSE;
-            break;
+        case RSID_STATE_WINDOWING:  
+        nBinLow  = 3;  
+        nBinHigh = RSID_FFT_SIZE - 32;  
+        for (int i = 0; i < RSID_FFT_N; i++) {  
+            int32_t xi = (int32_t)rsid_proc[rsid_cur_slot][i];  
+            fft_i[i] = (int16_t)(((int32_t)xi * window_q15[i]) >> 15);  
+            fft_q[i] = 0;  
+        }  
+        rsid_sm_state = RSID_STATE_FFT_BITREVERSE;  
+        break;
 
         case RSID_STATE_FFT_BITREVERSE: {
             uint16_t j = 0;  
@@ -737,9 +748,9 @@ void rsid_rx_service_sliced(void) {
                 }  
             }  
   
-            rsid_window_ready = false;  
-            rsid_sm_state = RSID_STATE_IDLE; // Цикл обработки кадра завершён  
-            break;  
+            rsid_win_tail = (uint8_t)((rsid_win_tail + 1) % RSID_WIN_SLOTS); // освобождаем слот  
+            rsid_sm_state = RSID_STATE_IDLE;  // кадр обработан  
+            break;
         }
     }  
     } while ((uint32_t)(micros() - t_slice_start) < RSID_SLICE_BUDGET_US);  
