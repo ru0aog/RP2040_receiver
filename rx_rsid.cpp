@@ -27,6 +27,23 @@ static inline int16_t sat16(int32_t x) {
 static volatile uint32_t rsid_sample_dropped = 0;
 static volatile uint32_t rsid_window_dropped = 0;
 
+// Диагностика времени rsid_rx_service_sliced().
+// Функция выполняется на Core 1; значения читаются диагностикой на Core 0.
+static volatile uint32_t rsid_service_max_us = 0;
+static volatile uint32_t rsid_service_calls_total = 0;
+
+uint32_t rsid_rx_service_max_us(void) {return rsid_service_max_us;}
+uint32_t rsid_rx_service_calls(void) {return rsid_service_calls_total;}
+
+// Вызывать в конце каждого входа в rsid_rx_service_sliced().
+static inline void rsid_service_record_time(uint32_t start_us) {
+    const uint32_t elapsed = micros() - start_us;
+    rsid_service_calls_total++;
+    if (elapsed > rsid_service_max_us) {
+        rsid_service_max_us = elapsed;
+    }
+}
+
 // Старый API сохраняем: он возвращает сумму обоих счётчиков.
 uint32_t rsid_rx_dropped(void) {return rsid_sample_dropped + rsid_window_dropped;}
 uint32_t rsid_rx_sample_dropped(void) {return rsid_sample_dropped;}
@@ -392,6 +409,9 @@ void rsid_rx_init(float fs_hz) {
     rsid_sample_dropped = 0;
     rsid_window_dropped = 0;
 
+    rsid_service_max_us = 0;
+    rsid_service_calls_total = 0;
+
     rsid_reset_state();
     rsid_inited = true;
 }  
@@ -440,7 +460,12 @@ bool rsid_get_rtty_center(float* f_hz) {
 
 
 void rsid_rx_service_sliced(void) {
-    if (!rsid_inited) return;
+    const uint32_t t_service_start = micros();
+
+    if (!rsid_inited) {
+        rsid_service_record_time(t_service_start);
+        return;
+    }
 
     // --- ФАЗА 0: Попутный сбор сэмплов из Lock-Free шлюза (всегда на полной скорости) ---
     while (rsid_sq_tail != rsid_sq_head) {
@@ -625,6 +650,9 @@ void rsid_rx_service_sliced(void) {
             break;
         }
     }  
-    } while ((uint32_t)(micros() - t_slice_start) < RSID_SLICE_BUDGET_US);  
+    } while ((uint32_t)(micros() - t_slice_start) < RSID_SLICE_BUDGET_US);
+
+    // Измеряем полное время вызова, включая сбор входных сэмплов.
+    rsid_service_record_time(t_service_start);
 }
 

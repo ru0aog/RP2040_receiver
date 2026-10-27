@@ -85,6 +85,7 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
         active_dec = DEC_IFKP;
         Serial.printf("# DECODER=IFKP center=%.1f Hz\n", (double)r->freq_hz);  
         break;
+        /*
     case RSID_CODE_OLIVIA_8_250:  
         stop_all_goertzel_decoders();  
         rx_olivia_init(r->freq_hz);         // центр из RSID, банк Гёрцеля 8 тонов  
@@ -97,6 +98,7 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
         active_dec = DEC_CONTESTIA;
         Serial.printf("# DECODER=CONTESTIA center=%.1f Hz\n", (double)r->freq_hz);
         break;
+        */
     default:  
         Serial.printf("# DECODER unsupported code=%d\n", r->mode_code);  
         break;  

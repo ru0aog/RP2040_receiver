@@ -68,6 +68,9 @@ uint32_t rsid_rx_sample_dropped(void);    // потери входных отс�
 uint32_t rsid_rx_window_dropped(void);    // потери готовых FFT-окон
 uint32_t rsid_rx_queue_fill(void);       // заполнение очереди входных отсчётов
 uint32_t rsid_rx_sm_state(void);          // состояние автомата RSID
+// Диагностика времени выполнения rsid_rx_service_sliced().
+uint32_t rsid_rx_service_max_us(void);
+uint32_t rsid_rx_service_calls(void);
 
 // Отложенная ДИСПЕТЧЕРИЗАЦИЯ результата RSID (печать метки + смена моды).  
 // Вызывать из loop() на Core 0. Сам тяжёлый поиск идёт на Core 1.  
