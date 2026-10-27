@@ -176,91 +176,121 @@ static uint32_t t_dbg = 0;
 
 
 
-    if (millis() - t_dbg >= 1000) {
-        t_dbg = millis();
 
-        static uint32_t rsid_prev_calls = 0;
-        static uint32_t rsid_prev_report_us = 0;
+if (millis() - t_dbg >= 100000) {
+    t_dbg = millis();
 
-        // Текущее время и общее количество вызовов RSID.
-        const uint32_t now_us = micros();
-        const uint32_t calls_total = rsid_rx_service_calls();
+    static uint32_t rsid_prev_calls = 0;
+    static uint32_t rsid_prev_callback_count = 0;
+    static uint32_t rsid_prev_report_us = 0;
 
-        uint32_t rsid_calls_s = 0;
+    const uint32_t now_us = micros();
 
-        if (rsid_prev_report_us != 0) {
-            const uint32_t elapsed_us = now_us - rsid_prev_report_us;
-            const uint32_t calls_delta = calls_total - rsid_prev_calls;
+    // Длительность прошедшего интервала измерения.
+    uint32_t elapsed_us = 0;
 
-            if (elapsed_us > 0) {
-                rsid_calls_s = (uint32_t)(
-                    ((uint64_t)calls_delta * 1000000ULL) / elapsed_us
-                );
-            }
-        }
-
-        rsid_prev_calls = calls_total;
-        rsid_prev_report_us = now_us;
-
-        const uint32_t rsid_max_us = rsid_rx_service_max_us();
-
-        // Снимаем значения загрузки один раз для согласованного вывода.
-        const uint32_t core1_load = rx_dsp_load_permille();
-        const uint32_t core1_dsp  = rx_dsp_compute_load_permille();
-        const uint32_t core1_rsid = rx_dsp_rsid_load_permille();
-
-        Serial.printf(
-            "# CORE0_TASK_LOAD=%lu.%lu%% "
-            "CORE1_LOAD=%lu.%lu%% "
-            "CORE1_DSP=%lu.%lu%% "
-            "CORE1_RSID=%lu.%lu%% "
-            "aud_dropped=%lu "
-            "out_dropped=%lu "
-            "clip=%lu "
-            "rsid_drop=%lu "
-            "rsid_sample_drop=%lu "
-            "rsid_window_drop=%lu "
-            "rsid_q=%lu/1024 "
-            "rsid_sm=%lu "
-            "rsid_max_us=%lu "
-            "rsid_calls_s=%lu\n",
-
-            // Core 0
-            (unsigned long)(core0_load_permille / 10u),
-            (unsigned long)(core0_load_permille % 10u),
-
-            // Core 1: общая активная загрузка
-            (unsigned long)(core1_load / 10u),
-            (unsigned long)(core1_load % 10u),
-
-            // Core 1: DSP
-            (unsigned long)(core1_dsp / 10u),
-            (unsigned long)(core1_dsp % 10u),
-
-            // Core 1: RSID
-            (unsigned long)(core1_rsid / 10u),
-            (unsigned long)(core1_rsid % 10u),
-
-            // Счётчики аудио и DSP
-            (unsigned long)rx_dsp_aud_dropped(),
-            (unsigned long)rx_dsp_out_dropped(),
-            (unsigned long)rx_dsp_clip_count(),
-
-            // Потери RSID
-            (unsigned long)rsid_rx_dropped(),
-            (unsigned long)rsid_rx_sample_dropped(),
-            (unsigned long)rsid_rx_window_dropped(),
-
-            // Очередь и состояние автомата RSID
-            (unsigned long)rsid_rx_queue_fill(),
-            (unsigned long)rsid_rx_sm_state(),
-
-            // Диагностика времени выполнения RSID
-            (unsigned long)rsid_max_us,
-            (unsigned long)rsid_calls_s
-        );
-        Serial.print("rsid_callback_count = "); Serial.print(rsid_callback_count); Serial.print(" rsid_callback_max_us = ");  Serial.println(rsid_callback_max_us);
+    if (rsid_prev_report_us != 0) {
+        elapsed_us = now_us - rsid_prev_report_us;
     }
+
+    // RSID service: общее количество вызовов.
+    const uint32_t calls_total = rsid_rx_service_calls();
+
+    // RSID callback: общее количество вызовов.
+    const uint32_t callback_count = rsid_callback_count;
+    const uint32_t callback_max_us = rsid_callback_max_us;
+
+    uint32_t rsid_calls_s = 0;
+    uint32_t callback_calls_s = 0;
+
+    if (elapsed_us > 0) {
+        const uint32_t calls_delta =
+            calls_total - rsid_prev_calls;
+
+        const uint32_t callback_delta =
+            callback_count - rsid_prev_callback_count;
+
+        rsid_calls_s = (uint32_t)(
+            ((uint64_t)calls_delta * 1000000ULL) / elapsed_us
+        );
+
+        callback_calls_s = (uint32_t)(
+            ((uint64_t)callback_delta * 1000000ULL) / elapsed_us
+        );
+    }
+
+    // Обновляем предыдущие значения только после расчёта обеих частот.
+    rsid_prev_calls = calls_total;
+    rsid_prev_callback_count = callback_count;
+    rsid_prev_report_us = now_us;
+
+    const uint32_t rsid_max_us = rsid_rx_service_max_us();
+
+    // Снимаем значения загрузки один раз.
+    const uint32_t core1_load = rx_dsp_load_permille();
+    const uint32_t core1_dsp  = rx_dsp_compute_load_permille();
+    const uint32_t core1_rsid = rx_dsp_rsid_load_permille();
+
+    Serial.printf(
+        "# CORE0_TASK_LOAD=%lu.%lu%% "
+        "CORE1_LOAD=%lu.%lu%% "
+        "CORE1_DSP=%lu.%lu%% "
+        "CORE1_RSID=%lu.%lu%% "
+        "aud_dropped=%lu "
+        "out_dropped=%lu "
+        "clip=%lu "
+        "rsid_drop=%lu "
+        "rsid_sample_drop=%lu "
+        "rsid_window_drop=%lu "
+        "rsid_q=%lu/1024 "
+        "rsid_sm=%lu "
+        "rsid_max_us=%lu "
+        "rsid_calls_s=%lu "
+        "rsid_callback_count=%lu "
+        "rsid_callback_calls_s=%lu "
+        "rsid_callback_max_us=%lu\n",
+
+        // Core 0
+        (unsigned long)(core0_load_permille / 10u),
+        (unsigned long)(core0_load_permille % 10u),
+
+        // Core 1: общая загрузка
+        (unsigned long)(core1_load / 10u),
+        (unsigned long)(core1_load % 10u),
+
+        // Core 1: DSP
+        (unsigned long)(core1_dsp / 10u),
+        (unsigned long)(core1_dsp % 10u),
+
+        // Core 1: RSID
+        (unsigned long)(core1_rsid / 10u),
+        (unsigned long)(core1_rsid % 10u),
+
+        // Счётчики аудио и DSP
+        (unsigned long)rx_dsp_aud_dropped(),
+        (unsigned long)rx_dsp_out_dropped(),
+        (unsigned long)rx_dsp_clip_count(),
+
+        // Потери RSID
+        (unsigned long)rsid_rx_dropped(),
+        (unsigned long)rsid_rx_sample_dropped(),
+        (unsigned long)rsid_rx_window_dropped(),
+
+        // Очередь и состояние автомата RSID
+        (unsigned long)rsid_rx_queue_fill(),
+        (unsigned long)rsid_rx_sm_state(),
+
+        // Диагностика RSID service
+        (unsigned long)rsid_max_us,
+        (unsigned long)rsid_calls_s,
+
+        // Диагностика callback
+        (unsigned long)callback_count,
+        (unsigned long)callback_calls_s,
+        (unsigned long)callback_max_us
+    );
+}
+
 
 
 

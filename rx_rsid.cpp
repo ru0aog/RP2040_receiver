@@ -9,11 +9,14 @@
 #define RSID_FFT_N    RSID_ARRAY_SIZE          // 2048  
 #define RSID_FFT_HALF (RSID_FFT_N / 2)
 
-// --- Межъядерный шлюз для сэмплов 11025 Гц ---
+// --- Локальная очередь сэмплов RSID на Core 1 ---
+// Ресэмплер и обработчик RSID выполняются на одном ядре.
+// Очередь отделяет приём отсчётов от пошаговой обработки FFT.
 #define RSID_SAMPLE_Q_SIZE 1024u
+
 static int16_t rsid_sample_queue[RSID_SAMPLE_Q_SIZE];
-static volatile uint32_t rsid_sq_head = 0; // Пишет Core 0
-static volatile uint32_t rsid_sq_tail = 0; // Читает Core 1
+static volatile uint32_t rsid_sq_head = 0;
+static volatile uint32_t rsid_sq_tail = 0;
   
 static inline int16_t sat16(int32_t x) {  
     if (x > 32767) return 32767;  
@@ -419,7 +422,9 @@ void rsid_rx_init(float fs_hz) {
 void rsid_rx_set_callback(rsid_detect_cb_t cb) { s_cb = cb; }  
   
 void rsid_rx_reset(void) { rsid_reset_state(); }  
-  
+
+// Принимает отсчёт 11025 Гц от ресэмплера на Core 1.
+// При заполнении локальной очереди увеличивает счётчик потерь.
 void rsid_rx_push(int16_t sample) {
     if (!rsid_inited) return;
 

@@ -587,6 +587,121 @@ static inline void core1_update_load(uint32_t now_us)
     core1_window_start_us = now_us;
 }
 
+// ============================================================================
+// RSID resampler: 15625 -> 11025 Hz
+// Выполняется на Core 1 непосредственно после демодуляции.
+// Выходные отсчёты поступают в локальную очередь RSID;
+// FFT и поиск по-прежнему выполняются через rsid_rx_service_sliced().
+// ============================================================================
+
+static int32_t rsid_rr_xm1 = 0;
+static int32_t rsid_rr_x0  = 0;
+static int32_t rsid_rr_x1  = 0;
+static int32_t rsid_rr_x2  = 0;
+
+static uint8_t rsid_rr_init = 0;
+
+#define RSID_RR_ONE_Q32 ((uint64_t)1 << 32)
+
+static const uint64_t rsid_rr_step_q32 =
+    (uint64_t)((15625.0 / 11025.0) * 4294967296.0);
+
+static uint64_t rsid_rr_frac_q = 0;
+
+
+// Коэффициенты кубического интерполятора Фарроу.
+// Представление соответствует существующему алгоритму rx_audio.cpp.
+static inline void rsid_farrow_calc_i(
+    int32_t ym1,
+    int32_t y0,
+    int32_t y1,
+    int32_t y2,
+    int32_t* c0,
+    int32_t* c1,
+    int32_t* c2,
+    int32_t* c3)
+{
+    *c0 = 2 * y0;
+    *c1 = y1 - ym1;
+    *c2 = 2 * ym1 - 5 * y0 + 4 * y1 - y2;
+    *c3 = 3 * (y0 - y1) + y2 - ym1;
+}
+
+
+// Полином Горнера в Q15. Возвращает 2*y.
+static inline int32_t rsid_farrow_eval_i(
+    int32_t c0,
+    int32_t c1,
+    int32_t c2,
+    int32_t c3,
+    uint32_t mu_q15)
+{
+    int32_t t = c3;
+
+    t = (int32_t)(((int64_t)t * mu_q15) >> 15) + c2;
+    t = (int32_t)(((int64_t)t * mu_q15) >> 15) + c1;
+    t = (int32_t)(((int64_t)t * mu_q15) >> 15) + c0;
+
+    return t;
+}
+
+
+// Вызывается для каждого демодулированного отсчёта 15625 Гц.
+// Генерирует отсчёты 11025 Гц и передаёт их RSID-обработчику.
+static inline void rsid_resampler_push(int32_t x)
+{
+    rsid_rr_xm1 = rsid_rr_x0;
+    rsid_rr_x0  = rsid_rr_x1;
+    rsid_rr_x1  = rsid_rr_x2;
+    rsid_rr_x2  = x;
+
+    if (rsid_rr_init < 4) {
+        ++rsid_rr_init;
+        if (rsid_rr_init < 4) {
+            return;
+        }
+    }
+
+    int32_t c0, c1, c2, c3;
+
+    rsid_farrow_calc_i(
+        rsid_rr_xm1,
+        rsid_rr_x0,
+        rsid_rr_x1,
+        rsid_rr_x2,
+        &c0, &c1, &c2, &c3);
+
+    while (rsid_rr_frac_q < RSID_RR_ONE_Q32) {
+        const uint32_t mu_q15 =
+            (uint32_t)(rsid_rr_frac_q >> 17);
+
+        const int32_t y2 = rsid_farrow_eval_i(
+            c0, c1, c2, c3, mu_q15);
+
+        const int32_t y = (y2 + 1) >> 1;
+
+        // Очередь RSID теперь заполняется на Core 1.
+        rsid_rx_push((int16_t)y);
+
+        rsid_rr_frac_q += rsid_rr_step_q32;
+    }
+
+    rsid_rr_frac_q -= RSID_RR_ONE_Q32;
+}
+
+
+// Сброс состояния при запуске DSP.
+static void rsid_resampler_reset(void)
+{
+    rsid_rr_xm1 = 0;
+    rsid_rr_x0  = 0;
+    rsid_rr_x1  = 0;
+    rsid_rr_x2  = 0;
+
+    rsid_rr_init   = 0;
+    rsid_rr_frac_q = 0;
+}
+
 // бесконечный изолированный рабочий цикл ядра Core 1
 // цифровой преобразователь частоты вниз (DDC — Digital Down Converter)
 static void __not_in_flash_func(rx_dsp_entry)(void) {
@@ -697,24 +812,43 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
                     si = sat16(vi);  
                     sq = sat16(vq);  
                 } else {  
-                    int32_t d;  
-                    if      (rxd_demod_mode == RXD_DEMOD_AM) d = rxd_am_sample(vi, vq);  
-                    else if (rxd_demod_mode == RXD_DEMOD_FM) d = rxd_fm_sample(vi, vq);  
-                    else                                     d = rxd_demod_sample(vi, vq); // SSB  
-                    int32_t df = af_lp_push(d);             // полосовой AF-фильтр (SH/SL)    
-                    // Автонотч применяем ТОЛЬКО в SSB; вызывать на каждом emit нельзя пропускать    
-                    if (notch_enabled &&    
-                        (rxd_demod_mode == RXD_DEMOD_USB || rxd_demod_mode == RXD_DEMOD_LSB)) {    
-                        df = notch_lms_push(df);    
-                    }    
-                    // ШП (ALE) — тоже только в SSB, на КАЖДОМ emit (линия задержки)    
-                    if (nr_enabled &&    
-                        (rxd_demod_mode == RXD_DEMOD_USB || rxd_demod_mode == RXD_DEMOD_LSB)) {    
-                        df = nr_lms_push(df);    
-                    }    
-                    int16_t m  = sat16(df);                 // моно
-                    si = m;  
-                    sq = m;  
+
+                    int32_t d;
+
+                    if (rxd_demod_mode == RXD_DEMOD_AM) {
+                        d = rxd_am_sample(vi, vq);
+                    } else if (rxd_demod_mode == RXD_DEMOD_FM) {
+                        d = rxd_fm_sample(vi, vq);
+                    } else {
+                        d = rxd_demod_sample(vi, vq);
+                    }
+
+                    int32_t df = af_lp_push(d);
+
+                    // Автонотч применяем только в SSB.
+                    if (notch_enabled &&
+                        (rxd_demod_mode == RXD_DEMOD_USB ||
+                        rxd_demod_mode == RXD_DEMOD_LSB)) {
+                        df = notch_lms_push(df);
+                    }
+
+                    // Шумоподавление — только в SSB.
+                    if (nr_enabled &&
+                        (rxd_demod_mode == RXD_DEMOD_USB ||
+                        rxd_demod_mode == RXD_DEMOD_LSB)) {
+                        df = nr_lms_push(df);
+                    }
+
+                    int16_t m = sat16(df);
+
+                    // RSID получает тот же моноотсчёт, что и аудиотракт.
+                    // Ресэмплинг 15625 -> 11025 Гц выполняется на Core 1.
+                    // В RAW_IQ этот участок не выполняется, как и раньше.
+                    rsid_resampler_push(m);
+
+                    si = m;
+                    sq = m;
+
                 }
             
                 uint8_t anext = (uint8_t)((aud_head + 1) % RX_AUD_BUFS);  
@@ -772,6 +906,7 @@ void rx_dsp_start(float f_target_hz) {
     // Остановка ядра
     // Принудительно гасит Core 1, исключая состояние гонки данных
     multicore_reset_core1();
+    rsid_resampler_reset();
     // Очистка памяти
     // Полностью обнуляет буферы фильтров промежуточной частоты 
     // и кольцевую межъядерную очередь
