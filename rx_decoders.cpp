@@ -84,7 +84,7 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
         Serial.printf("# DECODER=RTTY center=%.1f Hz\n", (double)r->freq_hz);  
         break;  
      
-     /*
+    // /*
 
     case RSID_CODE_CW:  
         stop_all_goertzel_decoders(); 
@@ -113,7 +113,7 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
         Serial.printf("# DECODER=CONTESTIA center=%.1f Hz\n", (double)r->freq_hz);
         break;
 
-     */
+    // */
 
     default:  
         Serial.printf("# DECODER unsupported code=%d\n", r->mode_code);  
