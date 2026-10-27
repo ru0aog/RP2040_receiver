@@ -62,10 +62,12 @@ void rsid_rx_service(void);
 // Высокопроизводительный пошаговый (квантованный) обработчик для Core 1  
 void rsid_rx_service_sliced(void);  
 
-// Диагностика RSID: пропущенные окна, заполнение очереди сэмплов, состояние SM.    
-uint32_t rsid_rx_dropped(void);    
-uint32_t rsid_rx_queue_fill(void);    
-uint32_t rsid_rx_sm_state(void);
+// Диагностика RSID.
+uint32_t rsid_rx_dropped(void);          // суммарные потери, для совместимости
+uint32_t rsid_rx_sample_dropped(void);    // потери входных отсчётов
+uint32_t rsid_rx_window_dropped(void);    // потери готовых FFT-окон
+uint32_t rsid_rx_queue_fill(void);       // заполнение очереди входных отсчётов
+uint32_t rsid_rx_sm_state(void);          // состояние автомата RSID
 
 // Отложенная ДИСПЕТЧЕРИЗАЦИЯ результата RSID (печать метки + смена моды).  
 // Вызывать из loop() на Core 0. Сам тяжёлый поиск идёт на Core 1.  

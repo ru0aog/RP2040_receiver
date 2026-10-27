@@ -178,31 +178,18 @@ static uint32_t t_dbg = 0;
 if (millis() - t_dbg >= 10000) {  
     t_dbg = millis();  
   
-    Serial.printf(  
-        "# CORE0_TASK_LOAD=%lu.%lu%% "  
-        "CORE1_LOAD=%lu.%lu%% "  
-        "aud_dropped=%lu "  
-        "out_dropped=%lu "  
-        "clip=%lu "  
-        "rsid_drop=%lu "  
-        "rsid_q=%lu/%u "  
-        "rsid_sm=%lu\n",  
-  
-        (unsigned long)(core0_load_permille / 10u),  
-        (unsigned long)(core0_load_permille % 10u),  
-  
-        (unsigned long)(rx_dsp_load_permille() / 10u),  
-        (unsigned long)(rx_dsp_load_permille() % 10u),  
-  
-        (unsigned long)rx_dsp_aud_dropped(),  
-        (unsigned long)rx_dsp_out_dropped(),  
-        (unsigned long)rx_dsp_clip_count(),  
-  
-        (unsigned long)rsid_rx_dropped(),  
-        (unsigned long)rsid_rx_queue_fill(),  
-        (unsigned int)1024u,  
-        (unsigned long)rsid_rx_sm_state()  
-    );  
+    Serial.printf(
+        "# CORE1_LOAD=%.1f%% CORE1_DSP=%.1f%% CORE1_RSID=%.1f%% "
+        "rsid_sample_drop=%lu rsid_window_drop=%lu "
+        "rsid_q=%lu/1024 rsid_sm=%lu\n",
+        rx_dsp_load_permille() / 10.0f,
+        rx_dsp_compute_load_permille() / 10.0f,
+        rx_dsp_rsid_load_permille() / 10.0f,
+        (unsigned long)rsid_rx_sample_dropped(),
+        (unsigned long)rsid_rx_window_dropped(),
+        (unsigned long)rsid_rx_queue_fill(),
+        (unsigned long)rsid_rx_sm_state()
+    );
 }
 
 

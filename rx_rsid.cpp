@@ -21,8 +21,16 @@ static inline int16_t sat16(int32_t x) {
     return (int16_t)x;  
 }  
   
-static volatile uint32_t rsid_dropped_windows = 0;    
-uint32_t rsid_rx_dropped(void) { return rsid_dropped_windows; }    
+// Раздельная диагностика потерь RSID.
+// sample_dropped: очередь входных отсчётов Core 0 -> Core 1.
+// window_dropped: кольцо готовых окон FFT на Core 1.
+static volatile uint32_t rsid_sample_dropped = 0;
+static volatile uint32_t rsid_window_dropped = 0;
+
+// Старый API сохраняем: он возвращает сумму обоих счётчиков.
+uint32_t rsid_rx_dropped(void) {return rsid_sample_dropped + rsid_window_dropped;}
+uint32_t rsid_rx_sample_dropped(void) {return rsid_sample_dropped;}
+uint32_t rsid_rx_window_dropped(void) {return rsid_window_dropped;}  
   
 // Заполнение SPSC-очереди сэмплов (0..RSID_SAMPLE_Q_SIZE-1). Диагностика:    
 // постоянно ~полная очередь = Core 1 не успевает забирать сэмплы.    
@@ -367,12 +375,25 @@ void rsid_rx_init(float fs_hz) {
     for (int i = 0; i < rsid_ids_size1; i++)  
         rsid_encode(rsid_ids_1[i].rs, pCodes1 + i * RSID_NSYMBOLS);  
   
-    memset(pCodes2, 0, sizeof(pCodes2));  
-    for (int i = 0; i < rsid_ids_size2; i++)  
-        rsid_encode(rsid_ids_2[i].rs, pCodes2 + i * RSID_NSYMBOLS);  
-  
-    rsid_reset_state();  
-    rsid_inited = true;  
+    memset(pCodes2, 0, sizeof(pCodes2));
+    for (int i = 0; i < rsid_ids_size2; i++)
+        rsid_encode(rsid_ids_2[i].rs, pCodes2 + i * RSID_NSYMBOLS);
+
+    // Сброс очереди входных отсчётов.
+    rsid_sq_head = 0;
+    rsid_sq_tail = 0;
+
+    // Сброс кольца готовых FFT-окон.
+    rsid_win_head = 0;
+    rsid_win_tail = 0;
+    rsid_cur_slot = 0;
+
+    // Сброс диагностических счётчиков потерь.
+    rsid_sample_dropped = 0;
+    rsid_window_dropped = 0;
+
+    rsid_reset_state();
+    rsid_inited = true;
 }  
   
 void rsid_rx_set_callback(rsid_detect_cb_t cb) { s_cb = cb; }  
@@ -390,8 +411,9 @@ void rsid_rx_push(int16_t sample) {
         __dmb(); // Гарантируем запись сэмпла до сдвига head
         rsid_sq_head = next;
     } else {
-        // Очередь переполнена (Core 1 слишком долго считал БПФ)
-        rsid_dropped_windows++; 
+        // Очередь входных отсчётов заполнена:
+        // Core 1 не успевает забирать данные от Core 0.
+        rsid_sample_dropped++;
     }
 }
 
@@ -435,9 +457,11 @@ void rsid_rx_service_sliced(void) {
                 memcpy(rsid_proc[rsid_win_head], aInputSamples,  
                     RSID_ARRAY_SIZE * sizeof(int16_t));  
                 rsid_win_head = nh;  
-            } else {  
-                rsid_dropped_windows++;                // кольцо переполнено — реальный дроп  
-            }  
+            } else {
+                // Все слоты кольца FFT-окон заняты.
+                // Обработчик RSID не успевает освобождать готовые окна.
+                rsid_window_dropped++;
+            }
             memmove(&aInputSamples[0], &aInputSamples[RSID_FFT_SAMPLES],  
                     (RSID_BUFFER_SIZE - RSID_FFT_SAMPLES) * sizeof(int16_t));  
             inptr -= RSID_FFT_SAMPLES;  

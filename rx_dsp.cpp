@@ -535,7 +535,58 @@ void rx_dsp_set_nr(bool on) {
 }  
 bool rx_dsp_get_nr(void) { return nr_enabled; }
 
-// ---- Измерение загрузки Core 1 ----
+// ---- Измерение активной загрузки Core 1 ----
+// Учитываем время реальной обработки DSP и RSID.
+// Время опроса пустой ADC-очереди в загрузку не включаем.
+
+static uint32_t core1_dsp_busy_us  = 0;
+static uint32_t core1_rsid_busy_us = 0;
+static uint32_t core1_window_start_us = 0;
+
+static volatile uint32_t dsp_load_permille  = 0;
+static volatile uint32_t rsid_load_permille = 0;
+static volatile uint32_t total_load_permille = 0;
+
+static inline void core1_update_load(uint32_t now_us)
+{
+    const uint32_t window_us = now_us - core1_window_start_us;
+
+    if (window_us < 1000000u) {
+        return;
+    }
+
+    uint32_t dsp_busy  = core1_dsp_busy_us;
+    uint32_t rsid_busy = core1_rsid_busy_us;
+
+    // Защита от некорректных значений.
+    if (dsp_busy > window_us) {
+        dsp_busy = window_us;
+    }
+
+    if (rsid_busy > window_us) {
+        rsid_busy = window_us;
+    }
+
+    uint32_t total_busy = dsp_busy + rsid_busy;
+
+    if (total_busy > window_us) {
+        total_busy = window_us;
+    }
+
+    dsp_load_permille =
+        (uint32_t)(((uint64_t)dsp_busy * 1000u) / window_us);
+
+    rsid_load_permille =
+        (uint32_t)(((uint64_t)rsid_busy * 1000u) / window_us);
+
+    total_load_permille =
+        (uint32_t)(((uint64_t)total_busy * 1000u) / window_us);
+
+    core1_dsp_busy_us = 0;
+    core1_rsid_busy_us = 0;
+    core1_window_start_us = now_us;
+}
+
 static uint32_t core1_busy_us = 0;
 static uint32_t core1_window_start_us = 0;
 static volatile uint32_t dsp_load_permille = 0;  // загрузка, промилле (0..1000)
@@ -569,22 +620,27 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
     while (true) {
         // кормим собачку
         watchdog_update();
-        // Учёт полного времени итерации (включая холостое ожидание).  
-        const uint32_t t_busy_start = time_us_32();
-        // проверяем очередь АЦП (функция в rx_capture.cpp)
+        // Проверяем очередь АЦП.
         const volatile uint32_t* blk = rx_capture_get_block();
-        if (!blk) {    
-            // Один вычислительный квант стейт-машины RSID. НЕ блокирует ядро на    
-            // весь БПФ+поиск, поэтому не роняет следующий ADC-блок.    
+
+        if (!blk) {
+            // Измеряем только фактическое время обработки RSID.
+            const uint32_t t_rsid_start = time_us_32();
+
             rsid_rx_service_sliced();
-            
-            // Учитываем фактическое время вызова RSID.
-            core1_account_busy(time_us_32() - t_busy_start);
+
+            core1_rsid_busy_us +=
+                (uint32_t)(time_us_32() - t_rsid_start);
+
             core1_update_load(time_us_32());
-            
-            tight_loop_contents();    
-            continue;    
+
+            // Ожидание ADC не включается в измерение активной загрузки.
+            tight_loop_contents();
+            continue;
         }
+
+        // ADC-блок получен: начинаем измерение активного времени DSP.
+        const uint32_t t_dsp_start = time_us_32();
         // данные из DMA пришли
     #if RTTY_DECODE 
         uint8_t wr        = out_head;                           // индекс текущего свободного буфера выходной очереди
@@ -723,8 +779,10 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
             out_head = next_head;
         }
     #endif
-        // подсчитываем нагрузку Core1
-        core1_account_busy(time_us_32() - t_busy_start);
+        // Учитываем только время обработки ADC-блока.
+        core1_dsp_busy_us +=
+            (uint32_t)(time_us_32() - t_dsp_start);
+
         core1_update_load(time_us_32());
     }
 }
@@ -858,10 +916,23 @@ uint32_t rx_dsp_out_dropped(void) {
     return out_dropped;
     }
 
-// Загрузка Core 1 в промилле (0..1000), обновляется раз в ~1 с.  
-uint32_t rx_dsp_load_permille(void) {  
-    return dsp_load_permille;  
-}  
+// Активная загрузка Core 1, промилле (0..1000).
+uint32_t rx_dsp_load_permille(void)
+{
+    return total_load_permille;
+}
+
+// Активная загрузка DSP без RSID, промилле (0..1000).
+uint32_t rx_dsp_compute_load_permille(void)
+{
+    return dsp_load_permille;
+}
+
+// Активная загрузка RSID, промилле (0..1000).
+uint32_t rx_dsp_rsid_load_permille(void)
+{
+    return rsid_load_permille;
+}
   
 // Счётчик дропов аудио-очереди (переполнение aud на Core 1).    
 uint32_t rx_dsp_aud_dropped(void) {    
