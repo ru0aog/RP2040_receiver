@@ -180,9 +180,10 @@ static uint16_t fft_base = 0;
   
 // Итераторы нарезанных стадий — живут между квантами.  
 static uint16_t w_i      = 0;     // WINDOWING: позиция в окне  
-static uint16_t br_i     = 1;     // BITREVERSE: i  
-static uint16_t br_j     = 0;     // BITREVERSE: бегущий bit-reversed счётчик  
-static int      ampl_i   = 0;     // CALC_AMPL: бин  
+static uint16_t br_i     = 1;     // BITREVERSE: i    
+static uint16_t br_j     = 0;     // BITREVERSE: бегущий bit-reversed счётчик    
+static uint16_t fft_j2   = 0;     // FFT_STAGE: позиция бабочки внутри группы    
+static int      ampl_i   = 0;     // CALC_AMPL: бин
 static int      bkt_phase = 0;    // SINK_AND_BUCKETS: 0=shift 1=memset 2=even 3=odd  
 static int      bkt_row   = 0;    // SINK_AND_BUCKETS: строка memmove  
 static int      bkt_i     = 0;    // CalculateBuckets: текущий бин  
@@ -512,10 +513,11 @@ void rsid_rx_service_sliced(void) {
     case RSID_STATE_IDLE:    
         if (rsid_win_tail != rsid_win_head) {       // есть готовое окно    
             rsid_cur_slot = rsid_win_tail;          // фиксируем слот на весь конвейер    
-            // Сброс итераторов нарезанных стадий на новое окно.  
-            w_i = 0; br_i = 1; br_j = 0;  
-            ampl_i = RSID_BIN_LOW - 2;  
-            bkt_phase = 0; bkt_row = 0;  
+            // Сброс итераторов нарезанных стадий на новое окно.    
+            w_i = 0; br_i = 1; br_j = 0;    
+            fft_j2 = 0;    
+            ampl_i = RSID_BIN_LOW - 2;    
+            bkt_phase = 0; bkt_row = 0;
             rsid_sm_state = RSID_STATE_WINDOWING;    
         }    
         break;
@@ -556,36 +558,41 @@ void rsid_rx_service_sliced(void) {
             break;  
         }
 
-        case RSID_STATE_FFT_STAGE: {
-            // Считаем только ОДНУ базовую группу бабочек за один вызов функции
-            const uint16_t half = fft_len >> 1;  
-            const uint16_t tw_step = RSID_FFT_N / fft_len;  
-            
-            for (uint16_t j2 = 0; j2 < half; ++j2) {  
-                const uint16_t tw = j2 * tw_step;  
-                const int32_t wr = tw_re[tw];  
-                const int32_t wi = tw_im[tw];  
-                const uint16_t a = fft_base + j2;  
-                const uint16_t b = a + half;  
-                const int32_t br = fft_i[b], bi = fft_q[b];  
-                const int32_t tr = (br * wr - bi * wi) >> 15;  
-                const int32_t ti = (br * wi + bi * wr) >> 15;  
-                const int32_t ar = fft_i[a], ai = fft_q[a];  
-                fft_i[a] = sat16((ar + tr) >> 1);  
-                fft_q[a] = sat16((ai + ti) >> 1);  
-                fft_i[b] = sat16((ar - tr) >> 1);  
-                fft_q[b] = sat16((ai - ti) >> 1);  
+        case RSID_STATE_FFT_STAGE: {  
+            // Бабочки текущей группы — чанками по RSID_CHUNK.  
+            // fft_j2 живёт в static: на поздних стадиях half = 512/1024,  
+            // и неделимая группа давала rsid_max_us ~1.6 мс.  
+            const uint16_t half = fft_len >> 1;    
+            const uint16_t tw_step = RSID_FFT_N / fft_len;    
+              
+            for (uint16_t n = 0; n < RSID_CHUNK && fft_j2 < half; ++fft_j2, ++n) {    
+                const uint16_t tw = fft_j2 * tw_step;    
+                const int32_t wr = tw_re[tw];    
+                const int32_t wi = tw_im[tw];    
+                const uint16_t a = fft_base + fft_j2;    
+                const uint16_t b = a + half;    
+                const int32_t br = fft_i[b], bi = fft_q[b];    
+                const int32_t tr = (br * wr - bi * wi) >> 15;    
+                const int32_t ti = (br * wi + bi * wr) >> 15;    
+                const int32_t ar = fft_i[a], ai = fft_q[a];    
+                fft_i[a] = sat16((ar + tr) >> 1);    
+                fft_q[a] = sat16((ai + ti) >> 1);    
+                fft_i[b] = sat16((ar - tr) >> 1);    
+                fft_q[b] = sat16((ai - ti) >> 1);    
+            }    
+  
+            if (fft_j2 >= half) {           // группа закончена — следующий блок  
+                fft_j2 = 0;  
+                fft_base += fft_len;  
+                if (fft_base >= RSID_FFT_N) {  
+                    fft_base = 0;  
+                    fft_len <<= 1;  
+                    if (fft_len > RSID_FFT_N) {  
+                        rsid_sm_state = RSID_STATE_CALC_AMPL;  
+                    }  
+                }  
             }  
-
-            fft_base += fft_len;
-            if (fft_base >= RSID_FFT_N) {
-                fft_base = 0;
-                fft_len <<= 1;
-                if (fft_len > RSID_FFT_N) {
-                    rsid_sm_state = RSID_STATE_CALC_AMPL;
-                }
-            }
-            break;
+            break;  
         }
 
         case RSID_STATE_CALC_AMPL:  
