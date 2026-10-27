@@ -88,8 +88,6 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
         Serial.printf("# DECODER=RTTY center=%.1f Hz\n", (double)r->freq_hz);  
         break;  
      
-    // /*
-
     case RSID_CODE_CW:  
         stop_all_goertzel_decoders(); 
         rx_cw_init(dec_fs_hz, r->freq_hz);  
