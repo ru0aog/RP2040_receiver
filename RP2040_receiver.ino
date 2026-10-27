@@ -116,63 +116,84 @@ void setup()
 }
   
 // RP2040_receiver.ino  
-void loop() {    
-    // --- Учёт загрузки Core 0 (по образцу Core 1) ---    
-    // total: полное время итерации; busy: время внутри рабочих функций.    
-    // Прим.: у Core 0 нет явного idle-маркера, метрика = доля wall-clock,    
-    // проведённая в rx_audio_poll()/RTTY, а не «истинная» занятость CPU.    
-    static uint32_t t_prev       = 0;    
-    static uint32_t busy_us_acc  = 0;    
-    static uint32_t total_us_acc = 0;    
-    static uint32_t core0_load_permille = 0;    
-    static bool     t_prev_init  = false;    
-  
-    const uint32_t t_now = time_us_32();    
-    if (!t_prev_init) { t_prev = t_now; t_prev_init = true; }    
-    total_us_acc += (t_now - t_prev);    
-    t_prev = t_now;    
-  
-    const uint32_t t_busy_start = time_us_32();    
-  
-    rx_audio_poll();  
-  
-    // RSID-поиск теперь идёт на Core 1 (холостая ветка DSP-цикла). На Core 0  
-    // остаётся лишь безопасная диспетчеризация: печать метки + смена моды +  
-    // перенастройка фильтров активного декодера (Serial/моды — только здесь).  
+void loop() {
+
+// ---- Учёт загрузки прикладных задач Core 0 ----
+
+static uint32_t core0_busy_us = 0;
+static uint32_t core0_window_start_us = 0;
+static uint32_t core0_load_permille = 0;
+
+static bool core0_timer_initialized = false;
+
+    uint32_t now = time_us_32();
+
+    if (!core0_timer_initialized) {
+        core0_window_start_us = now;
+        core0_timer_initialized = true;
+    }
+
+    // Начало измеряемой работы.
+    const uint32_t busy_start = now;
+
+    rx_audio_poll();
+
     rsid_rx_dispatch();
 
-    // CAT опрашиваем не каждую итерацию, а раз в ~15 мс: обращения к
-    // TinyUSB-CDC (dtr()/available()) в fldigi_cat_poll() дорогие,  
-    // а для разбора CAT-команд такой частоты более чем достаточно.  
-    static uint32_t t_cat = 0;  
-    if (millis() - t_cat >= 15) {  
-        t_cat = millis();  
-        fldigi_cat_poll();   // неблокирующий разбор CAT-команд  
-    }     
-    
-    // RTTY теперь тактируется из аудио-тракта (rx_audio.cpp::get_demod_input),  
-    // который берёт тот же демодулированный моно-поток, что идёт в USB-аудио.
-  
-    busy_us_acc += (time_us_32() - t_busy_start);    
-  
-    if (total_us_acc >= 1000000u) {    
-        core0_load_permille = (uint32_t)(((uint64_t)busy_us_acc * 1000u) / total_us_acc);    
-        busy_us_acc  = 0;    
-        total_us_acc = 0;    
-    }    
-  
-    // Диагностика: загрузка Core 0/Core 1 и дропы, раз в секунду.    
-    static uint32_t t_dbg = 0;    
-    if (millis() - t_dbg >= 10000) {    
-        t_dbg = millis();
-        // /* отключено: диагностика загрузки ядер 
-        Serial.printf("# CORE0_LOAD=%.1f%% CORE1_LOAD=%.1f%% aud_dropped=%lu out_dropped=%lu clip=%lu\n",  
-                      core0_load_permille / 10.0,  
-                      rx_dsp_load_permille() / 10.0,  
-                      (unsigned long)rx_dsp_aud_dropped(),  
-                      (unsigned long)rx_dsp_out_dropped(),  
-                      (unsigned long)rx_dsp_clip_count());
-        // */
+    // CAT опрашивается примерно раз в 15 мс.
+    static uint32_t t_cat = 0;
+
+    if (millis() - t_cat >= 15) {
+        t_cat = millis();
+        fldigi_cat_poll();
     }
+
+    // Завершение измеряемой работы.
+    now = time_us_32();
+
+    core0_busy_us += now - busy_start;
+
+    // Расчёт за окно реального времени.
+    const uint32_t window_us = now - core0_window_start_us;
+
+    if (window_us >= 1000000u) {
+        uint32_t busy = core0_busy_us;
+
+        if (busy > window_us) {
+            busy = window_us;
+        }
+
+        core0_load_permille =
+            (uint32_t)(((uint64_t)busy * 1000u) / window_us);
+
+        core0_busy_us = 0;
+        core0_window_start_us = now;
+    }
+
+ 
+    // Диагностика: загрузка Core 0/Core 1 и дропы, раз в секунду.    
+static uint32_t t_dbg = 0;
+
+if (millis() - t_dbg >= 1000) {
+    t_dbg = millis();
+
+    Serial.printf(
+        "# CORE0_TASK_LOAD=%lu.%lu%% "
+        "CORE1_LOAD=%lu.%lu%% "
+        "aud_dropped=%lu "
+        "out_dropped=%lu "
+        "clip=%lu\n",
+
+        (unsigned long)(core0_load_permille / 10u),
+        (unsigned long)(core0_load_permille % 10u),
+
+        (unsigned long)(rx_dsp_load_permille() / 10u),
+        (unsigned long)(rx_dsp_load_permille() % 10u),
+
+        (unsigned long)rx_dsp_aud_dropped(),
+        (unsigned long)rx_dsp_out_dropped(),
+        (unsigned long)rx_dsp_clip_count()
+    );
+}
 
 }
