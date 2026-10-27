@@ -69,16 +69,12 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
     }
 
     rsid_callback_count++;
-
-
   
     // ЕДИНСТВЕННАЯ точка печати RSID-метки.  
     Serial.printf("# RSID mode=%s code=%d freq=%.1f\n",  
                   r->mode_name, r->mode_code, r->freq_hz);  
   
     switch (r->mode_code) {  
-
-    // /*
 
     case RSID_CODE_RTTY45:  
         stop_all_goertzel_decoders(); 
@@ -87,6 +83,9 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
         active_dec = DEC_RTTY;
         Serial.printf("# DECODER=RTTY center=%.1f Hz\n", (double)r->freq_hz);  
         break;  
+     
+     /*
+
     case RSID_CODE_CW:  
         stop_all_goertzel_decoders(); 
         rx_cw_init(dec_fs_hz, r->freq_hz);  
@@ -107,14 +106,14 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
         Serial.printf("# DECODER=OLIVIA center=%.1f Hz\n", (double)r->freq_hz);    
         break;
 
-    // */
-
     case RSID_CODE_CONTESTIA_8_250:
         stop_all_goertzel_decoders();
         rx_contestia_init(r->freq_hz);
         active_dec = DEC_CONTESTIA;
         Serial.printf("# DECODER=CONTESTIA center=%.1f Hz\n", (double)r->freq_hz);
         break;
+
+     */
 
     default:  
         Serial.printf("# DECODER unsupported code=%d\n", r->mode_code);  

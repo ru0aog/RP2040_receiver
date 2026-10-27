@@ -89,30 +89,25 @@ static void startReceiver()
 }
 
 
-void setup()  
+void setup()
 {
-    rx_audio_init();  
- 
-    Serial.begin(115200);  
-    // ожидание коннекта - до 5 сек  
-    uint32_t timeout = millis();  
-    while (!Serial && (millis() - timeout < 5000)) {  
-        #if defined(ARDUINO_ARCH_RP2040) && !defined(ARDUINO_ARCH_MBED)  
-        TinyUSBDevice.task();  
-        #endif  
-    }  
+    rx_audio_init();
 
+    Serial.begin(115200);
+
+    // Ожидание подключения Serial — оставить существующий код.
+
+    // Сначала полностью инициализируем RSID.
+    rsid_rx_init(RSID_RX_FS_HZ);
+
+    // Затем запускаем ADC и DSP на ядре 1.
     startReceiver();
- 
-    // RSID-декодер: строит таблицы мод и создаёт FFT-движок (g_fft 2048).  
-    // Без этого вызова rsfft остаётся nullptr и rsid_rx_push() молчит.  
-    rsid_rx_init(RSID_RX_FS_HZ);  
 
-    // Маршрутизатор декодеров: единая точка вывода + смена моды по RSID.  
-    rx_decoders_init(rx_dsp_fs_out());  
+    // Диспетчер декодеров инициализируем после запуска DSP,
+    // поскольку ему нужна фактическая частота выходного потока.
+    rx_decoders_init(rx_dsp_fs_out());
 
-    // Второй USB-CDC для CAT (FLDigi, Kenwood TS-2000).      
-    fldigi_cat_init();    
+    fldigi_cat_init();
 }
   
 // RP2040_receiver.ino  
