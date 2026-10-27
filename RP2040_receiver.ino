@@ -174,12 +174,13 @@ static bool core0_timer_initialized = false;
     // Диагностика: загрузка Core 0/Core 1 и дропы, раз в секунду.    
 static uint32_t t_dbg = 0;
 
+/*
 if (millis() - t_dbg >= 1000) {  
     t_dbg = millis();  
   
     Serial.printf(  
         "# CORE0_TASK_LOAD=%lu.%lu%% "  
-        "CORE1_DSP=%lu.%lu%% CORE1_RSID=%lu.%lu%% "
+        "CORE1_LOAD=%lu.%lu%% "  
         "aud_dropped=%lu "  
         "out_dropped=%lu "  
         "clip=%lu "  
@@ -193,10 +194,7 @@ if (millis() - t_dbg >= 1000) {
         (unsigned long)(rx_dsp_load_permille() / 10u),  
         (unsigned long)(rx_dsp_load_permille() % 10u),  
   
-        (unsigned long)(rx_dsp_rsid_permille() / 10u),  
-        (unsigned long)(rx_dsp_rsid_permille() % 10u),  
-  
-        (unsigned long)rx_dsp_aud_dropped(),
+        (unsigned long)rx_dsp_aud_dropped(),  
         (unsigned long)rx_dsp_out_dropped(),  
         (unsigned long)rx_dsp_clip_count(),  
   
@@ -206,5 +204,7 @@ if (millis() - t_dbg >= 1000) {
         (unsigned long)rsid_rx_sm_state()  
     );  
 }
+
+*/
 
 }

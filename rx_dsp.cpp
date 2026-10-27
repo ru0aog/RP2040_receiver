@@ -535,42 +535,30 @@ void rx_dsp_set_nr(bool on) {
 }  
 bool rx_dsp_get_nr(void) { return nr_enabled; }
 
-// ---- Измерение загрузки Core 1: DSP-блоки и RSID-кванты раздельно ----  
-// dsp_load   — обработка ADC-блоков (обязательная работа, real-time).  
-// rsid_load  — кванты стейт-машины RSID (фоновая работа, вытесняемая).  
-// Перегруз = dsp_load близко к 1000‰ или растёт aud_dropped. RSID легко  
-// съедает весь остаток холостого времени — это НЕ перегруз.  
-static uint32_t busy_dsp_us  = 0;  
-static uint32_t busy_rsid_us = 0;  
-static uint32_t core1_window_start_us = 0;  
-static volatile uint32_t dsp_load_permille  = 0;   // DSP-блоки, ‰  
-static volatile uint32_t rsid_load_permille = 0;   // RSID-кванты, ‰  
-  
-// Доля времени, которую разрешаем отдавать RSID в окне замера (‰).  
-// 600 → RSID ≤60%, DSP ≤~35%, гарантированный запас ~10%+ под неучтённое.  
-#define RSID_MAX_SHARE_PERMILLE 600u  
-  
-static inline void core1_update_load(uint32_t now_us) {  
-    const uint32_t window_us = now_us - core1_window_start_us;  
-    if (window_us < 1000000u) {  
-        return;  
-    }  
-    uint32_t d = busy_dsp_us;  
-    uint32_t r = busy_rsid_us;  
-    if (d > window_us)       d = window_us;  
-    if (r > window_us - d)   r = window_us - d;  
-    dsp_load_permille  = (uint32_t)(((uint64_t)d * 1000u) / window_us);  
-    rsid_load_permille = (uint32_t)(((uint64_t)r * 1000u) / window_us);  
-  
-    busy_dsp_us = 0;  
-    busy_rsid_us = 0;  
-    core1_window_start_us = now_us;  
-}  
-  
-// true, если в текущем окне замера RSID ещё не выбрал свою квоту  
-static inline bool rsid_quota_left(void) {  
-    const uint32_t window_us = time_us_32() - core1_window_start_us;  
-    return busy_rsid_us * 1000u < window_us * RSID_MAX_SHARE_PERMILLE;  
+// ---- Измерение загрузки Core 1 ----
+static uint32_t core1_busy_us = 0;
+static uint32_t core1_window_start_us = 0;
+static volatile uint32_t dsp_load_permille = 0;  // загрузка, промилле (0..1000)
+
+static inline void core1_account_busy(uint32_t elapsed_us) {
+    core1_busy_us += elapsed_us;
+}
+
+static inline void core1_update_load(uint32_t now_us) {
+    const uint32_t window_us = now_us - core1_window_start_us;
+    if (window_us < 1000000u) {
+        return;
+    }
+    uint32_t busy = core1_busy_us;
+    // Защита от некорректного значения.
+    if (busy > window_us) {
+        busy = window_us;
+    }
+    dsp_load_permille =
+        (uint32_t)(((uint64_t)busy * 1000u) / window_us);
+
+    core1_busy_us = 0;
+    core1_window_start_us = now_us;
 }
 
 // бесконечный изолированный рабочий цикл ядра Core 1
@@ -581,23 +569,22 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
     while (true) {
         // кормим собачку
         watchdog_update();
-        // проверяем очередь АЦП (функция в rx_capture.cpp)  
-        const volatile uint32_t* blk = rx_capture_get_block();  
-        if (!blk) {  
-            // Квант RSID — только пока не исчерпана квота RSID_MAX_SHARE_PERMILLE  
-            // в текущем окне замера. Исчерпана → честный idle (запас под неучтённое).  
-            if (rsid_quota_left()) {  
-                const uint32_t t0 = time_us_32();  
-                rsid_rx_service_sliced();  
-                busy_rsid_us += (uint32_t)(time_us_32() - t0);  
-            } else {  
-                tight_loop_contents();  
-            }  
-            core1_update_load(time_us_32());  
-            continue;  
-        }  
-        // Начало обработки ADC-блока: засекаем время.  
+        // Учёт полного времени итерации (включая холостое ожидание).  
         const uint32_t t_busy_start = time_us_32();
+        // проверяем очередь АЦП (функция в rx_capture.cpp)
+        const volatile uint32_t* blk = rx_capture_get_block();
+        if (!blk) {    
+            // Один вычислительный квант стейт-машины RSID. НЕ блокирует ядро на    
+            // весь БПФ+поиск, поэтому не роняет следующий ADC-блок.    
+            rsid_rx_service_sliced();
+            
+            // Учитываем фактическое время вызова RSID.
+            core1_account_busy(time_us_32() - t_busy_start);
+            core1_update_load(time_us_32());
+            
+            tight_loop_contents();    
+            continue;    
+        }
         // данные из DMA пришли
     #if RTTY_DECODE 
         uint8_t wr        = out_head;                           // индекс текущего свободного буфера выходной очереди
@@ -736,8 +723,8 @@ static void __not_in_flash_func(rx_dsp_entry)(void) {
             out_head = next_head;
         }
     #endif
-        // подсчитываем нагрузку Core1 (только обработка ADC-блока → DSP-счётчик)  
-        busy_dsp_us += (uint32_t)(time_us_32() - t_busy_start);  
+        // подсчитываем нагрузку Core1
+        core1_account_busy(time_us_32() - t_busy_start);
         core1_update_load(time_us_32());
     }
 }
@@ -871,9 +858,10 @@ uint32_t rx_dsp_out_dropped(void) {
     return out_dropped;
     }
 
-// Загрузка Core 1 в промилле: DSP-блоки и RSID отдельно.  
-uint32_t rx_dsp_load_permille(void)  { return dsp_load_permille;  }  
-uint32_t rx_dsp_rsid_permille(void)  { return rsid_load_permille; }
+// Загрузка Core 1 в промилле (0..1000), обновляется раз в ~1 с.  
+uint32_t rx_dsp_load_permille(void) {  
+    return dsp_load_permille;  
+}  
   
 // Счётчик дропов аудио-очереди (переполнение aud на Core 1).    
 uint32_t rx_dsp_aud_dropped(void) {    
@@ -933,3 +921,8 @@ uint8_t rx_dsp_aud_fill(void) {
 float rx_dsp_audio_fs(void) {  
     return RX_FS_OUT_HZ;                 // 15625.0 Гц — теперь с выхода HB-цепочки
 }
+
+
+
+
+
