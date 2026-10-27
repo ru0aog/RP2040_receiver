@@ -7,7 +7,13 @@
   
 // Целочисленный Q15 FFT (порт RP2040_beacon/rx_spectrum.cpp) — без FPU и без g_fft.  
 #define RSID_FFT_N    RSID_ARRAY_SIZE          // 2048  
-#define RSID_FFT_HALF (RSID_FFT_N / 2)  
+#define RSID_FFT_HALF (RSID_FFT_N / 2)
+
+// --- Межъядерный шлюз для сэмплов 11025 Гц ---
+#define RSID_SAMPLE_Q_SIZE 1024u
+static int16_t rsid_sample_queue[RSID_SAMPLE_Q_SIZE];
+static volatile uint32_t rsid_sq_head = 0; // Пишет Core 0
+static volatile uint32_t rsid_sq_tail = 0; // Читает Core 1
   
 static inline int16_t sat16(int32_t x) {  
     if (x > 32767) return 32767;  
@@ -15,8 +21,14 @@ static inline int16_t sat16(int32_t x) {
     return (int16_t)x;  
 }  
   
-static volatile uint32_t rsid_dropped_windows = 0;  
-uint32_t rsid_rx_dropped(void) { return rsid_dropped_windows; }  
+static volatile uint32_t rsid_dropped_windows = 0;    
+uint32_t rsid_rx_dropped(void) { return rsid_dropped_windows; }    
+  
+// Заполнение SPSC-очереди сэмплов (0..RSID_SAMPLE_Q_SIZE-1). Диагностика:    
+// постоянно ~полная очередь = Core 1 не успевает забирать сэмплы.    
+uint32_t rsid_rx_queue_fill(void) {    
+    return (rsid_sq_head - rsid_sq_tail) % RSID_SAMPLE_Q_SIZE;    
+}    
   
 // ============================================================================  
 //  Константы RSID (из refs/rsid.h). Вход уже 11025 Гц.  
@@ -35,10 +47,6 @@ uint32_t rsid_rx_dropped(void) { return rsid_dropped_windows; }
 // fldigi: 27 * RSID_SYMLEN отсчётов (10 gap + 15 символов + 2 на ошибки тайминга);  
 // при шаге окна RSID_FFT_SAMPLES (512) это ~27 окон. Берём с запасом.  
 #define RSID_SECONDARY_WINDOWS   60
-  
-// float вместо double — экономия ОЗУ на RP2040.  
-typedef float                       rs_fft_type;  
-typedef std::complex<rs_fft_type>   rs_cpx_type;  
   
 // ============================================================================  
 //  Таблицы мод RSID (code -> имя).  
@@ -140,28 +148,34 @@ static void rsid_encode(int code, unsigned char* rsid /*RSID_NSYMBOLS*/) {
     }  
 }  
 
-// --- Межъядерный шлюз для сэмплов 11025 Гц ---
-#define RSID_SAMPLE_Q_SIZE 1024u
-static int16_t rsid_sample_queue[RSID_SAMPLE_Q_SIZE];
-static volatile uint32_t rsid_sq_head = 0; // Пишет Core 0
-static volatile uint32_t rsid_sq_tail = 0; // Читает Core 1
 
 // --- Переменные асинхронной стейт-машины RSID ---
-enum rsid_state_t {
-    RSID_STATE_IDLE = 0,
-    RSID_STATE_WINDOWING,
-    RSID_STATE_FFT_BITREVERSE,
-    RSID_STATE_FFT_STAGE,
-    RSID_STATE_CALC_AMPL,
-    RSID_STATE_SINK_AND_BUCKETS,
-    RSID_STATE_SEARCH
+enum rsid_state_t {  
+    RSID_STATE_IDLE = 0,  
+    RSID_STATE_WINDOWING,  
+    RSID_STATE_FFT_BITREVERSE,  
+    RSID_STATE_FFT_STAGE,  
+    RSID_STATE_CALC_AMPL,  
+    RSID_STATE_BUCKETS_SHIFT,     // memmove+memset истории fft_buckets  
+    RSID_STATE_BUCKETS_LOW,       // CalculateBuckets по строке bucket_low  
+    RSID_STATE_BUCKETS_HIGH,      // CalculateBuckets по строке bucket_low+1  
+    RSID_STATE_SEARCH  
 };
 
 static rsid_state_t rsid_sm_state = RSID_STATE_IDLE;
 
+// Текущее состояние стейт-машины (0=IDLE..6=SEARCH). Диагностика:    
+// если застряло не в IDLE — конвейер не доходит до поиска.    
+uint32_t rsid_rx_sm_state(void) { return (uint32_t)rsid_sm_state; } 
+
 // Переменные итераторов для сохранения контекста между вызовами  
 static uint16_t fft_len = 2;  
 static uint16_t fft_base = 0;  
+static uint16_t fft_j2  = 0;      // бабочка внутри группы (квантуем по 64)  
+  
+// Сколько бабочек БПФ считать за один квант FFT_STAGE.  
+// 64 умножения+сложения int32 — ~20-30 мкс на M0+ @316 МГц.  
+#define RSID_FFT_BUTTERFLY_CHUNK 64u
   
 // Бюджет времени на один заход rsid_rx_service_sliced() (мкс).  
 // Несколько коротких квантов, но суммарно < интервала ADC-блока (4.096 мс).  
@@ -209,8 +223,6 @@ static int   hamming_resolution = RSID_HAMMING_RESOLUTION;
 static int   rsid_secondary_windows = 0;  
   
 static rsid_detect_cb_t s_cb = nullptr;  
-static rsid_fft_sink_t  s_fft_sink = nullptr;  
-void rsid_rx_set_fft_sink(rsid_fft_sink_t sink) { s_fft_sink = sink; }
 
 // --- Почтовый ящик детекта: пишется на Core 1, читается на Core 0.  
 static volatile bool rsid_det_pending = false;  
@@ -243,44 +255,7 @@ static void rsid_reset_state(void) {
     inptr = RSID_FFT_SIZE;  
     memset(aInputSamples, 0, sizeof(aInputSamples));
     rsid_reset_detect();
-    srch_i = 0;
 }
-
-// In-place radix-2 DIT, деление на 2 на каждой стадии (значения в Q15).  
-static void fft_q15(void) {  
-    uint16_t j = 0;  
-    for (uint16_t i = 1; i < RSID_FFT_N; ++i) {  
-        uint16_t bit = RSID_FFT_HALF;  
-        while (j & bit) { j ^= bit; bit >>= 1; }  
-        j ^= bit;  
-        if (i < j) {  
-            int16_t t;  
-            t = fft_i[i]; fft_i[i] = fft_i[j]; fft_i[j] = t;  
-            t = fft_q[i]; fft_q[i] = fft_q[j]; fft_q[j] = t;  
-        }  
-    }  
-    for (uint16_t len = 2; len <= RSID_FFT_N; len <<= 1) {  
-        const uint16_t half = len >> 1;  
-        const uint16_t tw_step = RSID_FFT_N / len;  
-        for (uint16_t base = 0; base < RSID_FFT_N; base += len) {  
-            for (uint16_t j2 = 0; j2 < half; ++j2) {  
-                const uint16_t tw = j2 * tw_step;  
-                const int32_t wr = tw_re[tw];  
-                const int32_t wi = tw_im[tw];  
-                const uint16_t a = base + j2;  
-                const uint16_t b = a + half;  
-                const int32_t br = fft_i[b], bi = fft_q[b];  
-                const int32_t tr = (br * wr - bi * wi) >> 15;  
-                const int32_t ti = (br * wi + bi * wr) >> 15;  
-                const int32_t ar = fft_i[a], ai = fft_q[a];  
-                fft_i[a] = sat16((ar + tr) >> 1);  
-                fft_q[a] = sat16((ai + ti) >> 1);  
-                fft_i[b] = sat16((ar - tr) >> 1);  
-                fft_q[b] = sat16((ai - ti) >> 1);  
-            }  
-        }  
-    }  
-}  
   
 // ----------------------------------------------------------------------------  
 //  CalculateBuckets (refs/rsid.cxx, без изменений логики).  
@@ -452,8 +427,11 @@ bool rsid_get_rtty_center(float* f_hz) {
 void rsid_rx_service_sliced(void) {
     if (!rsid_inited) return;
 
-    // --- ФАЗА 0: Попутный сбор сэмплов из Lock-Free шлюза (всегда на полной скорости) ---
-    while (rsid_sq_tail != rsid_sq_head) {
+    // --- ФАЗА 0: Попутный сбор сэмплов. Не более 256 сэмплов за заход,  
+    // чтобы при скоплении очереди не удерживать Core 1 дольше бюджета.  
+    uint32_t samples_done = 0;  
+    while (rsid_sq_tail != rsid_sq_head && samples_done < 256u) {  
+        samples_done++;
         uint32_t tail = rsid_sq_tail;
         int16_t sample = rsid_sample_queue[tail];
         
@@ -517,42 +495,49 @@ void rsid_rx_service_sliced(void) {
                     t = fft_q[i]; fft_q[i] = fft_q[j]; fft_q[j] = t;  
                 }  
             }
-            fft_len = 2; // Инициализируем итераторы для стадий БПФ
-            fft_base = 0;
-            rsid_sm_state = RSID_STATE_FFT_STAGE;
+            fft_len = 2; // Инициализируем итераторы для стадий БПФ  
+            fft_base = 0;  
+            fft_j2   = 0;  
+            rsid_sm_state = RSID_STATE_FFT_STAGE;  
             break;
         }
 
-        case RSID_STATE_FFT_STAGE: {
-            // Считаем только ОДНУ базовую группу бабочек за один вызов функции
-            const uint16_t half = fft_len >> 1;  
-            const uint16_t tw_step = RSID_FFT_N / fft_len;  
-            
-            for (uint16_t j2 = 0; j2 < half; ++j2) {  
-                const uint16_t tw = j2 * tw_step;  
-                const int32_t wr = tw_re[tw];  
-                const int32_t wi = tw_im[tw];  
-                const uint16_t a = fft_base + j2;  
-                const uint16_t b = a + half;  
-                const int32_t br = fft_i[b], bi = fft_q[b];  
-                const int32_t tr = (br * wr - bi * wi) >> 15;  
-                const int32_t ti = (br * wi + bi * wr) >> 15;  
-                const int32_t ar = fft_i[a], ai = fft_q[a];  
-                fft_i[a] = sat16((ar + tr) >> 1);  
-                fft_q[a] = sat16((ai + ti) >> 1);  
-                fft_i[b] = sat16((ar - tr) >> 1);  
-                fft_q[b] = sat16((ai - ti) >> 1);  
+        case RSID_STATE_FFT_STAGE: {  
+            // Считаем ЧАСТЬ бабочек текущей группы (до RSID_FFT_BUTTERFLY_CHUNK)  
+            const uint16_t half = fft_len >> 1;    
+            const uint16_t tw_step = RSID_FFT_N / fft_len;    
+  
+            uint16_t todo = half - fft_j2;  
+            if (todo > RSID_FFT_BUTTERFLY_CHUNK) todo = RSID_FFT_BUTTERFLY_CHUNK;  
+  
+            for (uint16_t k = 0; k < todo; ++k, ++fft_j2) {  
+                const uint16_t tw = fft_j2 * tw_step;  
+                const int32_t wr = tw_re[tw];    
+                const int32_t wi = tw_im[tw];    
+                const uint16_t a = fft_base + fft_j2;    
+                const uint16_t b = a + half;    
+                const int32_t br = fft_i[b], bi = fft_q[b];    
+                const int32_t tr = (br * wr - bi * wi) >> 15;    
+                const int32_t ti = (br * wi + bi * wr) >> 15;    
+                const int32_t ar = fft_i[a], ai = fft_q[a];    
+                fft_i[a] = sat16((ar + tr) >> 1);    
+                fft_q[a] = sat16((ai + ti) >> 1);    
+                fft_i[b] = sat16((ar - tr) >> 1);    
+                fft_q[b] = sat16((ai - ti) >> 1);    
+            }    
+  
+            if (fft_j2 >= half) {          // группа закончилась — следующий base  
+                fft_j2 = 0;  
+                fft_base += fft_len;  
+                if (fft_base >= RSID_FFT_N) {  
+                    fft_base = 0;  
+                    fft_len <<= 1;  
+                    if (fft_len > RSID_FFT_N) {  
+                        rsid_sm_state = RSID_STATE_CALC_AMPL;  
+                    }  
+                }  
             }  
-
-            fft_base += fft_len;
-            if (fft_base >= RSID_FFT_N) {
-                fft_base = 0;
-                fft_len <<= 1;
-                if (fft_len > RSID_FFT_N) {
-                    rsid_sm_state = RSID_STATE_CALC_AMPL;
-                }
-            }
-            break;
+            break;  
         }
 
         case RSID_STATE_CALC_AMPL:
@@ -561,27 +546,30 @@ void rsid_rx_service_sliced(void) {
                 const int32_t im = fft_q[i];  
                 aFFTAmpl[i] = (uint64_t)((int64_t)re * re + (int64_t)im * im);  
             }
-            rsid_sm_state = RSID_STATE_SINK_AND_BUCKETS;
+            rsid_sm_state = RSID_STATE_BUCKETS_SHIFT;
             break;
 
-        case RSID_STATE_SINK_AND_BUCKETS: {
-            if (s_fft_sink) {
-                s_fft_sink(aFFTAmpl, RSID_FFT_SIZE, (float)(RSID_SAMPLE_RATE / 2048.0));
-            }
-
-            int bucket_low  = 3;  
-            int bucket_high = RSID_FFT_SIZE - 32;  
-          
-            memmove(fft_buckets, &(fft_buckets[1][0]),  
-                    (RSID_NTIMES - 1) * RSID_FFT_SIZE * sizeof(fft_buckets[0][0]));  
-            memset(&(fft_buckets[RSID_NTIMES - 1][0]), 0, RSID_FFT_SIZE * sizeof(fft_buckets[0][0]));  
-          
-            CalculateBuckets(aFFTAmpl, bucket_low,     bucket_high - RSID_NTIMES);  
-            CalculateBuckets(aFFTAmpl, bucket_low + 1, bucket_high - RSID_NTIMES);  
-            
-            rsid_sm_state = RSID_STATE_SEARCH;
+        case RSID_STATE_BUCKETS_SHIFT: {  
+            // Переход из CALC_AMPL: сдвиг истории бакетов (memmove ~60 КБ, ~50 мкс)  
+            memmove(fft_buckets, &(fft_buckets[1][0]),    
+                    (RSID_NTIMES - 1) * RSID_FFT_SIZE * sizeof(fft_buckets[0][0]));    
+            memset(&(fft_buckets[RSID_NTIMES - 1][0]), 0,  
+                    RSID_FFT_SIZE * sizeof(fft_buckets[0][0]));    
+            rsid_sm_state = RSID_STATE_BUCKETS_LOW;  
+            break;  
+        }  
+  
+        case RSID_STATE_BUCKETS_LOW:  
+            // Первая строка бакетов (чётные бины) — ~500 CalculateBuckets-итераций  
+            CalculateBuckets(aFFTAmpl, nBinLow, nBinHigh - RSID_NTIMES);  
+            rsid_sm_state = RSID_STATE_BUCKETS_HIGH;  
+            break;  
+  
+        case RSID_STATE_BUCKETS_HIGH:  
+            // Вторая строка (смещённая на 1 бин)  
+            CalculateBuckets(aFFTAmpl, nBinLow + 1, nBinHigh - RSID_NTIMES);  
+            rsid_sm_state = RSID_STATE_SEARCH;  
             break;
-        }
 
         case RSID_STATE_SEARCH: {  
             // Выбор таблицы фиксирован на всё время перебора окна  

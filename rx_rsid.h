@@ -59,11 +59,14 @@ void rsid_rx_push(int16_t sample);
 // Оставлен для совместимости; в горячем пути НЕ используется.  
 void rsid_rx_service(void);  
   
-// Квантованный (пошаговый) обработчик RSID для Core 1: за один вызов  
-// выполняет один вычислительный квант стейт-машины, не блокируя ядро  
-// на всё время БПФ/поиска. Вызывается из холостой ветки цикла Core 1.  
+// Высокопроизводительный пошаговый (квантованный) обработчик для Core 1  
 void rsid_rx_service_sliced(void);  
-  
+
+// Диагностика RSID: пропущенные окна, заполнение очереди сэмплов, состояние SM.    
+uint32_t rsid_rx_dropped(void);    
+uint32_t rsid_rx_queue_fill(void);    
+uint32_t rsid_rx_sm_state(void);
+
 // Отложенная ДИСПЕТЧЕРИЗАЦИЯ результата RSID (печать метки + смена моды).  
 // Вызывать из loop() на Core 0. Сам тяжёлый поиск идёт на Core 1.  
 void rsid_rx_dispatch(void);  
@@ -78,11 +81,6 @@ void rsid_rx_reset(void);
 // Вернуть найденный по FFT центр пары mark/space RTTY (Гц). true — если  
 // с прошлого вызова появился новый центр. Подаётся в rx_mf_init().  
 bool rsid_get_rtty_center(float* f_hz);  
-  
-// Сток спектра IFKP: вызывается каждое FFT-окно (нижняя половина спектра).  
-//   ampl[nbins] — мощности бинов, bin_hz = RSID_SAMPLE_RATE/2048 ≈ 5.383 Гц.  
-typedef void (*rsid_fft_sink_t)(const uint64_t* ampl, int nbins, float bin_hz);  
-void rsid_rx_set_fft_sink(rsid_fft_sink_t sink);  
   
 #ifdef __cplusplus  
 }  
