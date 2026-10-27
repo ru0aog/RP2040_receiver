@@ -15,12 +15,14 @@
 #include "rx_ifkp.h"
 #include "rx_olivia.h"
 #include "rx_contestia.h"
+#include "rx_jtty.h"
   
 // Коды мод из таблицы RSID (см. логи: RTTY-45=39, CW=26).  
 #define RSID_CODE_RTTY45   39  
 #define RSID_CODE_CW       26  
 #define RTTY_SHIFT_HZ      170.0f
 #define RSID_CODE_IFKP     1171
+#define RSID_CODE_JTTY     1172
 #define RSID_CODE_OLIVIA_8_250      69
 #define RSID_CODE_CONTESTIA_8_250   49
 
@@ -30,7 +32,8 @@ enum {
     DEC_CW,
     DEC_IFKP,
     DEC_OLIV,
-    DEC_CONTESTIA
+    DEC_CONTESTIA, 
+    DEC_JTTY
 };
   
 static int   active_dec = DEC_NONE;  
@@ -53,6 +56,7 @@ void rx_decoders_sample(int16_t m) {
     case DEC_IFKP:      rx_ifkp_push(m);        break;
     case DEC_OLIV:      rx_olivia_push(m);      break;
     case DEC_CONTESTIA: rx_contestia_push(m);   break;
+    case DEC_JTTY:      rx_jtty_push(m);        break;
     default:                                    break;   // DEC_NONE — пока метки нет, не декодируем  
     }  
 }
@@ -113,7 +117,12 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
         Serial.printf("# DECODER=CONTESTIA center=%.1f Hz\n", (double)r->freq_hz);
         break;
 
-    // */
+    case RSID_CODE_JTTY:   // код уточнить — в стандартной таблице может отсутствовать  
+         stop_all_goertzel_decoders();  
+         rx_jtty_init(r->freq_hz);  
+         active_dec = DEC_JTTY;  
+         Serial.printf("# DECODER=JTTY center=%.1f Hz\n", (double)r->freq_hz);  
+         break;
 
     default:  
         Serial.printf("# DECODER unsupported code=%d\n", r->mode_code);  
@@ -135,6 +144,7 @@ static void stop_all_goertzel_decoders() {
     else if (active_dec == DEC_IFKP)        { rx_ifkp_stop();       }
     else if (active_dec == DEC_OLIV)        { rx_olivia_stop();     }
     else if (active_dec == DEC_CONTESTIA)   { rx_contestia_stop();  }
+    else if (active_dec == DEC_JTTY)        { rx_jtty_stop();       }
 }
 
 void rx_decoders_init(float fs_hz) {  
