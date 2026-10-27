@@ -13,15 +13,16 @@
 #include "rx_cw.h"
 #include "rx_rtty.h"
 #include "rx_ifkp.h"
-
+#include "rx_olivia.h" 
   
 // Коды мод из таблицы RSID (см. логи: RTTY-45=39, CW=26).  
 #define RSID_CODE_RTTY45   39  
 #define RSID_CODE_CW       26  
 #define RTTY_SHIFT_HZ      170.0f
-#define RSID_CODE_IFKP     1171 
+#define RSID_CODE_IFKP     1171
+#define RSID_CODE_OLIVIA_8_250  69
 
-enum { DEC_NONE = 0, DEC_RTTY, DEC_CW, DEC_IFKP }; 
+enum { DEC_NONE = 0, DEC_RTTY, DEC_CW, DEC_IFKP, DEC_OLIV }; 
   
 static int   active_dec = DEC_NONE;  
 static float dec_fs_hz  = 15625.0f;  
@@ -38,7 +39,8 @@ void rx_decoders_sample(int16_t m) {
     switch (active_dec) {  
     case DEC_RTTY: rx_mf_sample(m, 0); break;  
     case DEC_CW:   rx_cw_sample(m); break;
-    case DEC_IFKP: rx_ifkp_push(m); break;   // добавить 
+    case DEC_IFKP: rx_ifkp_push(m); break;
+    case DEC_OLIV: rx_olivia_push(m); break;
     default:       break;   // DEC_NONE — пока метки нет, не декодируем  
     }  
 }
@@ -53,14 +55,14 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
   
     switch (r->mode_code) {  
     case RSID_CODE_RTTY45:  
-        rx_ifkp_stop();  
+        // rx_ifkp_stop();  
         active_dec = DEC_RTTY;  
         rx_mf_init(dec_fs_hz, r->freq_hz, RTTY_SHIFT_HZ);  
         rx_rtty_init(dec_fs_hz);  
         Serial.printf("# DECODER=RTTY center=%.1f Hz\n", (double)r->freq_hz);  
         break;  
     case RSID_CODE_CW:  
-        rx_ifkp_stop();  
+        // rx_ifkp_stop();  
         active_dec = DEC_CW;  
         rx_cw_init(dec_fs_hz, r->freq_hz);  
         Serial.printf("# DECODER=CW center=%.1f Hz\n", (double)r->freq_hz);  
@@ -70,12 +72,21 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
         rx_ifkp_init(r->freq_hz);           // первично — центр из RSID  
         Serial.printf("# DECODER=IFKP center=%.1f Hz\n", (double)r->freq_hz);  
         break;
+    case RSID_CODE_OLIVIA_8_250:  
+        // Глушим ТОЛЬКО активный декодер — rx_ifkp_stop() на неактивном  
+        // декодере ломал тракт (трогает разделяемый GB-банк/флаги).  
+        if (active_dec == DEC_IFKP) rx_ifkp_stop();  
+        else if (active_dec == DEC_OLIV) rx_olivia_stop();  
+        active_dec = DEC_OLIV; 
+        rx_olivia_init(r->freq_hz);         // центр из RSID, банк Гёрцеля 8 тонов  
+        Serial.printf("# DECODER=OLIVIA center=%.1f Hz\n", (double)r->freq_hz);    
+        break;
     default:  
         Serial.printf("# DECODER unsupported code=%d\n", r->mode_code);  
         break;  
     }  
 }  
-  
+
 void rx_decoders_init(float fs_hz) {  
     dec_fs_hz  = (fs_hz > 1.0f) ? fs_hz : 15625.0f;  
     active_dec = DEC_NONE;  

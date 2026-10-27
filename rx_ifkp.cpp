@@ -30,7 +30,7 @@ static int    base_delta = -1; static bool have_base = false;
   
   
 void rx_ifkp_init(float center_hz) {  
-    base_hz = center_hz - IFKP_OFFSET_HZ;  
+    base_hz = center_hz - IFKP_OFFSET_HZ;
     memset(tpwr, 0, sizeof(tpwr));  
     peak = 0; prev_peak = -1; last_peak = -1; peak_counter = 0;  
     prev_tone = -1; have_prev = false;  

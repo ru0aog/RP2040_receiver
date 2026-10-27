@@ -9,17 +9,47 @@ static int      g_ntones = 0, g_block_n = 1024, g_cnt = 0;
 static int32_t  g_coeff[GB_MAX_TONES];                 // Q14  
 static int32_t  g_q1[GB_MAX_TONES], g_q2[GB_MAX_TONES]; // состояние резонатора
   
-void gb_init(const gb_cfg_t* c) {  
-    g_ntones  = (c->ntones > GB_MAX_TONES) ? GB_MAX_TONES : c->ntones;  
-    g_block_n = c->block_n;  
-    for (int i = 0; i < g_ntones; i++) {  
-        float f = c->base_hz + i * c->step_hz;  
-        float w = 2.0f * (float)M_PI * f / c->fs_hz;  
-        // Q14. cosf/lroundf — только при инициализации (холодный путь).  
-        g_coeff[i] = (int32_t)lroundf(2.0f * cosf(w) * (float)(1 << GB_COEFF_SHIFT));  
+void gb_init(const gb_cfg_t* c)
+{
+    if (c == nullptr ||
+        c->ntones <= 0 ||
+        c->ntones > GB_MAX_TONES ||
+        c->block_n <= 0 ||
+        c->fs_hz <= 0.0f ||
+        c->step_hz < 0.0f) {
+
+        g_ntones = 0;
+        g_block_n = 0;
+        g_cnt = 0;
+
+        memset(g_coeff, 0, sizeof(g_coeff));
+        memset(g_q1, 0, sizeof(g_q1));
+        memset(g_q2, 0, sizeof(g_q2));
+        return;
     }
-    gb_reset();  
-}  
+
+    g_ntones = c->ntones;
+    g_block_n = c->block_n;
+
+    for (int i = 0; i < g_ntones; i++) {
+        const float f = c->base_hz + i * c->step_hz;
+
+        if (f < 0.0f || f >= c->fs_hz * 0.5f) {
+            g_ntones = 0;
+            g_block_n = 0;
+            gb_reset();
+            return;
+        }
+
+        const float w = 2.0f * (float)M_PI * f / c->fs_hz;
+
+        g_coeff[i] = (int32_t)lroundf(
+            2.0f * cosf(w) * (float)(1 << GB_COEFF_SHIFT)
+        );
+    }
+
+    gb_reset();
+} 
   
 void gb_reset(void) {  
     memset(g_q1, 0, sizeof(g_q1));  
@@ -31,6 +61,10 @@ void gb_reset(void) {
 // + сдвиг + сложения на тон. Состояние q1/q2 в int32 (при block_n<=4096 и  
 // полношкальном входе рост <~8e7, запас к 2^31 большой).  
 bool gb_push(int16_t x, float* pwr) {  
+    if (g_ntones <= 0 || g_block_n <= 0 || pwr == nullptr) {
+        return false;
+    }
+
     int32_t s = (int32_t)x;  
     for (int i = 0; i < g_ntones; i++) {  
         int32_t q1 = g_q1[i];  
