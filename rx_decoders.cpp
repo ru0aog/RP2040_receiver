@@ -58,27 +58,27 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
     switch (r->mode_code) {  
     case RSID_CODE_RTTY45:  
         stop_all_goertzel_decoders(); 
-        active_dec = DEC_RTTY;  
         rx_mf_init(dec_fs_hz, r->freq_hz, RTTY_SHIFT_HZ);  
         rx_rtty_init(dec_fs_hz);  
+        active_dec = DEC_RTTY;
         Serial.printf("# DECODER=RTTY center=%.1f Hz\n", (double)r->freq_hz);  
         break;  
     case RSID_CODE_CW:  
         stop_all_goertzel_decoders(); 
-        active_dec = DEC_CW;  
         rx_cw_init(dec_fs_hz, r->freq_hz);  
+        active_dec = DEC_CW;
         Serial.printf("# DECODER=CW center=%.1f Hz\n", (double)r->freq_hz);  
         break;  
     case RSID_CODE_IFKP:
         stop_all_goertzel_decoders(); 
-        active_dec = DEC_IFKP;  
         rx_ifkp_init(r->freq_hz);           // первично — центр из RSID  
+        active_dec = DEC_IFKP;
         Serial.printf("# DECODER=IFKP center=%.1f Hz\n", (double)r->freq_hz);  
         break;
     case RSID_CODE_OLIVIA_8_250:  
         stop_all_goertzel_decoders();  
-        active_dec = DEC_OLIV; 
         rx_olivia_init(r->freq_hz);         // центр из RSID, банк Гёрцеля 8 тонов  
+        active_dec = DEC_OLIV;
         Serial.printf("# DECODER=OLIVIA center=%.1f Hz\n", (double)r->freq_hz);    
         break;
     default:  
