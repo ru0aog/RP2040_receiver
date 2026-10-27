@@ -174,8 +174,8 @@ static bool core0_timer_initialized = false;
     // Диагностика: загрузка Core 0/Core 1 и дропы, раз в секунду.    
 static uint32_t t_dbg = 0;
 
-/*
-if (millis() - t_dbg >= 1000) {  
+
+if (millis() - t_dbg >= 10000) {  
     t_dbg = millis();  
   
     Serial.printf(  
@@ -205,6 +205,6 @@ if (millis() - t_dbg >= 1000) {
     );  
 }
 
-*/
+
 
 }

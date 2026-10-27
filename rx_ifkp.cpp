@@ -17,7 +17,7 @@
 #define IFKP_PEAK_HITS     2  
 // Сглаживание энергии тона между окнами (аналог binfilt Cmovavg в FLDigi).  
 #define IFKP_SMOOTH_A      0.3f   // ~ movavg 4 окна (как binfilt FLDigi для IFKP 0.5)
-  
+
 static bool   active = false;  
 static float  base_hz = 0.0f;  
   
