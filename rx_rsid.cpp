@@ -172,8 +172,22 @@ static rsid_state_t rsid_sm_state = RSID_STATE_IDLE;
 uint32_t rsid_rx_sm_state(void) { return (uint32_t)rsid_sm_state; } 
 
 // Переменные итераторов для сохранения контекста между вызовами  
-static uint16_t fft_len = 2;  
-static uint16_t fft_base = 0;  
+static uint16_t fft_len = 2;    
+static uint16_t fft_base = 0;    
+  
+// Размер чанка нарезанных стадий за один квант (бинов/отсчётов).  
+#define RSID_CHUNK   128  
+  
+// Итераторы нарезанных стадий — живут между квантами.  
+static uint16_t w_i      = 0;     // WINDOWING: позиция в окне  
+static uint16_t br_i     = 1;     // BITREVERSE: i  
+static uint16_t br_j     = 0;     // BITREVERSE: бегущий bit-reversed счётчик  
+static int      ampl_i   = 0;     // CALC_AMPL: бин  
+static int      bkt_phase = 0;    // SINK_AND_BUCKETS: 0=shift 1=memset 2=even 3=odd  
+static int      bkt_row   = 0;    // SINK_AND_BUCKETS: строка memmove  
+static int      bkt_i     = 0;    // CalculateBuckets: текущий бин  
+static int      bkt_imax  = 0;    // CalculateBuckets: скользящий argmax  
+static uint64_t bkt_ampmax = 0;   // CalculateBuckets: скользящий max 
   
 // Бюджет времени на один заход rsid_rx_service_sliced() (мкс).  
 // Несколько коротких квантов, но суммарно < интервала ADC-блока (4.096 мс).  
@@ -255,29 +269,36 @@ static void rsid_reset_state(void) {
     rsid_reset_detect();
 }
   
-// ----------------------------------------------------------------------------  
-//  CalculateBuckets (refs/rsid.cxx, без изменений логики).  
-// ----------------------------------------------------------------------------  
-static void CalculateBuckets(const uint64_t* pSpectrum, int iBegin, int iEnd) {  
-    uint64_t Amp = 0, AmpMax = 0;  
-    int iBucketMax = iBegin - 2;  
-    int j;  
-    for (int i = iBegin; i < iEnd; i += 2) {  
-        if (iBucketMax == i - 2) {  
-            AmpMax = pSpectrum[i];  
-            iBucketMax = i;  
-            for (j = i + 2; j < i + RSID_NTIMES + 2; j += 2) {  
-                Amp = pSpectrum[j];  
-                if (Amp > AmpMax) { AmpMax = Amp; iBucketMax = j; }  
+// Инициализация прохода CalculateBuckets (вызывать при смене начального бина).  
+static inline void buckets_begin(int iBegin) {  
+    bkt_i      = iBegin;  
+    bkt_imax   = iBegin - 2;  
+    bkt_ampmax = 0;  
+}  
+  
+// Один чанк CalculateBuckets: до RSID_CHUNK бинов с шагом 2.  
+// Скользящий максимум живёт в bkt_ampmax/bkt_imax между квантами.  
+// Возвращает true, когда проход iBegin..iEnd завершён.  
+static bool buckets_step(const uint64_t* pSpectrum, int iEnd) {  
+    int n = 0;  
+    for (; bkt_i < iEnd && n < RSID_CHUNK; bkt_i += 2, n++) {  
+        const int i = bkt_i;  
+        if (bkt_imax == i - 2) {  
+            bkt_ampmax = pSpectrum[i];  
+            bkt_imax = i;  
+            for (int j = i + 2; j < i + RSID_NTIMES + 2; j += 2) {  
+                const uint64_t Amp = pSpectrum[j];  
+                if (Amp > bkt_ampmax) { bkt_ampmax = Amp; bkt_imax = j; }  
             }  
         } else {  
-            j = i + RSID_NTIMES;  
-            Amp = pSpectrum[j];  
-            if (Amp > AmpMax) { AmpMax = Amp; iBucketMax = j; }  
+            const int j = i + RSID_NTIMES;  
+            const uint64_t Amp = pSpectrum[j];  
+            if (Amp > bkt_ampmax) { bkt_ampmax = Amp; bkt_imax = j; }  
         }  
-        fft_buckets[RSID_NTIMES - 1][i] = (int16_t)((iBucketMax - i) >> 1);  
+        fft_buckets[RSID_NTIMES - 1][i] = (int16_t)((bkt_imax - i) >> 1);  
     }  
-}  
+    return (bkt_i >= iEnd);  
+}
   
 // ----------------------------------------------------------------------------  
 //  HammingDistance / search_amp (refs/rsid.cxx).  
@@ -450,7 +471,9 @@ void rsid_rx_service_sliced(void) {
     }
 
     // --- ФАЗА 0: Попутный сбор сэмплов из Lock-Free шлюза (всегда на полной скорости) ---
-    while (rsid_sq_tail != rsid_sq_head) {
+    // Не более 256 сэмплов за вызов — иначе полная очередь (1024)  
+    // обслуживается одним неделимым заходом и ломает таймбюджет.  
+    for (int n = 0; n < 256 && rsid_sq_tail != rsid_sq_head; n++) {  
         uint32_t tail = rsid_sq_tail;
         int16_t sample = rsid_sample_queue[tail];
         
@@ -486,40 +509,51 @@ void rsid_rx_service_sliced(void) {
   
     switch (rsid_sm_state) {  
           
-        case RSID_STATE_IDLE:  
-        if (rsid_win_tail != rsid_win_head) {       // есть готовое окно  
-            rsid_cur_slot = rsid_win_tail;          // фиксируем слот на весь конвейер  
-            rsid_sm_state = RSID_STATE_WINDOWING;  
-        }  
+    case RSID_STATE_IDLE:    
+        if (rsid_win_tail != rsid_win_head) {       // есть готовое окно    
+            rsid_cur_slot = rsid_win_tail;          // фиксируем слот на весь конвейер    
+            // Сброс итераторов нарезанных стадий на новое окно.  
+            w_i = 0; br_i = 1; br_j = 0;  
+            ampl_i = RSID_BIN_LOW - 2;  
+            bkt_phase = 0; bkt_row = 0;  
+            rsid_sm_state = RSID_STATE_WINDOWING;    
+        }    
         break;
 
         case RSID_STATE_WINDOWING:  
-        nBinLow  = RSID_BIN_LOW;  
-        nBinHigh = RSID_BIN_HIGH;
-        for (int i = 0; i < RSID_FFT_N; i++) {  
-            int32_t xi = (int32_t)rsid_proc[rsid_cur_slot][i];  
-            fft_i[i] = (int16_t)(((int32_t)xi * window_q15[i]) >> 15);  
-            fft_q[i] = 0;  
+        if (w_i == 0) {               // первый чанк окна  
+            nBinLow  = RSID_BIN_LOW;  
+            nBinHigh = RSID_BIN_HIGH;  
         }  
-        rsid_sm_state = RSID_STATE_FFT_BITREVERSE;  
+        for (int n = 0; n < RSID_CHUNK && w_i < RSID_FFT_N; n++, w_i++) {  
+            int32_t xi = (int32_t)rsid_proc[rsid_cur_slot][w_i];  
+            fft_i[w_i] = (int16_t)(((int32_t)xi * window_q15[w_i]) >> 15);  
+            fft_q[w_i] = 0;  
+        }  
+        if (w_i >= RSID_FFT_N)  
+            rsid_sm_state = RSID_STATE_FFT_BITREVERSE;  
         break;
 
-        case RSID_STATE_FFT_BITREVERSE: {
-            uint16_t j = 0;  
-            for (uint16_t i = 1; i < RSID_FFT_N; ++i) {  
+        case RSID_STATE_FFT_BITREVERSE: {  
+            // br_j — бегущий bit-reversed счётчик, пересчитывать с нуля нельзя:  
+            // он зависит от всей предыстории, поэтому живёт в static.  
+            int n = 0;  
+            for (; br_i < RSID_FFT_N && n < RSID_CHUNK; ++br_i, ++n) {  
                 uint16_t bit = RSID_FFT_HALF;  
-                while (j & bit) { j ^= bit; bit >>= 1; }  
-                j ^= bit;  
-                if (i < j) {  
+                while (br_j & bit) { br_j ^= bit; bit >>= 1; }  
+                br_j ^= bit;  
+                if (br_i < br_j) {  
                     int16_t t;  
-                    t = fft_i[i]; fft_i[i] = fft_i[j]; fft_i[j] = t;  
-                    t = fft_q[i]; fft_q[i] = fft_q[j]; fft_q[j] = t;  
+                    t = fft_i[br_i]; fft_i[br_i] = fft_i[br_j]; fft_i[br_j] = t;  
+                    t = fft_q[br_i]; fft_q[br_i] = fft_q[br_j]; fft_q[br_j] = t;  
                 }  
-            }
-            fft_len = 2; // Инициализируем итераторы для стадий БПФ
-            fft_base = 0;
-            rsid_sm_state = RSID_STATE_FFT_STAGE;
-            break;
+            }  
+            if (br_i >= RSID_FFT_N) {  
+                fft_len = 2;   // Инициализируем итераторы для стадий БПФ  
+                fft_base = 0;  
+                rsid_sm_state = RSID_STATE_FFT_STAGE;  
+            }  
+            break;  
         }
 
         case RSID_STATE_FFT_STAGE: {
@@ -555,34 +589,49 @@ void rsid_rx_service_sliced(void) {
         }
 
         case RSID_STATE_CALC_AMPL:  
-            for (int i = RSID_BIN_LOW - 2; i < RSID_BIN_HIGH; i++) {  
-                const int32_t re = fft_i[i];  
-                const int32_t im = fft_q[i];  
-                aFFTAmpl[i] = (uint64_t)((int64_t)re * re + (int64_t)im * im);  
+            // ampl_i инициализирован в IDLE значением RSID_BIN_LOW - 2  
+            // (минимальный индекс, читаемый CalculateBuckets: iBegin - 2).  
+            for (int n = 0; n < RSID_CHUNK && ampl_i < RSID_BIN_HIGH; n++, ampl_i++) {  
+                const int32_t re = fft_i[ampl_i];  
+                const int32_t im = fft_q[ampl_i];  
+                aFFTAmpl[ampl_i] = (uint64_t)((int64_t)re * re + (int64_t)im * im);  
             }  
-            rsid_sm_state = RSID_STATE_SINK_AND_BUCKETS;  
+            if (ampl_i >= RSID_BIN_HIGH)  
+                rsid_sm_state = RSID_STATE_SINK_AND_BUCKETS;  
             break;
 
-        case RSID_STATE_SINK_AND_BUCKETS: {
-            // возможная точка подключения спектроанализатора
-            // if (s_fft_sink) {
-            //     s_fft_sink(aFFTAmpl, RSID_FFT_SIZE, (float)(RSID_SAMPLE_RATE / 2048.0));}
-
-            int bucket_low  = RSID_BIN_LOW;  
-            int bucket_high = RSID_BIN_HIGH;
-          
-            const int bw = RSID_BIN_HIGH - RSID_BIN_LOW;  
-            for (int r = 0; r < RSID_NTIMES - 1; r++)  
-                memmove(&fft_buckets[r][RSID_BIN_LOW], &fft_buckets[r + 1][RSID_BIN_LOW],  
-                        bw * sizeof(fft_buckets[0][0]));  
-            memset(&fft_buckets[RSID_NTIMES - 1][RSID_BIN_LOW], 0,  
-                   bw * sizeof(fft_buckets[0][0]));
-          
-            CalculateBuckets(aFFTAmpl, bucket_low,     bucket_high - RSID_NTIMES);  
-            CalculateBuckets(aFFTAmpl, bucket_low + 1, bucket_high - RSID_NTIMES);  
-            
-            rsid_sm_state = RSID_STATE_SEARCH;
-            break;
+        case RSID_STATE_SINK_AND_BUCKETS: {  
+            const int bw   = RSID_BIN_HIGH - RSID_BIN_LOW;  
+            const int iEnd = RSID_BIN_HIGH - RSID_NTIMES;   // = 557  
+  
+            switch (bkt_phase) {  
+            case 0: {   // сдвиг строк бакетов: по 8 строк за квант  
+                int n = 0;  
+                for (; bkt_row < RSID_NTIMES - 1 && n < 8; bkt_row++, n++)  
+                    memmove(&fft_buckets[bkt_row][RSID_BIN_LOW],  
+                            &fft_buckets[bkt_row + 1][RSID_BIN_LOW],  
+                            bw * sizeof(fft_buckets[0][0]));  
+                if (bkt_row >= RSID_NTIMES - 1) bkt_phase = 1;  
+                break;  
+            }  
+            case 1:     // очистка последней строки — один чанк  
+                memset(&fft_buckets[RSID_NTIMES - 1][RSID_BIN_LOW], 0,  
+                       bw * sizeof(fft_buckets[0][0]));  
+                buckets_begin(RSID_BIN_LOW);      // чётные бины  
+                bkt_phase = 2;  
+                break;  
+            case 2:     // CalculateBuckets: чётный проход, чанками  
+                if (buckets_step(aFFTAmpl, iEnd)) {  
+                    buckets_begin(RSID_BIN_LOW + 1);   // нечётные бины  
+                    bkt_phase = 3;  
+                }  
+                break;  
+            case 3:     // CalculateBuckets: нечётный проход, чанками  
+                if (buckets_step(aFFTAmpl, iEnd))  
+                    rsid_sm_state = RSID_STATE_SEARCH;  
+                break;  
+            }  
+            break;  
         }
 
         case RSID_STATE_SEARCH: {  
