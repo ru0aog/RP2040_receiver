@@ -13,16 +13,25 @@
 #include "rx_cw.h"
 #include "rx_rtty.h"
 #include "rx_ifkp.h"
-#include "rx_olivia.h" 
+#include "rx_olivia.h"
+#include "rx_contestia.h"
   
 // Коды мод из таблицы RSID (см. логи: RTTY-45=39, CW=26).  
 #define RSID_CODE_RTTY45   39  
 #define RSID_CODE_CW       26  
 #define RTTY_SHIFT_HZ      170.0f
 #define RSID_CODE_IFKP     1171
-#define RSID_CODE_OLIVIA_8_250  69
+#define RSID_CODE_OLIVIA_8_250      69
+#define RSID_CODE_CONTESTIA_8_250   49
 
-enum { DEC_NONE = 0, DEC_RTTY, DEC_CW, DEC_IFKP, DEC_OLIV }; 
+enum {
+    DEC_NONE = 0,
+    DEC_RTTY,
+    DEC_CW,
+    DEC_IFKP,
+    DEC_OLIV,
+    DEC_CONTESTIA
+};
   
 static int   active_dec = DEC_NONE;  
 static float dec_fs_hz  = 15625.0f;
@@ -39,11 +48,12 @@ void rx_decoders_emit(char c) { if (s_out) s_out(c); }
 // Мода выбирается рантайм по результату RSID
 void rx_decoders_sample(int16_t m) {  
     switch (active_dec) {  
-    case DEC_RTTY: rx_mf_sample(m, 0); break;  
-    case DEC_CW:   rx_cw_sample(m); break;
-    case DEC_IFKP: rx_ifkp_push(m); break;
-    case DEC_OLIV: rx_olivia_push(m); break;
-    default:       break;   // DEC_NONE — пока метки нет, не декодируем  
+    case DEC_RTTY:      rx_mf_sample(m, 0);     break;  
+    case DEC_CW:        rx_cw_sample(m);        break;
+    case DEC_IFKP:      rx_ifkp_push(m);        break;
+    case DEC_OLIV:      rx_olivia_push(m);      break;
+    case DEC_CONTESTIA: rx_contestia_push(m);   break;
+    default:                                    break;   // DEC_NONE — пока метки нет, не декодируем  
     }  
 }
 
@@ -81,6 +91,12 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
         active_dec = DEC_OLIV;
         Serial.printf("# DECODER=OLIVIA center=%.1f Hz\n", (double)r->freq_hz);    
         break;
+    case RSID_CODE_CONTESTIA_8_250:
+        stop_all_goertzel_decoders();
+        rx_contestia_init(r->freq_hz);
+        active_dec = DEC_CONTESTIA;
+        Serial.printf("# DECODER=CONTESTIA center=%.1f Hz\n", (double)r->freq_hz);
+        break;
     default:  
         Serial.printf("# DECODER unsupported code=%d\n", r->mode_code);  
         break;  
@@ -89,10 +105,11 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
 
 // Остановить декодеры, использующие общий банк Гёрцеля.
 static void stop_all_goertzel_decoders() {
-    if      (active_dec == DEC_RTTY)    { /*rx_rtty_stop();*/   } 
-    else if (active_dec == DEC_CW)      { /*rx_cw_stop();  */   }
-    else if (active_dec == DEC_IFKP)    { rx_ifkp_stop();   }
-    else if (active_dec == DEC_OLIV)    { rx_olivia_stop(); }
+    if      (active_dec == DEC_RTTY)        { /*rx_rtty_stop();*/   } 
+    else if (active_dec == DEC_CW)          { /*rx_cw_stop();  */   }
+    else if (active_dec == DEC_IFKP)        { rx_ifkp_stop();       }
+    else if (active_dec == DEC_OLIV)        { rx_olivia_stop();     }
+    else if (active_dec == DEC_CONTESTIA)   { rx_contestia_stop();  }
 }
 
 void rx_decoders_init(float fs_hz) {  
