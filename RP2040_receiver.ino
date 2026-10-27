@@ -172,7 +172,7 @@ static uint32_t t_dbg = 0;
 
 
 
-if (millis() - t_dbg >= 100000) {
+if (millis() - t_dbg >= 1000) {
     t_dbg = millis();
 
     static uint32_t rsid_prev_calls = 0;

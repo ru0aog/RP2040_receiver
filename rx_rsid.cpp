@@ -75,7 +75,14 @@ uint32_t rsid_rx_queue_fill(void) {
 // fldigi: 27 * RSID_SYMLEN отсчётов (10 gap + 15 символов + 2 на ошибки тайминга);  
 // при шаге окна RSID_FFT_SAMPLES (512) это ~27 окон. Берём с запасом.  
 #define RSID_SECONDARY_WINDOWS   60
-  
+
+// --- Полоса поиска RSID-меток ---  
+// Бин FFT-2048 при 11025 Гц = 5,383 Гц. Ищем метки только в 300..3000 Гц:  
+// за пределами АЧХ приёмного тракта метки всё равно не живут, а бакеты и  
+// перебор кодов масштабируются диапазоном nBinLow..nBinHigh.  
+#define RSID_BIN_LOW   ((int)(300.0  * 2048.0 / RSID_SAMPLE_RATE))                 // 55  
+#define RSID_BIN_HIGH  ((int)(3000.0 * 2048.0 / RSID_SAMPLE_RATE) + RSID_NTIMES)   // 587
+
 // ============================================================================  
 //  Таблицы мод RSID (code -> имя).  
 //   rsid_ids_1 — основной (primary) набор из refs/rsid_defs.cxx.  
@@ -86,43 +93,13 @@ struct RSIDmap { unsigned short rs; const char* name; };
   
 #define RSID_LIST \
     ELEM_(263, "EOT")            ELEM_(6,   "ESCAPE")        \
-    ELEM_(1,   "BPSK31")         ELEM_(110, "QPSK31")        \
-    ELEM_(2,   "BPSK63")         ELEM_(3,   "QPSK63")        \
-    ELEM_(4,   "BPSK125")        ELEM_(5,   "QPSK125")       \
-    ELEM_(126, "BPSK250")        ELEM_(127, "QPSK250")       \
-    ELEM_(173, "BPSK500")                                    \
-    ELEM_(183, "PSK125R")        ELEM_(186, "PSK250R")       \
-    ELEM_(187, "PSK500R")                                    \
-    ELEM_(9,  "MT63-500L")       ELEM_(10, "MT63-500S")      \
-    ELEM_(12, "MT63-1000L")      ELEM_(13, "MT63-1000S")     \
-    ELEM_(15, "MT63-2000L")      ELEM_(17, "MT63-2000S")     \
-    ELEM_(22, "PSK63F")          ELEM_(26, "CW")             \
-    ELEM_(37, "RTTY-ASCII7")     ELEM_(38, "RTTY-ASCII8")    \
-    ELEM_(39, "RTTY-45")         ELEM_(40, "RTTY-50")        \
-    ELEM_(41, "RTTY-75")                                     \
-    ELEM_(43, "THROB1")          ELEM_(44, "THROB2")         \
-    ELEM_(45, "THROB4")                                      \
-    ELEM_(204,"CONT-4/125")      ELEM_(55, "CONT-4/250")     \
-    ELEM_(54, "CONT-4/500")      ELEM_(169,"CONT-8/125")     \
-    ELEM_(49, "CONT-8/250")      ELEM_(52, "CONT-8/500")     \
-    ELEM_(50, "CONT-16/500")     ELEM_(53, "CONT-16/1000")   \
-    ELEM_(51, "CONT-32/1000")                                \
-    ELEM_(60, "MFSK8")           ELEM_(57, "MFSK16")         \
-    ELEM_(147,"MFSK32")          ELEM_(148,"MFSK11")         \
-    ELEM_(152,"MFSK22")                                      \
-    ELEM_(203,"OLIVIA-4/125")    ELEM_(75, "OLIVIA-4/250")   \
-    ELEM_(74, "OLIVIA-4/500")    ELEM_(163,"OLIVIA-8/125")   \
-    ELEM_(69, "OLIVIA-8/250")    ELEM_(72, "OLIVIA-8/500")   \
-    ELEM_(70, "OLIVIA-16/500")   ELEM_(73, "OLIVIA-16/1000") \
-    ELEM_(84, "DOMEX4")          ELEM_(85, "DOMEX5")         \
-    ELEM_(86, "DOMEX8")          ELEM_(87, "DOMEX11")        \
-    ELEM_(88, "DOMEX16")         ELEM_(90, "DOMEX22")        \
-    ELEM_(97, "DOMEX8-FEC")                                  \
-    ELEM_(104,"FELD-HELL")       ELEM_(106,"HELL80")         \
-    ELEM_(136,"THOR4")           ELEM_(137,"THOR8")          \
-    ELEM_(138,"THOR16")          ELEM_(139,"THOR5")          \
-    ELEM_(143,"THOR11")          ELEM_(145,"THOR22")         \
-    ELEM_(0,   "NONE")  
+    ELEM_(26,  "CW")                                         \
+    ELEM_(39,  "RTTY-45")        ELEM_(40, "RTTY-50")        \
+    ELEM_(49,  "CONT-8/250")                                 \
+    ELEM_(69,  "OLIVIA-8/250")                               \
+    ELEM_(86, "DOMEX8")          ELEM_(137,"THOR8")          \
+    ELEM_(138,"THOR16")          ELEM_(57, "MFSK16")         \
+    ELEM_(0,   "NONE")
   
 #define ELEM_(code_, name_) { code_, name_ },  
 static const RSIDmap rsid_ids_1[] = { RSID_LIST };  
@@ -517,8 +494,8 @@ void rsid_rx_service_sliced(void) {
         break;
 
         case RSID_STATE_WINDOWING:  
-        nBinLow  = 3;  
-        nBinHigh = RSID_FFT_SIZE - 32;  
+        nBinLow  = RSID_BIN_LOW;  
+        nBinHigh = RSID_BIN_HIGH;
         for (int i = 0; i < RSID_FFT_N; i++) {  
             int32_t xi = (int32_t)rsid_proc[rsid_cur_slot][i];  
             fft_i[i] = (int16_t)(((int32_t)xi * window_q15[i]) >> 15);  
@@ -577,26 +554,29 @@ void rsid_rx_service_sliced(void) {
             break;
         }
 
-        case RSID_STATE_CALC_AMPL:
-            for (int i = 0; i < RSID_FFT_SIZE; i++) {  
+        case RSID_STATE_CALC_AMPL:  
+            for (int i = RSID_BIN_LOW - 2; i < RSID_BIN_HIGH; i++) {  
                 const int32_t re = fft_i[i];  
                 const int32_t im = fft_q[i];  
                 aFFTAmpl[i] = (uint64_t)((int64_t)re * re + (int64_t)im * im);  
-            }
-            rsid_sm_state = RSID_STATE_SINK_AND_BUCKETS;
+            }  
+            rsid_sm_state = RSID_STATE_SINK_AND_BUCKETS;  
             break;
 
         case RSID_STATE_SINK_AND_BUCKETS: {
-            //if (s_fft_sink) {
-            //    s_fft_sink(aFFTAmpl, RSID_FFT_SIZE, (float)(RSID_SAMPLE_RATE / 2048.0));
-            //}
+            // возможная точка подключения спектроанализатора
+            // if (s_fft_sink) {
+            //     s_fft_sink(aFFTAmpl, RSID_FFT_SIZE, (float)(RSID_SAMPLE_RATE / 2048.0));}
 
-            int bucket_low  = 3;  
-            int bucket_high = RSID_FFT_SIZE - 32;  
+            int bucket_low  = RSID_BIN_LOW;  
+            int bucket_high = RSID_BIN_HIGH;
           
-            memmove(fft_buckets, &(fft_buckets[1][0]),  
-                    (RSID_NTIMES - 1) * RSID_FFT_SIZE * sizeof(fft_buckets[0][0]));  
-            memset(&(fft_buckets[RSID_NTIMES - 1][0]), 0, RSID_FFT_SIZE * sizeof(fft_buckets[0][0]));  
+            const int bw = RSID_BIN_HIGH - RSID_BIN_LOW;  
+            for (int r = 0; r < RSID_NTIMES - 1; r++)  
+                memmove(&fft_buckets[r][RSID_BIN_LOW], &fft_buckets[r + 1][RSID_BIN_LOW],  
+                        bw * sizeof(fft_buckets[0][0]));  
+            memset(&fft_buckets[RSID_NTIMES - 1][RSID_BIN_LOW], 0,  
+                   bw * sizeof(fft_buckets[0][0]));
           
             CalculateBuckets(aFFTAmpl, bucket_low,     bucket_high - RSID_NTIMES);  
             CalculateBuckets(aFFTAmpl, bucket_low + 1, bucket_high - RSID_NTIMES);  
