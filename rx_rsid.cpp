@@ -176,12 +176,6 @@ static int  srch_best_dist = 1000;
 static int  srch_best_bin  = -1;  
 static int  srch_best_sym  = -1;
 
-// Нарезанный поиск: аккумуляторы между квантами.  
-static int rsid_srch_i   = 0;      // индекс текущего кода в таблице  
-static int rsid_srch_min = 1000;   // текущий минимум расстояния Хэмминга  
-static int rsid_srch_bin = -1;  
-static int rsid_srch_sym = -1;
-
 // ============================================================================  
 //  Состояние детектора  
 // ============================================================================  
@@ -218,7 +212,7 @@ static rsid_detect_cb_t s_cb = nullptr;
 static rsid_fft_sink_t  s_fft_sink = nullptr;  
 void rsid_rx_set_fft_sink(rsid_fft_sink_t sink) { s_fft_sink = sink; }
 
-// --- Почтовый ящик детекта: пишется на Core 1 (rsid_search), читается на Core 0.  
+// --- Почтовый ящик детекта: пишется на Core 1, читается на Core 0.  
 static volatile bool rsid_det_pending = false;  
 static rsid_result_t rsid_det_result;
 
@@ -236,10 +230,12 @@ static void rsid_reset_detect(void) {
     memset(fft_buckets, 0, sizeof(fft_buckets));  
     hamming_resolution = RSID_HAMMING_RESOLUTION;  
     rsid_secondary_windows = 0;  
-    rsid_srch_i = 0;  
-    rsid_win_head = rsid_win_tail = rsid_cur_slot = 0;  // <-- добавить  
-    srch_active = false;                                // <-- добавить (чистый старт поиска)  
-    rsid_sm_state = RSID_STATE_IDLE;                    // <-- добавить  
+    srch_i = 0;  
+    srch_active = false;                 // чистый старт поиска  
+    rsid_sm_state = RSID_STATE_IDLE;  
+    // НЕ трогаем rsid_win_head/tail/cur_slot здесь:  
+    // эта функция зовётся из SEARCH до освобождения слота,  
+    // сброс индексов разорвёт учёт кольца.
 }
   
 // Полный сброс (только с Core 0: init / retune) — сбрасывает и накопитель.  
@@ -247,7 +243,7 @@ static void rsid_reset_state(void) {
     inptr = RSID_FFT_SIZE;  
     memset(aInputSamples, 0, sizeof(aInputSamples));
     rsid_reset_detect();
-    rsid_srch_i = 0;
+    srch_i = 0;
 }
 
 // In-place radix-2 DIT, деление на 2 на каждой стадии (значения в Q15).  
@@ -322,32 +318,6 @@ static inline int HammingDistance(int iBucket, const unsigned char* p2) {
     }  
     return dist;  
 }  
-  
-// Параметризованный поиск: по заданной таблице кодов pCodes и её ids/size.  
-static bool search_amp(int& bin_out, int& symbol_out,  
-                       const unsigned char* pCodes,  
-                       const RSIDmap* ids, int ids_size) {  
-    int iDistanceMin = 1000;  
-    int iBin = -1, iSymbol = -1;  
-    for (int i = 0; i < ids_size; i++) {  
-        const unsigned char* pc = pCodes + i * RSID_NSYMBOLS;  
-        for (int j = nBinLow; j < nBinHigh - RSID_NTIMES; j++) {  
-            int d = HammingDistance(j, pc);  
-            if (d < iDistanceMin) {  
-                iDistanceMin = d;  
-                iSymbol = ids[i].rs;  
-                iBin = j;  
-                if (iDistanceMin == 0) break;  
-            }  
-        }  
-    }  
-    if (iDistanceMin <= hamming_resolution) {  
-        symbol_out = iSymbol;  
-        bin_out    = iBin;  
-        return true;  
-    }  
-    return false;  
-}
 
 // Пошаговый поиск: обрабатывает ОДИН код таблицы за вызов (один квант).  
 // Возвращает true, когда перебор всей таблицы завершён; результат — в srch_best_*.  
@@ -380,22 +350,6 @@ static bool search_amp_step(const unsigned char* pCodes,
     return false;                     // остались ещё коды  
 }
 
-// Один шаг: полный перебор бинов для ОДНОГО кода pCodes[i].  
-// Результат копится в rsid_srch_min/bin/sym между вызовами.  
-static void search_amp_step(int i, const unsigned char* pCodes,  
-                            const RSIDmap* ids) {  
-    const unsigned char* pc = pCodes + i * RSID_NSYMBOLS;  
-    for (int j = nBinLow; j < nBinHigh - RSID_NTIMES; j++) {  
-        int d = HammingDistance(j, pc);  
-        if (d < rsid_srch_min) {  
-            rsid_srch_min = d;  
-            rsid_srch_sym = ids[i].rs;  
-            rsid_srch_bin = j;  
-            if (rsid_srch_min == 0) break;   // идеальное совпадение  
-        }  
-    }  
-}
-
 // ----------------------------------------------------------------------------  
 //  apply: выдать (имя моды, частоту) из заданной таблицы.  
 // ----------------------------------------------------------------------------  
@@ -425,82 +379,6 @@ static void rsid_apply(int iBin, int iSymbol,
 // ----------------------------------------------------------------------------  
 static float         rtty_center_hz = 0.0f;  
 static volatile bool rtty_center_new = false;  
-  
-// ----------------------------------------------------------------------------  
-//  search (refs/rsid.cxx): FFT окна 2048 -> bucket'ы -> поиск кода.  
-//  bReverse = false (USB, тон в положительной звуковой полосе).  
-// ----------------------------------------------------------------------------  
-static void rsid_search(void) {  
-    nBinLow  = 3;  
-    nBinHigh = RSID_FFT_SIZE - 32;  
-  
-    // Оконирование Q15: вход (int16) * окно (Q15) >> 15. Мнимая часть = 0.  
-    for (int i = 0; i < RSID_FFT_N; i++) {  
-        int32_t xi = (int32_t)rsid_proc[i];  
-        fft_i[i] = (int16_t)(((int32_t)xi * window_q15[i]) >> 15);  
-        fft_q[i] = 0;  
-    }  
-  
-    fft_q15();  
-  
-    for (int i = 0; i < RSID_FFT_SIZE; i++) {  
-        const int32_t re = fft_i[i];  
-        const int32_t im = fft_q[i];  
-        aFFTAmpl[i] = (uint64_t)((int64_t)re * re + (int64_t)im * im);  
-    }  
-
-    if (s_fft_sink)  
-        s_fft_sink(aFFTAmpl, RSID_FFT_SIZE, (float)(RSID_SAMPLE_RATE / 2048.0));
-
-    int bucket_low  = 3;  
-    int bucket_high = RSID_FFT_SIZE - 32;  
-  
-    memmove(fft_buckets, &(fft_buckets[1][0]),  
-            (RSID_NTIMES - 1) * RSID_FFT_SIZE * sizeof(fft_buckets[0][0]));  
-    memset(&(fft_buckets[RSID_NTIMES - 1][0]), 0, RSID_FFT_SIZE * sizeof(fft_buckets[0][0]));  
-  
-    CalculateBuckets(aFFTAmpl, bucket_low,     bucket_high - RSID_NTIMES);  
-    CalculateBuckets(aFFTAmpl, bucket_low + 1, bucket_high - RSID_NTIMES);  
-  
-    int sym = -1, bin = -1;  
-  
-    // ---- Набор 1 (primary), пока не активен приём набора 2 ----  
-    if (rsid_secondary_windows <= 0) {  
-        if (search_amp(bin, sym, pCodes1, rsid_ids_1, rsid_ids_size1)) {  
-            if (sym != RSID_ESCAPE) {  
-                rsid_apply(bin, sym, rsid_ids_1, rsid_ids_size1);  
-  
-                // Центр матч-фильтра RTTY — прямо из частоты RSID.  
-                rtty_center_hz  = (float)((bin + RSID_NSYMBOLS - 0.5)  
-                                          * RSID_SAMPLE_RATE / 2048.0);  
-                __dmb();  
-                rtty_center_new = true;
-  
-                rsid_reset_detect(); 
-            } else {  
-                // ESCAPE: следующие окна ищем в расширенном наборе.  
-                rsid_secondary_windows = RSID_SECONDARY_WINDOWS;  
-            }  
-        }  
-        return;  
-    }  
-  
-    // ---- Набор 2 (extended), активен RSID_SECONDARY_WINDOWS окон ----  
-    rsid_secondary_windows--;  
-    if (search_amp(bin, sym, pCodes2, rsid_ids_2, rsid_ids_size2)) {  
-        if (sym != RSID_NONE2) {  
-            rsid_apply(bin, sym, rsid_ids_2, rsid_ids_size2);  
-  
-            // Частота известна и для расширенных мод; RTTY-центр  
-            // для не-RTTY мод не задаём (routing по моде в rx_decoders).  
-            rsid_reset_detect();   // сбросит и rsid_secondary_windows  
-        }  
-    }  
-    if (rsid_secondary_windows <= 0) {  
-        // Таймаут истёк — возвращаемся к поиску набора 1.  
-        rsid_secondary_windows = 0;  
-    }  
-}  
   
 // ============================================================================  
 //  Публичный интерфейс (rx_rsid.h).  
@@ -748,8 +626,10 @@ void rsid_rx_service_sliced(void) {
                 }  
             }  
   
-            rsid_win_tail = (uint8_t)((rsid_win_tail + 1) % RSID_WIN_SLOTS); // освобождаем слот  
-            rsid_sm_state = RSID_STATE_IDLE;  // кадр обработан  
+            // Слот освобождаем ЗДЕСЬ, до любого reset внутри обработчиков выше —  
+            // reset сбрасывает rsid_sm_state в IDLE, но не трогает индексы кольца.  
+            rsid_win_tail = (uint8_t)((rsid_win_tail + 1) % RSID_WIN_SLOTS);  
+            rsid_sm_state = RSID_STATE_IDLE;  
             break;
         }
     }  

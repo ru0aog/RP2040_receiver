@@ -535,12 +535,6 @@ void rx_dsp_set_nr(bool on) {
 }  
 bool rx_dsp_get_nr(void) { return nr_enabled; }
 
-
-// ---- Инструментирование загрузки Core 1 ----  
-static uint32_t busy_us_acc  = 0;   // время в обработке блоков за окно  
-static uint32_t total_us_acc = 0;   // полное время за окно  
-
-
 // ---- Измерение загрузки Core 1 ----
 static uint32_t core1_busy_us = 0;
 static uint32_t core1_window_start_us = 0;
@@ -570,7 +564,6 @@ static inline void core1_update_load(uint32_t now_us) {
 // бесконечный изолированный рабочий цикл ядра Core 1
 // цифровой преобразователь частоты вниз (DDC — Digital Down Converter)
 static void __not_in_flash_func(rx_dsp_entry)(void) {
-    uint32_t t_prev = time_us_32();   // метка времени предыдущей итерации  
     core1_window_start_us = time_us_32();
     // бесконечный цикл ядра Core 1
     while (true) {
