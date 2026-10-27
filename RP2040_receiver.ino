@@ -259,6 +259,7 @@ static uint32_t t_dbg = 0;
             (unsigned long)rsid_max_us,
             (unsigned long)rsid_calls_s
         );
+        Serial.print("rsid_callback_count = "); Serial.print(rsid_callback_count); Serial.print(" rsid_callback_max_us = ");  Serial.println(rsid_callback_max_us);
     }
 
 

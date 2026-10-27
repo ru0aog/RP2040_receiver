@@ -20,3 +20,5 @@ void rx_decoders_on_rsid(const rsid_result_t* r);
 // Подать один отсчёт базовой полосы в активный декодер (из rx_audio.cpp).  
 void rx_decoders_sample(int16_t m);
 
+static volatile uint32_t rsid_callback_count;
+static volatile uint32_t rsid_callback_max_us;

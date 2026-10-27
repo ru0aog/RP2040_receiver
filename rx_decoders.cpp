@@ -57,9 +57,20 @@ void rx_decoders_sample(int16_t m) {
     }  
 }
 
+//static volatile uint32_t rsid_callback_count = 0;
+//static volatile uint32_t rsid_callback_max_us = 0;
+
 // Вызывается из rsid_rx_service() (Core 0, loop) — Serial безопасен.  
 void rx_decoders_on_rsid(const rsid_result_t* r) {  
-    if (!r) return;  
+    const uint32_t t_start = micros();
+
+    if (!r) {
+        return;
+    }
+
+    rsid_callback_count++;
+
+
   
     // ЕДИНСТВЕННАЯ точка печати RSID-метки.  
     Serial.printf("# RSID mode=%s code=%d freq=%.1f\n",  
@@ -73,6 +84,9 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
         active_dec = DEC_RTTY;
         Serial.printf("# DECODER=RTTY center=%.1f Hz\n", (double)r->freq_hz);  
         break;  
+
+        /*
+
     case RSID_CODE_CW:  
         stop_all_goertzel_decoders(); 
         rx_cw_init(dec_fs_hz, r->freq_hz);  
@@ -85,7 +99,7 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
         active_dec = DEC_IFKP;
         Serial.printf("# DECODER=IFKP center=%.1f Hz\n", (double)r->freq_hz);  
         break;
-        /*
+        
     case RSID_CODE_OLIVIA_8_250:  
         stop_all_goertzel_decoders();  
         rx_olivia_init(r->freq_hz);         // центр из RSID, банк Гёрцеля 8 тонов  
@@ -98,11 +112,18 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
         active_dec = DEC_CONTESTIA;
         Serial.printf("# DECODER=CONTESTIA center=%.1f Hz\n", (double)r->freq_hz);
         break;
-        */
+         */
     default:  
         Serial.printf("# DECODER unsupported code=%d\n", r->mode_code);  
         break;  
     }  
+
+const uint32_t elapsed = micros() - t_start;
+
+if (elapsed > rsid_callback_max_us) {
+    rsid_callback_max_us = elapsed;
+}
+
 }
 
 // Остановить декодеры, использующие общий банк Гёрцеля.
