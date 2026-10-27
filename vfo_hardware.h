@@ -65,6 +65,8 @@ float rx_dsp_fs_out(void);
 uint32_t rx_dsp_out_dropped(void);  
 uint32_t rx_dsp_aud_dropped(void);  
 uint32_t rx_dsp_load_permille(void);
+uint32_t rx_dsp_compute_load_permille(void);
+uint32_t rx_dsp_rsid_load_permille(void);
 uint32_t rx_dsp_clip_count(void);   // диагностика клиппинга (sat16)
 uint8_t  rx_dsp_aud_fill(void);   // заполнение очереди aud для адаптивного ресемплинга
 

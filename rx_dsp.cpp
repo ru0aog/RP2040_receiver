@@ -587,31 +587,6 @@ static inline void core1_update_load(uint32_t now_us)
     core1_window_start_us = now_us;
 }
 
-static uint32_t core1_busy_us = 0;
-static uint32_t core1_window_start_us = 0;
-static volatile uint32_t dsp_load_permille = 0;  // загрузка, промилле (0..1000)
-
-static inline void core1_account_busy(uint32_t elapsed_us) {
-    core1_busy_us += elapsed_us;
-}
-
-static inline void core1_update_load(uint32_t now_us) {
-    const uint32_t window_us = now_us - core1_window_start_us;
-    if (window_us < 1000000u) {
-        return;
-    }
-    uint32_t busy = core1_busy_us;
-    // Защита от некорректного значения.
-    if (busy > window_us) {
-        busy = window_us;
-    }
-    dsp_load_permille =
-        (uint32_t)(((uint64_t)busy * 1000u) / window_us);
-
-    core1_busy_us = 0;
-    core1_window_start_us = now_us;
-}
-
 // бесконечный изолированный рабочий цикл ядра Core 1
 // цифровой преобразователь частоты вниз (DDC — Digital Down Converter)
 static void __not_in_flash_func(rx_dsp_entry)(void) {
