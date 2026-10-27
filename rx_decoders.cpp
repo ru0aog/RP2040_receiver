@@ -25,7 +25,9 @@
 enum { DEC_NONE = 0, DEC_RTTY, DEC_CW, DEC_IFKP, DEC_OLIV }; 
   
 static int   active_dec = DEC_NONE;  
-static float dec_fs_hz  = 15625.0f;  
+static float dec_fs_hz  = 15625.0f;
+
+static void stop_all_goertzel_decoders();
   
 static void default_output(char c) { Serial.print(c); }  
 static rx_output_cb_t s_out = default_output;  
@@ -55,28 +57,26 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
   
     switch (r->mode_code) {  
     case RSID_CODE_RTTY45:  
-        // rx_ifkp_stop();  
+        stop_all_goertzel_decoders(); 
         active_dec = DEC_RTTY;  
         rx_mf_init(dec_fs_hz, r->freq_hz, RTTY_SHIFT_HZ);  
         rx_rtty_init(dec_fs_hz);  
         Serial.printf("# DECODER=RTTY center=%.1f Hz\n", (double)r->freq_hz);  
         break;  
     case RSID_CODE_CW:  
-        // rx_ifkp_stop();  
+        stop_all_goertzel_decoders(); 
         active_dec = DEC_CW;  
         rx_cw_init(dec_fs_hz, r->freq_hz);  
         Serial.printf("# DECODER=CW center=%.1f Hz\n", (double)r->freq_hz);  
         break;  
-    case RSID_CODE_IFKP:  
+    case RSID_CODE_IFKP:
+        stop_all_goertzel_decoders(); 
         active_dec = DEC_IFKP;  
         rx_ifkp_init(r->freq_hz);           // первично — центр из RSID  
         Serial.printf("# DECODER=IFKP center=%.1f Hz\n", (double)r->freq_hz);  
         break;
     case RSID_CODE_OLIVIA_8_250:  
-        // Глушим ТОЛЬКО активный декодер — rx_ifkp_stop() на неактивном  
-        // декодере ломал тракт (трогает разделяемый GB-банк/флаги).  
-        if (active_dec == DEC_IFKP) rx_ifkp_stop();  
-        else if (active_dec == DEC_OLIV) rx_olivia_stop();  
+        stop_all_goertzel_decoders();  
         active_dec = DEC_OLIV; 
         rx_olivia_init(r->freq_hz);         // центр из RSID, банк Гёрцеля 8 тонов  
         Serial.printf("# DECODER=OLIVIA center=%.1f Hz\n", (double)r->freq_hz);    
@@ -85,7 +85,15 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
         Serial.printf("# DECODER unsupported code=%d\n", r->mode_code);  
         break;  
     }  
-}  
+}
+
+// Остановить декодеры, использующие общий банк Гёрцеля.
+static void stop_all_goertzel_decoders() {
+    if      (active_dec == DEC_RTTY)    { /*rx_rtty_stop();*/   } 
+    else if (active_dec == DEC_CW)      { /*rx_cw_stop();  */   }
+    else if (active_dec == DEC_IFKP)    { rx_ifkp_stop();   }
+    else if (active_dec == DEC_OLIV)    { rx_olivia_stop(); }
+}
 
 void rx_decoders_init(float fs_hz) {  
     dec_fs_hz  = (fs_hz > 1.0f) ? fs_hz : 15625.0f;  
