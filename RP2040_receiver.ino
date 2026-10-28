@@ -9,13 +9,18 @@
 #include "hardware/pll.h"  
 #include "hardware/sync.h"      // save_and_disable_interrupts  
 
-#include "vfo_hardware.h"    
-#include "rx_audio.h"    
-#include "rx_mf.h"    
-#include "rx_rtty.h"
-#include "rx_rsid.h"
-#include "rx_decoders.h" 
-#include "fldigi_cat.h"    
+#include "src/audio/rx_audio.h"  
+#include "src/cat/fldigi_cat.h" 
+#include "src/modes/rx_decoders.h" 
+#include "src/modes/rx_mf.h"    
+#include "src/modes/rx_rtty.h"
+#include "src/rsid/rx_rsid.h"
+#include "src/vfo/vfo_rp2040.h"    
+
+// #include "../vfo/vfo_rp2040.h"
+// #include "../dsp/rx_goertzel.h"
+// #include "../modes/rx_decoders.h"
+
 #include <Adafruit_TinyUSB.h> 
   
 static constexpr uint32_t RX_FREQ_HZ = 3600000UL;  
