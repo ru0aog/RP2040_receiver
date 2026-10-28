@@ -1,12 +1,12 @@
-#include <Arduino.h>  
+﻿#include <Arduino.h>  
 #include <math.h>  
 #include <string.h>  
   
-#include "vfo_hardware.h"  
-#include "rx_audio.h"
-#include "rx_mf.h"
-#include "rx_rsid.h"   // точка входа RSID: rsid_rx_push(int16_t) на 11025 Гц  
-#include "rx_decoders.h"
+#include "../vfo/vfo_rp2040.h"  
+#include "../audio/rx_audio.h"
+#include "../modes/rx_mf.h"
+#include "../rsid/rx_rsid.h"
+#include "../modes/rx_decoders.h"
 #include "AudioTools.h"  
 #include "AudioTools/Communication/USB/USBAudioStream.h"  
  
