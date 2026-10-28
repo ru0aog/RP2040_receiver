@@ -13,16 +13,27 @@
 #include <string.h>  
 #include <math.h>  
   
-// #define AX25_DEBUG  
+#define AX25_DEBUG  
+  
+#ifdef AX25_DEBUG  
+static uint32_t dbg_samples = 0, dbg_bits = 0, dbg_flags = 0;  
+static uint32_t dbg_stuff = 0, dbg_abort = 0, dbg_fcs_bad = 0, dbg_fcs_ok = 0;  
+static float    dbg_dmin = 1e9f, dbg_dmax = -1e9f;  
+#endif
   
 // -----------------------------------------------------------------------------  
 // Protocol parameters  
 // -----------------------------------------------------------------------------  
 static constexpr float    AX25_FS        = 15625.0f;  
 static constexpr float    AX25_BAUD      = 300.0f;  
-static constexpr float    AX25_MARK_HZ   = 1200.0f;  
-static constexpr float    AX25_SPACE_HZ  = 2200.0f;  
-static constexpr float    AX25_LP_ALPHA  = 0.20f;    // matched-filter LP, ~50 Hz  
+static constexpr float    AX25_LP_ALPHA  = 0.20f;    // matched-filter LP, ~50 Hz
+
+static constexpr float AX25_SHIFT_HZ  = 200.0f;    // сдвиг mark/space, Гц  
+// Тоны ставятся симметрично вокруг метки RSID:  
+//   mark  = center_hz − SHIFT/2  
+//   space = center_hz + SHIFT/2  
+// Для сдвига 200 Гц и метки 1553 Гц: mark=1453, space=1653.  
+// Если источник — классический Bell 202 (1200/2200), поставьте 1000.0f.
   
 static constexpr int      AX25_MAX_FRAME = 330;  
 static constexpr uint16_t AX25_FCS_MAGIC = 0xF0B8;   // residue of valid frame+FCS  
@@ -166,7 +177,10 @@ static void ax25_hdlc_bit(uint8_t raw) {
   
     g_pat_det = (uint8_t)((g_pat_det << 1) | (dbit & 1));  
   
-    if (g_pat_det == 0x7E) {  
+    if (g_pat_det == 0x7E) {
+#ifdef AX25_DEBUG  
+        ++dbg_flags;  
+#endif
         // Flag: end of frame (if any bits accumulated)  
         if (g_frame_len >= 2 + 15) {  
             ax25_frame_finish();  
@@ -176,13 +190,19 @@ static void ax25_hdlc_bit(uint8_t raw) {
         g_oacc = 0;  
         return;  
     }  
-    if (g_pat_det == 0xFE) {  
+    if (g_pat_det == 0xFE) {
+#ifdef AX25_DEBUG  
+        ++dbg_abort;  
+#endif
         // Seven '1' bits: abort / loss of signal — drop frame in progress  
         g_frame_len = 0;  
         g_olen = 0;  
         return;  
     }  
     if (dbit == 0 && (g_pat_det & 0x7F) == 0x3E) {  
+#ifdef AX25_DEBUG  
+        ++dbg_stuff;  
+#endif
         // Текущий '0' после ровно пяти '1' — вставленный бит, отбрасываем.  
         // 0x3E = ...0 11111 0; шесть единиц = 0x7E (флаг) уже обработан выше.  
         return;  
@@ -193,25 +213,29 @@ static void ax25_hdlc_bit(uint8_t raw) {
     if (dbit) g_oacc |= 0x80;  
     ++g_olen;  
   
-    if (g_olen >= 8) {  
-        g_olen = 0;  
-        if (g_frame_len < AX25_MAX_FRAME) {    
-            g_frame_buf[g_frame_len++] = g_oacc;    
-        } else {    
-            g_frame_len = -1;   // переполнение: весь кадр отбрасываем    
-        }
-        g_oacc = 0;  
-    }  
+    if (g_olen >= 8) {    
+        g_olen = 0;    
+        if (g_frame_len >= 0 && g_frame_len < AX25_MAX_FRAME) {      
+            g_frame_buf[g_frame_len++] = g_oacc;      
+        } else {      
+            g_frame_len = -1;   // переполнение: весь кадр отбрасываем      
+        }  
+        g_oacc = 0;    
+    }
 }  
   
 // -----------------------------------------------------------------------------  
 // Public API  
 // -----------------------------------------------------------------------------  
 void rx_ax25_init(float center_hz) {  
-    (void)center_hz;   // tones are fixed Bell 202 frequencies  
-  
-    ax25_tone_init(&g_tone_mark,  AX25_MARK_HZ);  
-    ax25_tone_init(&g_tone_space, AX25_SPACE_HZ);  
+    g_active = false;  
+    const float mark  = center_hz - 0.5f * AX25_SHIFT_HZ;  
+    const float space = center_hz + 0.5f * AX25_SHIFT_HZ;  
+    ax25_tone_init(&g_tone_mark,  mark);  
+    ax25_tone_init(&g_tone_space, space);  
+#ifdef AX25_DEBUG  
+    Serial.printf("# AX25 mark=%.0f space=%.0f\n", mark, space);  
+#endif
   
     g_dpll_step   = (uint32_t)(4294967296.0 * AX25_BAUD / AX25_FS);  // ~82.5e6  
     g_dpll        = 0;  
@@ -228,8 +252,10 @@ void rx_ax25_init(float center_hz) {
   
 #ifdef AX25_DEBUG  
     Serial.printf("# AX25 init center=%.1f mark=%.0f space=%.0f\n",  
-                  center_hz, AX25_MARK_HZ, AX25_SPACE_HZ);  
-#endif  
+                  (double)center_hz,  
+                  (double)(center_hz - 0.5f * AX25_SHIFT_HZ),  
+                  (double)(center_hz + 0.5f * AX25_SHIFT_HZ));  
+#endif
 }  
   
 void rx_ax25_stop(void) {  
@@ -253,7 +279,24 @@ void rx_ax25_push(int16_t m) {
   
     // Slicer input: mark positive, space negative  
     const float d = pm - ps;  
-  
+
+#ifdef AX25_DEBUG  
+    if (d < dbg_dmin) dbg_dmin = d;  
+    if (d > dbg_dmax) dbg_dmax = d;  
+    if (++dbg_samples >= AX25_FS) {  
+        dbg_samples = 0;  
+        Serial.printf("# AX25 d[%.0f..%.0f] pk=%.0f vl=%.0f mid=%.1f "  
+                      "bits=%lu flags=%lu stuff=%lu abort=%lu fcs_ok=%lu fcs_bad=%lu\n",  
+                      (double)dbg_dmin, (double)dbg_dmax,  
+                      (double)g_peak, (double)g_valley,  
+                      (double)((g_peak + g_valley) * 0.5f),  
+                      (unsigned long)dbg_bits, (unsigned long)dbg_flags,  
+                      (unsigned long)dbg_stuff, (unsigned long)dbg_abort,  
+                      (unsigned long)dbg_fcs_ok, (unsigned long)dbg_fcs_bad);  
+        dbg_dmin = 1e9f; dbg_dmax = -1e9f;  
+    }  
+#endif
+
     // AGC: attack fast / decay slow (refs/demod_afsk.c)  
     if (d > g_peak)   g_peak   += (d - g_peak)   * 0.5f;  
     else              g_peak   += (d - g_peak)   * 0.02f;  
@@ -267,6 +310,9 @@ void rx_ax25_push(int16_t m) {
     const uint32_t prev_dpll = g_dpll;  
     g_dpll += g_dpll_step;  
     if (g_dpll < prev_dpll) {                     // wrapped -> sample bit  
+#ifdef AX25_DEBUG  
+        ++dbg_bits;  
+#endif  
         ax25_hdlc_bit(tone);  
     }  
     if (tone != g_prev_tone) {                    // transition -> nudge phase  
