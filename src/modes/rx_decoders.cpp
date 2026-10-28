@@ -16,6 +16,7 @@
 #include "../modes/rx_olivia.h"
 #include "../modes/rx_contestia.h"
 #include "../modes/rx_jtty.h"
+#include "../../rx_ax25.h"
   
 // Коды мод из таблицы RSID (см. логи: RTTY-45=39, CW=26).  
 #define RSID_CODE_RTTY45   39  
@@ -23,6 +24,7 @@
 #define RTTY_SHIFT_HZ      170.0f
 #define RSID_CODE_IFKP     1171
 #define RSID_CODE_JTTY     1172
+#define RSID_CODE_AX25_300 35   // AX.25/PACKET 300bd
 #define RSID_CODE_OLIVIA_8_250      69
 #define RSID_CODE_CONTESTIA_8_250   49
 
@@ -33,7 +35,8 @@ enum {
     DEC_IFKP,
     DEC_OLIV,
     DEC_CONTESTIA, 
-    DEC_JTTY
+    DEC_JTTY,  
+    DEC_AX25
 };
   
 static int   active_dec = DEC_NONE;  
@@ -57,6 +60,7 @@ void rx_decoders_sample(int16_t m) {
     case DEC_OLIV:      rx_olivia_push(m);      break;
     case DEC_CONTESTIA: rx_contestia_push(m);   break;
     case DEC_JTTY:      rx_jtty_push(m);        break;
+    case DEC_AX25:      rx_ax25_push(m);        break;
     case DEC_NONE:                              break;
     default:                                    break;   // DEC_NONE — пока метки нет, не декодируем  
     }  
@@ -120,6 +124,12 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
          active_dec = DEC_JTTY;  
          Serial.printf("# DECODER=JTTY center=%.1f Hz\n", (double)r->freq_hz);  
          break;
+    case RSID_CODE_AX25_300:  
+        stop_all_goertzel_decoders();  
+        rx_ax25_init(r->freq_hz);  
+        active_dec = DEC_AX25;  
+        Serial.printf("# DECODER=AX25 center=%.1f Hz\n", (double)r->freq_hz);  
+        break;
 
     default:  
         Serial.printf("# DECODER unsupported code=%d\n", r->mode_code);  
@@ -142,6 +152,7 @@ static void stop_all_goertzel_decoders() {
     else if (active_dec == DEC_OLIV)        { rx_olivia_stop();     }
     else if (active_dec == DEC_CONTESTIA)   { rx_contestia_stop();  }
     else if (active_dec == DEC_JTTY)        { rx_jtty_stop();       }
+    else if (active_dec == DEC_AX25)        { rx_ax25_stop();       }
 }
 
 void rx_decoders_init(float fs_hz) {  
