@@ -99,7 +99,6 @@ struct RSIDmap { unsigned short rs; const char* name; };
     ELEM_(69,  "OLIVIA-8/250")                               \
     ELEM_(86, "DOMEX8")          ELEM_(137,"THOR8")          \
     ELEM_(138,"THOR16")          ELEM_(57, "MFSK16")         \
-    ELEM_(1172,"JTTY")                                       \
     ELEM_(0,   "NONE")
   
 #define ELEM_(code_, name_) { code_, name_ },  
@@ -111,6 +110,7 @@ static const int rsid_ids_size1 =
 // Расширенный набор. Терминатор должен иметь код RSID_NONE2 (0).  
 #define RSID_LIST2 \
     ELEM2_(1171, "IFKP")  \
+    ELEM2_(1172, "JTTY")  \
     ELEM2_(0,    "NONE2")  
   
 #define ELEM2_(code_, name_) { code_, name_ },  
