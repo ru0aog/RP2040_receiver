@@ -96,9 +96,14 @@ static uint8_t g_dec_bits[JTTY_INFO_BITS]; // decoded info bits when g_dec_ok
 // a frame finishes within a few Goertzel hops.  
 static constexpr int JTTY_VIT_STATES_PER_CALL = 256; // ~half a state sweep
 
-// Output text is assembled until an EOM atom is received.
-static char g_message[128];
-static size_t g_message_len = 0;
+// Output text is assembled until an EOM atom is received.  
+static char g_message[128];  
+static size_t g_message_len = 0;  
+static uint32_t g_last_atom_ms = 0;   // millis() of the last appended atom  
+  
+// If no atom arrives for this long, flush whatever was collected.  
+// Frames are ~1.9 s apart; 4 s covers one missed frame plus margin.  
+static constexpr uint32_t JTTY_MSG_IDLE_MS = 4000;
 
 // Viterbi working memory. A byte per state/step is compact and avoids
 // heap allocation; bit 0 records which predecessor's high state bit won.
@@ -129,20 +134,20 @@ static void jtty_message_clear(void)
     g_message[0] = '\0';
 }
 
+static void jtty_message_flush(void);  
+
 static void jtty_message_append(const char* text)
 {
     if (text == nullptr || *text == '\0') {
         return;
     }
 
-    const size_t n = strlen(text);
-    if (n >= sizeof(g_message) - 1 ||
-        g_message_len + n >= sizeof(g_message) - 1) {
-        // Never emit a truncated/concatenated message after overflow.
-        jtty_message_clear();
-        if (n >= sizeof(g_message) - 1) {
-            return;
-        }
+    const size_t n = strlen(text);  
+    if (n >= sizeof(g_message) - 1) {  
+        return;                         // atom itself can't fit — drop it  
+    }  
+    if (g_message_len + n >= sizeof(g_message) - 1) {  
+        jtty_message_flush();           // emit what we have, keep the new atom  
     }
 
     memcpy(g_message + g_message_len, text, n);
@@ -429,7 +434,8 @@ if (calculated_crc != received_crc) {
                 text[i] = (index < 64u) ? JTTY_ALPHABET[index] : '?';  
             }  
             text[5] = '\0';  
-            jtty_message_append(text);  
+            jtty_message_append(text);
+            g_last_atom_ms = millis();
         }  
         // CALL atoms intentionally not decoded (see previous revision notes).  
     }  
@@ -437,6 +443,8 @@ if (calculated_crc != received_crc) {
     if (eom) {  
         jtty_message_flush();  
     }  
+    // Idle-timeout flush lives in the hunting branch of rx_jtty_push:  
+    // here g_last_atom_ms was just updated, so the check could never fire.
 }
 
 // -----------------------------------------------------------------------------
@@ -484,8 +492,12 @@ void rx_jtty_init(float center_hz)
     g_dec_step = 0;  
     g_dec_state_i = 0;
 
-    jtty_clear_sync_history();
-    jtty_message_clear();
+    jtty_clear_sync_history();  
+    if (g_message_len > 0) {  
+        jtty_message_flush();   // emit collected text on mode change too  
+    } else {  
+        jtty_message_clear();  
+    }
 
     if (!isfinite(center_hz) || center_hz <= 0.0f ||
         center_hz >= JTTY_FS_HZ * 0.5f) {
@@ -575,8 +587,12 @@ void rx_jtty_push(int16_t sample)
             g_hunting = false;  
             g_data_count = 0;  
             g_hops_since_sync = 0;  
+        } else if (g_message_len > 0 &&  
+                   (uint32_t)(millis() - g_last_atom_ms) > JTTY_MSG_IDLE_MS) {  
+            // Пауза между кадрами > 4 с без EOM — печатаем накопленное.  
+            jtty_message_flush();  
         }  
-        return; 
+        return;  
     }
 
     // The sync detector fires at the end of the final sync-symbol window.
