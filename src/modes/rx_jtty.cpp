@@ -1,10 +1,11 @@
-// rx_jtty.cpp — JTTY decoder for RP2040_receiver.
+﻿// rx_jtty.cpp — JTTY decoder for RP2040_receiver.
 // 4-FSK, 31.25 baud, 500 samples/symbol at 15625 Hz.
 // Uses the shared rx_goertzel bank only; no FFT and no private Goertzel bank.
 
-#include "rx_jtty.h"
-#include "rx_goertzel.h"
-#include "rx_decoders.h"
+#include "../modes/rx_jtty.h"
+#include "../modes/rx_decoders.h"
+#include "../dsp/rx_goertzel.h"
+
 
 #include <Arduino.h>
 #include <math.h>

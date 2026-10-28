@@ -1,4 +1,4 @@
-// path: rx_cw.cpp  (ru0aog/RP2040_receiver)  
+﻿// path: rx_cw.cpp  (ru0aog/RP2040_receiver)  
 // ============================================================================  
 // rx_cw.cpp — декодер CW (Морзе) по одному тону.  
 // Вход: отсчёты базовой полосы 15625 Гц из rx_cw_sample. Тон сносится в DC  
@@ -11,8 +11,8 @@
 // ============================================================================  
 #include <Arduino.h>  
 #include <math.h>  
-#include "rx_cw.h"  
-#include "rx_decoders.h"   // единая точка вывода  
+#include "../modes/rx_cw.h"  
+#include "../modes/rx_decoders.h"   // единая точка вывода  
   
 // ---- параметры фронта ----  
 #define CW_LP_FC_HZ    80.0f     // полоса НЧ детектора тона  

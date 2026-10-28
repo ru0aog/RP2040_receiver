@@ -1,4 +1,4 @@
-/**
+﻿/**
  * ============================================================================
  * rx_olivia.cpp — OLIVIA 8/250 RX для RP2040_receiver.
  *
@@ -35,9 +35,9 @@
 #include <stdbool.h>
 #include <string.h>
 
-#include "rx_olivia.h"
-#include "rx_goertzel.h"
-#include "rx_decoders.h"
+#include "../modes/rx_olivia.h"
+#include "../modes/rx_decoders.h"
+#include "../dsp/rx_goertzel.h"
 
 // ---------------------------------------------------------------------------
 // Параметры режима

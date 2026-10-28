@@ -1,4 +1,4 @@
-// ============================================================================  
+﻿// ============================================================================  
 // rx_rtty.cpp — декодер RTTY-45 (45.45 бод, shift ~170 Гц, Baudot/ITA2)  
 // Вход: уровни мощности mark/space (pm=|mark|^2, ps=|space|^2) на КАЖДЫЙ  
 // отсчёт 15625 Гц из rx_mf_sample. Бит-автомат портирован из FLDigi (rtty.cxx):  
@@ -9,8 +9,8 @@
   
 #include <Arduino.h>  
 #include <math.h>  
-#include "rx_rtty.h"
-#include "rx_decoders.h"
+#include "../modes/rx_rtty.h"
+#include "../modes/rx_decoders.h"
   
 // ---------------- параметры RTTY ----------------  
 #define RTTY_BAUD       45.45f  

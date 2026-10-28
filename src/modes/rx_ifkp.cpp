@@ -1,13 +1,13 @@
-// rx_ifkp.cpp — декодер IFKP (incremental FSK, 33 тона, шаг 11.697 Гц).  
+﻿// rx_ifkp.cpp — декодер IFKP (incremental FSK, 33 тона, шаг 11.697 Гц).  
 // Переиспользует FFT из rx_rsid (11025 Гц, 1024 бина, окно ~46 мс).  
 // Символ ~500 мс; argmax тона на границе символа -> дельта IFK+ -> символ.  
 // Таблица — инверсия кодера маяка (ifkp_modem.cpp). Вывод: rx_decoders_emit.  
 #include <Arduino.h>  
 #include <math.h>  
 #include <string.h>  
-#include "rx_ifkp.h"  
-#include "rx_decoders.h"
-#include "rx_goertzel.h"
+#include "../modes/rx_ifkp.h"  
+#include "../modes/rx_decoders.h"
+#include "../dsp/rx_goertzel.h"
   
 #define IFKP_NTONES        33  
 #define IFKP_STEP_HZ       11.697f  

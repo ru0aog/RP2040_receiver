@@ -1,4 +1,4 @@
-/**
+﻿/**
  * ============================================================================
  * rx_contestia.cpp — CONTESTIA 8/250 для RP2040_receiver
  *
@@ -23,9 +23,9 @@
 #include <stdbool.h>
 #include <string.h>
 
-#include "rx_contestia.h"
-#include "rx_goertzel.h"
-#include "rx_decoders.h"
+#include "../modes/rx_contestia.h"
+#include "../dsp/rx_goertzel.h"
+#include "../modes/rx_decoders.h"
 
 // ---------------------------------------------------------------------------
 // Параметры

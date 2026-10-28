@@ -1,6 +1,6 @@
-#pragma once  
+﻿#pragma once  
 #include <stdint.h>  
-#include "rx_rsid.h"   // rsid_result_t  
+#include "../rsid/rx_rsid.h" 
   
 // Единая точка вывода символов декодера (по умолчанию — Serial).  
 typedef void (*rx_output_cb_t)(char c);  

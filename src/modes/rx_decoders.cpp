@@ -1,4 +1,4 @@
-/**    
+﻿/**    
  * ============================================================================    
  *  rx_decoders.cpp — декодеры цифровых мод на децимированной базовой полосе    
  *  Fs_in = rx_dsp_fs_out() ≈ 15.6 кс/с при RX_ADC_SAMPLE_RATE_HZ = 250 кГц.    
@@ -6,16 +6,16 @@
  */  
 
 #include <Arduino.h>  
-#include "vfo_hardware.h"  
+#include "../vfo/vfo_rp2040.h"  
 #include "rx_decoders.h"  
-#include "rx_rsid.h"  
-#include "rx_mf.h"
-#include "rx_cw.h"
-#include "rx_rtty.h"
-#include "rx_ifkp.h"
-#include "rx_olivia.h"
-#include "rx_contestia.h"
-#include "rx_jtty.h"
+#include "../rsid/rx_rsid.h" 
+#include "../modes/rx_mf.h"  
+#include "../modes/rx_cw.h"
+#include "../modes/rx_rtty.h"
+#include "../modes/rx_ifkp.h"
+#include "../modes/rx_olivia.h"
+#include "../modes/rx_contestia.h"
+#include "../modes/rx_jtty.h"
   
 // Коды мод из таблицы RSID (см. логи: RTTY-45=39, CW=26).  
 #define RSID_CODE_RTTY45   39  
