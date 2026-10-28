@@ -79,7 +79,7 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
                   r->mode_name, r->mode_code, r->freq_hz);  
   
     switch (r->mode_code) {  
-
+/*
     case RSID_CODE_RTTY45:  
         stop_all_goertzel_decoders(); 
         rx_mf_init(dec_fs_hz, r->freq_hz, RTTY_SHIFT_HZ);  
@@ -114,7 +114,7 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
         active_dec = DEC_CONTESTIA;
         Serial.printf("# DECODER=CONTESTIA center=%.1f Hz\n", (double)r->freq_hz);
         break;
-
+*/
     case RSID_CODE_JTTY:   // код уточнить — в стандартной таблице может отсутствовать  
          stop_all_goertzel_decoders();  
          rx_jtty_init(r->freq_hz);  
