@@ -170,7 +170,7 @@ static bool core0_timer_initialized = false;
 static uint32_t t_dbg = 0;
 
 
-if (millis() - t_dbg >= 1000) {
+if (millis() - t_dbg >= 10000) {
     t_dbg = millis();
 
     static uint32_t rsid_prev_calls = 0;

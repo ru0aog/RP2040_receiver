@@ -41,7 +41,7 @@ static void nco_lut_init(void) {
         nco_lut[i] = (int16_t)(32767.0f * sinf(2.0f * PI * i / 1024.0f));  
 }
 // быстрое извлечение квадратурной пары (синуса и косинуса) из заранее подготовленной таблицы
-static inline void nco_sincos(uint32_t ph, int16_t* s, int16_t* c) {  
+static inline void __not_in_flash_func(nco_sincos)(uint32_t ph, int16_t* s, int16_t* c) {
     uint16_t idx = ph >> 22;                // Битовый сдвиг фазы. Старшие 10 бит
     *s = nco_lut[idx];                      // Извлечение синуса
     *c = nco_lut[(idx + 256) & 1023];       // Извлечение косинуса. cos = sin сдвинутый на 90°  
@@ -85,7 +85,7 @@ static int32_t cic_comb_i[CIC_N], cic_comb_q[CIC_N];
 static uint8_t cic_cnt = 0;  
   
 // Возвращает true раз в CIC_R входных отсчётов с децимированной парой.  
-static inline bool cic_push_iq(int32_t xi, int32_t xq, int32_t* yi, int32_t* yq) {  
+static inline bool __not_in_flash_func(cic_push_iq)(int32_t xi, int32_t xq, int32_t* yi, int32_t* yq) {
     // интеграторы на полной частоте  
     cic_int_i[0] += xi; cic_int_i[1] += cic_int_i[0]; cic_int_i[2] += cic_int_i[1];  
     cic_int_q[0] += xq; cic_int_q[1] += cic_int_q[0]; cic_int_q[2] += cic_int_q[1];  
@@ -107,7 +107,7 @@ static inline bool cic_push_iq(int32_t xi, int32_t xq, int32_t* yi, int32_t* yq)
 }
 
 // реализует один шаг фильтрации и децимации (прореживания) данных через Half-Band FIR (КИХ) фильтр
-static inline bool hb_push(hb_state_t* st, int32_t x, int32_t* out) {
+static inline bool __not_in_flash_func(hb_push)(hb_state_t* st, int32_t x, int32_t* out) {
     // Новый входящий отсчёт x записывается в историю фильтра (линию задержки st->d) по текущему указателю записи st->w
     st->d[st->w] = x;
     // Указатель st->w сдвигается на следующий элемент
@@ -151,7 +151,7 @@ static inline bool hb_push(hb_state_t* st, int32_t x, int32_t* out) {
 
 
 // 16-битный ограничитель
-static inline int16_t sat16(int32_t v) {
+static inline int16_t __not_in_flash_func(sat16)(int32_t v) {
 // Если значение превысило верхний порог 32767, оно жестко ограничивается до максимума 32767
 // Если значение ушло ниже минимального порога -32768, оно ограничивается снизу до -32768
 // Если значение находится в безопасных пределах, оно возвращается без изменений
@@ -611,7 +611,7 @@ static uint64_t rsid_rr_frac_q = 0;
 
 // Коэффициенты кубического интерполятора Фарроу.
 // Представление соответствует существующему алгоритму rx_audio.cpp.
-static inline void rsid_farrow_calc_i(
+static inline void __not_in_flash_func(rsid_farrow_calc_i)(
     int32_t ym1,
     int32_t y0,
     int32_t y1,
@@ -629,7 +629,7 @@ static inline void rsid_farrow_calc_i(
 
 
 // Полином Горнера в Q15. Возвращает 2*y.
-static inline int32_t rsid_farrow_eval_i(
+static inline int32_t __not_in_flash_func(rsid_farrow_eval_i)(
     int32_t c0,
     int32_t c1,
     int32_t c2,
@@ -648,7 +648,7 @@ static inline int32_t rsid_farrow_eval_i(
 
 // Вызывается для каждого демодулированного отсчёта 15625 Гц.
 // Генерирует отсчёты 11025 Гц и передаёт их RSID-обработчику.
-static inline void rsid_resampler_push(int32_t x)
+static inline void __not_in_flash_func(rsid_resampler_push)(int32_t x)
 {
     rsid_rr_xm1 = rsid_rr_x0;
     rsid_rr_x0  = rsid_rr_x1;

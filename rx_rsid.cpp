@@ -425,14 +425,14 @@ void rsid_rx_reset(void) { rsid_reset_state(); }
 
 // Принимает отсчёт 11025 Гц от ресэмплера на Core 1.
 // При заполнении локальной очереди увеличивает счётчик потерь.
-void rsid_rx_push(int16_t sample) {
+void __not_in_flash_func(rsid_rx_push)(int16_t s) {  
     if (!rsid_inited) return;
 
     uint32_t head = rsid_sq_head;
     uint32_t next = (head + 1u) % RSID_SAMPLE_Q_SIZE;
 
     if (next != rsid_sq_tail) {
-        rsid_sample_queue[head] = sample;
+        rsid_sample_queue[head] = s;
         __dmb(); // Гарантируем запись сэмпла до сдвига head
         rsid_sq_head = next;
     } else {
@@ -464,7 +464,7 @@ bool rsid_get_rtty_center(float* f_hz) {
 }
 
 
-void rsid_rx_service_sliced(void) {
+void __not_in_flash_func(rsid_rx_service_sliced)(void) {
     const uint32_t t_service_start = micros();
 
     if (!rsid_inited) {

@@ -11,6 +11,10 @@
 #include <stdint.h>
 #include <string.h>
 
+// Отладочный вывод JTTY: синхра, запуск декода, причина сброса кадра.  
+// Убрать/закомментировать перед релизом — печать идёт на Core 0.  
+#define JTTY_DEBUG
+
 // -----------------------------------------------------------------------------
 // Protocol parameters
 // -----------------------------------------------------------------------------
@@ -60,9 +64,31 @@ static uint8_t g_sync_tones[JTTY_SYNC_HISTORY];
 static int g_sync_write = 0;
 static int g_sync_count = 0;
 
-static float g_data_power[JTTY_NDATA][JTTY_NTONES];
-static int g_data_count = 0;
-static int g_hops_since_sync = 0;
+static float g_data_power[JTTY_NDATA][JTTY_NTONES];  
+static int g_data_count = 0;  
+static int g_hops_since_sync = 0;  
+  
+// Resumable frame decode state machine. The Viterbi passes run in small  
+// quanta so that decoding never blocks the audio polling loop on Core 0.  
+typedef enum {  
+    JTTY_DEC_IDLE = 0,  
+    JTTY_DEC_PASS1,  
+    JTTY_DEC_PASS2,  
+    JTTY_DEC_TRACEBACK,  
+    JTTY_DEC_FINISH  
+} jtty_dec_state_t;  
+  
+static jtty_dec_state_t g_dec_state = JTTY_DEC_IDLE;  
+static int  g_dec_step = 0;        // symbol step within a pass  
+static int  g_dec_state_i = 0;     // destination-state iterator within a step  
+static int  g_dec_pass2_state = 0; // tail-biting start/end state from pass 1  
+static bool g_dec_ok = false;      // traceback passed the circular check  
+static uint8_t g_dec_bits[JTTY_INFO_BITS]; // decoded info bits when g_dec_ok  
+  
+// Viterbi quanta per service call. JTTY_VIT_STEPS are state iterations  
+// inside one symbol step; the number of serviced calls is small enough that  
+// a frame finishes within a few Goertzel hops.  
+static constexpr int JTTY_VIT_STATES_PER_CALL = 256; // ~half a state sweep
 
 // Output text is assembled until an EOM atom is received.
 static char g_message[128];
@@ -157,211 +183,248 @@ static uint16_t jtty_crc12(const uint8_t* bits)
     return reg;
 }
 
-// -----------------------------------------------------------------------------
-// Tail-biting Viterbi
-//
-// State convention:
-//   next_state = ((previous_state << 1) | input_bit) & 0x1ff
-//   input_bit  = next_state & 1
-// For a given next state, the two possible predecessor states differ in bit 8.
-// The selected predecessor's bit 8 is stored for traceback.
-//
-// Pass 1: all initial states have equal metric; select the best ending state.
-// Pass 2: constrain the start to that state and traceback from the same state.
-// This is a bounded-cost approximation to full tail-biting list decoding. The
-// frame is accepted only if the resulting path passes CRC-12.
-// -----------------------------------------------------------------------------
-static bool jtty_viterbi_decode(uint8_t decoded[JTTY_INFO_BITS],
-                                const float power[JTTY_NDATA][JTTY_NTONES])
-{
-    const float NEG_INF = -1.0e30f;
-
-    for (int s = 0; s < JTTY_NSTATES; ++s) {
-        g_metric_a[s] = 0.0f;
-    }
-
-    // Unconstrained pass: estimate the most likely circular state.
-    for (int step = 0; step < JTTY_INFO_BITS; ++step) {
-        float max_power = power[step][0];
-        for (int t = 1; t < JTTY_NTONES; ++t) {
-            if (power[step][t] > max_power) {
-                max_power = power[step][t];
-            }
-        }
-
-        for (int s = 0; s < JTTY_NSTATES; ++s) {
-            g_metric_b[s] = NEG_INF;
-        }
-
-        for (int s = 0; s < JTTY_NSTATES; ++s) {
-            const int input_bit = s & 1;
-            const int pred_base = s >> 1;
-
-            for (int pred_msb = 0; pred_msb <= 1; ++pred_msb) {
-                const int prev = pred_base | (pred_msb << (JTTY_NU - 1));
-                const float old_metric = g_metric_a[prev];
-                if (old_metric <= NEG_INF / 2.0f) {
-                    continue;
-                }
-
-                const uint16_t reg =
-                    (uint16_t)(((prev << 1) | input_bit) & 0x03FFu);
-                const int b0 = jtty_parity((uint32_t)(reg & JTTY_G0));
-                const int b1 = jtty_parity((uint32_t)(reg & JTTY_G1));
-                const int tone = JTTY_GRAY_TO_TONE[(b0 << 1) | b1];
-
-                // Subtracting the per-symbol maximum keeps the metric bounded
-                // without changing which path maximizes it.
-                const float candidate =
-                    old_metric + (power[step][tone] - max_power);
-
-                if (candidate > g_metric_b[s]) {
-                    g_metric_b[s] = candidate;
-                    g_predecessor[step][s] = (uint8_t)pred_msb;
-                }
-            }
-        }
-
-        float* tmp = g_metric_a;
-        memcpy(g_metric_a, g_metric_b, sizeof(g_metric_a));
-        (void)tmp;
-    }
-
-    int best_state = 0;
-    for (int s = 1; s < JTTY_NSTATES; ++s) {
-        if (g_metric_a[s] > g_metric_a[best_state]) {
-            best_state = s;
-        }
-    }
-
-    // Constrained pass: start and end at best_state.
-    for (int s = 0; s < JTTY_NSTATES; ++s) {
-        g_metric_a[s] = NEG_INF;
-    }
-    g_metric_a[best_state] = 0.0f;
-
-    for (int step = 0; step < JTTY_INFO_BITS; ++step) {
-        float max_power = power[step][0];
-        for (int t = 1; t < JTTY_NTONES; ++t) {
-            if (power[step][t] > max_power) {
-                max_power = power[step][t];
-            }
-        }
-
-        for (int s = 0; s < JTTY_NSTATES; ++s) {
-            g_metric_b[s] = NEG_INF;
-        }
-
-        for (int s = 0; s < JTTY_NSTATES; ++s) {
-            const int input_bit = s & 1;
-            const int pred_base = s >> 1;
-
-            for (int pred_msb = 0; pred_msb <= 1; ++pred_msb) {
-                const int prev = pred_base | (pred_msb << (JTTY_NU - 1));
-                const float old_metric = g_metric_a[prev];
-                if (old_metric <= NEG_INF / 2.0f) {
-                    continue;
-                }
-
-                const uint16_t reg =
-                    (uint16_t)(((prev << 1) | input_bit) & 0x03FFu);
-                const int b0 = jtty_parity((uint32_t)(reg & JTTY_G0));
-                const int b1 = jtty_parity((uint32_t)(reg & JTTY_G1));
-                const int tone = JTTY_GRAY_TO_TONE[(b0 << 1) | b1];
-
-                const float candidate =
-                    old_metric + (power[step][tone] - max_power);
-
-                if (candidate > g_metric_b[s]) {
-                    g_metric_b[s] = candidate;
-                    g_predecessor[step][s] = (uint8_t)pred_msb;
-                }
-            }
-        }
-
-        memcpy(g_metric_a, g_metric_b, sizeof(g_metric_a));
-    }
-
-    if (g_metric_a[best_state] <= NEG_INF / 2.0f) {
-        return false;
-    }
-
-    int state = best_state;
-    for (int step = JTTY_INFO_BITS - 1; step >= 0; --step) {
-        decoded[step] = (uint8_t)(state & 1);
-        const int pred_msb = g_predecessor[step][state] & 1u;
-        state = (state >> 1) | (pred_msb << (JTTY_NU - 1));
-    }
-
-    // Enforce the tail-biting condition explicitly.
-    return state == best_state;
+// One symbol step of a Viterbi pass, bounded to JTTY_VIT_STATES_PER_CALL  
+// destination-state updates. Returns true when the step is finished.  
+// g_dec_state_i tracks progress within the step; on entry to a new step it  
+// resets g_metric_b.  
+static bool jtty_vit_step_quanta(const float power[JTTY_NDATA][JTTY_NTONES],  
+                                 int step)  
+{  
+    const float NEG_INF = -1.0e30f;  
+  
+    if (g_dec_state_i == 0) {  
+        for (int s = 0; s < JTTY_NSTATES; ++s) {  
+            g_metric_b[s] = NEG_INF;  
+        }  
+    }  
+  
+    float max_power = power[step][0];  
+    for (int t = 1; t < JTTY_NTONES; ++t) {  
+        if (power[step][t] > max_power) {  
+            max_power = power[step][t];  
+        }  
+    }  
+  
+    const int s_end = g_dec_state_i + JTTY_VIT_STATES_PER_CALL;  
+    const int limit = (s_end < JTTY_NSTATES) ? s_end : JTTY_NSTATES;  
+  
+    for (int s = g_dec_state_i; s < limit; ++s) {  
+        const int input_bit = s & 1;  
+        const int pred_base = s >> 1;  
+  
+        for (int pred_msb = 0; pred_msb <= 1; ++pred_msb) {  
+            const int prev = pred_base | (pred_msb << (JTTY_NU - 1));  
+            const float old_metric = g_metric_a[prev];  
+            if (old_metric <= NEG_INF / 2.0f) {  
+                continue;  
+            }  
+  
+            const uint16_t reg =  
+                (uint16_t)(((prev << 1) | input_bit) & 0x03FFu);  
+            const int b0 = jtty_parity((uint32_t)(reg & JTTY_G0));  
+            const int b1 = jtty_parity((uint32_t)(reg & JTTY_G1));  
+            const int tone = JTTY_GRAY_TO_TONE[(b0 << 1) | b1];  
+  
+            const float candidate =  
+                old_metric + (power[step][tone] - max_power);  
+  
+            if (candidate > g_metric_b[s]) {  
+                g_metric_b[s] = candidate;  
+                g_predecessor[step][s] = (uint8_t)pred_msb;  
+            }  
+        }  
+    }  
+  
+    g_dec_state_i = limit;  
+    if (g_dec_state_i < JTTY_NSTATES) {  
+        return false; // step not finished yet  
+    }  
+  
+    // Step complete: commit metrics.  
+    memcpy(g_metric_a, g_metric_b, sizeof(g_metric_a));  
+    g_dec_state_i = 0;  
+    return true;  
+}  
+  
+// Advance the decode state machine once per service call. Returns true when  
+// the whole frame decode is done (g_dec_ok holds the result, g_dec_bits the  
+// info bits on success).  
+static bool jtty_dec_service(void)  
+{  
+    const float NEG_INF = -1.0e30f;  
+  
+    switch (g_dec_state) {  
+  
+    case JTTY_DEC_PASS1:  
+        // Pass 1 launch happens in jtty_dec_start(). Here we iterate steps.  
+        if (jtty_vit_step_quanta(g_data_power, g_dec_step)) {  
+            if (++g_dec_step >= JTTY_INFO_BITS) {  
+                // Pick best ending state.  
+                int best_state = 0;  
+                for (int s = 1; s < JTTY_NSTATES; ++s) {  
+                    if (g_metric_a[s] > g_metric_a[best_state]) {  
+                        best_state = s;  
+                    }  
+                }  
+                g_dec_pass2_state = best_state;  
+  
+                // Launch constrained pass 2.  
+                for (int s = 0; s < JTTY_NSTATES; ++s) {  
+                    g_metric_a[s] = NEG_INF;  
+                }  
+                g_metric_a[best_state] = 0.0f;  
+                g_dec_step = 0;  
+                g_dec_state = JTTY_DEC_PASS2;  
+            }  
+        }  
+        return false;  
+  
+    case JTTY_DEC_PASS2:  
+        if (jtty_vit_step_quanta(g_data_power, g_dec_step)) {  
+            if (++g_dec_step >= JTTY_INFO_BITS) {  
+                g_dec_ok = false;  
+                if (g_metric_a[g_dec_pass2_state] > NEG_INF / 2.0f) {  
+                    g_dec_step = JTTY_INFO_BITS - 1;  
+                    g_dec_state_i = g_dec_pass2_state; // reuse as traceback ptr  
+                    g_dec_state = JTTY_DEC_TRACEBACK;  
+                } else {  
+                    g_dec_state = JTTY_DEC_FINISH;  
+                }  
+            }  
+        }  
+        return false;  
+  
+    case JTTY_DEC_TRACEBACK: {  
+        // Traceback is only 46 iterations — do it in one quantum.  
+        int state = g_dec_state_i;  
+        for (int step = JTTY_INFO_BITS - 1; step >= 0; --step) {  
+            g_dec_bits[step] = (uint8_t)(state & 1);  
+            const int pred_msb = g_predecessor[step][state] & 1u;  
+            state = (state >> 1) | (pred_msb << (JTTY_NU - 1));  
+        }  
+        g_dec_ok = (state == g_dec_pass2_state);  
+        g_dec_state = JTTY_DEC_FINISH;  
+        return false;  
+    }  
+  
+    case JTTY_DEC_FINISH:  
+        g_dec_state = JTTY_DEC_IDLE;  
+        return true;  
+  
+    case JTTY_DEC_IDLE:  
+    default:  
+        return true;  
+    }  
+}  
+  
+// Launch the resumable decode on the collected frame.  
+static void jtty_dec_start(void)  
+{  
+    for (int s = 0; s < JTTY_NSTATES; ++s) {  
+        g_metric_a[s] = 0.0f;  
+    }  
+    g_dec_step = 0;  
+    g_dec_state_i = 0;  
+    g_dec_ok = false;  
+    g_dec_state = JTTY_DEC_PASS1;  
 }
 
 // -----------------------------------------------------------------------------
 // Payload handling
 // -----------------------------------------------------------------------------
-static void jtty_process_frame(void)
-{
-    uint8_t info[JTTY_INFO_BITS];
-
-    if (!jtty_viterbi_decode(info, g_data_power)) {
-#ifdef JTTY_DEBUG
-        Serial.println(F("# JTTY: Viterbi/tail-biting failure"));
+// Called once when a full 46-symbol data frame is in g_data_power: start the  
+// resumable decode. The audio path returns to hunting immediately; decode  
+// progresses through jtty_dec_service() on subsequent calls.  
+static void jtty_frame_launch(void)    
+{    
+    if (g_dec_state != JTTY_DEC_IDLE) {  
+#ifdef JTTY_DEBUG  
+        Serial.println(F("# JTTY: frame dropped (decoder busy)"));  
+#endif  
+        return;  
+    }  
+#ifdef JTTY_DEBUG  
+    Serial.println(F("# JTTY: frame collected, decode start"));  
+#endif  
+    jtty_dec_start();    
+}
+  
+// Called when jtty_dec_service() reports completion: run CRC and emit atoms.  
+static void jtty_frame_finish(void)    
+{    
+    const uint8_t* info = g_dec_bits;    
+    
+    if (!g_dec_ok) {    
+#ifdef JTTY_DEBUG    
+        Serial.println(F("# JTTY: Viterbi/tail-biting failure"));    
+#endif    
+        return;    
+    }    
+  
+#ifdef JTTY_DEBUG  
+    // Грубая оценка качества: сумма мощностей лучших тонов к полной.  
+    float p_sig = 0.0f, p_sum = 0.0f;  
+    for (int i = 0; i < JTTY_NDATA; ++i) {  
+        float best = g_data_power[i][0];  
+        float row = 0.0f;  
+        for (int t = 0; t < JTTY_NTONES; ++t) {  
+            row += g_data_power[i][t];  
+            if (g_data_power[i][t] > best) best = g_data_power[i][t];  
+        }  
+        p_sig += best;  
+        p_sum += row;  
+    }  
+    const float ratio = (p_sum > 0.0f) ? p_sig / p_sum : 0.0f;  
+    Serial.printf("# JTTY: Viterbi ok, tone_ratio=%.2f\n", (double)ratio);  
 #endif
-        return;
-    }
-
-    const uint16_t calculated_crc = jtty_crc12(info);
-    uint16_t received_crc = 0;
-    for (int i = JTTY_PAYLOAD_BITS; i < JTTY_INFO_BITS; ++i) {
-        received_crc = (uint16_t)((received_crc << 1) | (info[i] & 1u));
-    }
-
-    if (calculated_crc != received_crc) {
-#ifdef JTTY_DEBUG
-        Serial.println(F("# JTTY: CRC failure"));
+  
+    const uint16_t calculated_crc = jtty_crc12(info);  
+    uint16_t received_crc = 0;  
+    for (int i = JTTY_PAYLOAD_BITS; i < JTTY_INFO_BITS; ++i) {  
+        received_crc = (uint16_t)((received_crc << 1) | (info[i] & 1u));  
+    }  
+  
+if (calculated_crc != received_crc) {    
+#ifdef JTTY_DEBUG    
+        Serial.printf("# JTTY: CRC failure calc=%03X rx=%03X\n",  
+                      calculated_crc, received_crc);  
+#endif    
+        return;    
+    }    
+  
+#ifdef JTTY_DEBUG  
+    Serial.println(F("# JTTY: CRC ok"));  
 #endif
-        return;
-    }
-
-    // Payload bits 0..31 are the atom value; bit 32 is reserved and bit 33 EOM.
-    uint32_t atom = 0;
-    for (int i = 0; i < 32; ++i) {
-        atom = (atom << 1) | (info[i] & 1u);
-    }
-
-    const bool reserved = info[32] != 0;
-    const bool eom = info[33] != 0;
-    const uint8_t type = (uint8_t)(atom & 0x03u);
-
-    if (!reserved) {
-        if (type == 3u) {
-            // TEXT5: five 6-bit alphabet indices occupy the upper 30 bits.
-            uint32_t packed = atom >> 2;
-            char text[6];
-
-            for (int i = 4; i >= 0; --i) {
-                const uint8_t index = (uint8_t)(packed & 0x3Fu);
-                packed >>= 6;
-
-                // The encoding table is expected to contain exactly 64
-                // characters; guard the lookup even if the table is edited.
-                text[i] = (index < 64u) ? JTTY_ALPHABET[index] : '?';
-            }
-            text[5] = '\0';
-            jtty_message_append(text);
-        } else {
-            // CALL (type 0/1) is intentionally not decoded here. The exact
-            // pack28/unpack28 bit layout must be verified against the
-            // reference golden vectors before displaying a callsign.
-            // Type 2 is a non-text atom and is ignored.
-        }
-    }
-
-    // EOM is meaningful even when the final atom is not TEXT5.
-    if (eom) {
-        jtty_message_flush();
-    }
+  
+    // Payload bits 0..31 are the atom value; bit 32 is reserved and bit 33 EOM.  
+    uint32_t atom = 0;  
+    for (int i = 0; i < 32; ++i) {  
+        atom = (atom << 1) | (info[i] & 1u);  
+    }  
+  
+    const bool reserved = info[32] != 0;  
+    const bool eom = info[33] != 0;  
+    const uint8_t type = (uint8_t)(atom & 0x03u);  
+  
+    if (!reserved) {  
+        if (type == 3u) {  
+            uint32_t packed = atom >> 2;  
+            char text[6];  
+  
+            for (int i = 4; i >= 0; --i) {  
+                const uint8_t index = (uint8_t)(packed & 0x3Fu);  
+                packed >>= 6;  
+                text[i] = (index < 64u) ? JTTY_ALPHABET[index] : '?';  
+            }  
+            text[5] = '\0';  
+            jtty_message_append(text);  
+        }  
+        // CALL atoms intentionally not decoded (see previous revision notes).  
+    }  
+  
+    if (eom) {  
+        jtty_message_flush();  
+    }  
 }
 
 // -----------------------------------------------------------------------------
@@ -374,30 +437,26 @@ static void jtty_clear_sync_history(void)
     g_sync_count = 0;
 }
 
-static bool jtty_sync_match(void)
-{
-    if (g_sync_count < JTTY_SYNC_HISTORY) {
-        return false;
-    }
-
-    int matches = 0;
-    for (int i = 0; i < JTTY_NSYNC; ++i) {
-        // Current result is the end of symbol 12. Previous sync symbols are
-        // exactly five Goertzel hops apart. This tests the five possible
-        // phases implicitly as each new 100-sample hop arrives.
-        const int back = (JTTY_NSYNC - 1 - i) * JTTY_HOPS_PER_SYMBOL;
-        int idx = g_sync_write - 1 - back;
-        while (idx < 0) {
-            idx += JTTY_SYNC_HISTORY;
-        }
-        idx %= JTTY_SYNC_HISTORY;
-
-        if (g_sync_tones[idx] == JTTY_IS13[i]) {
-            ++matches;
-        }
-    }
-
-    return matches >= 7;
+static int jtty_sync_matches(void)  
+{  
+    if (g_sync_count < JTTY_SYNC_HISTORY) {  
+        return 0;  
+    }  
+  
+    int matches = 0;  
+    for (int i = 0; i < JTTY_NSYNC; ++i) {  
+        const int back = (JTTY_NSYNC - 1 - i) * JTTY_HOPS_PER_SYMBOL;  
+        int idx = g_sync_write - 1 - back;  
+        while (idx < 0) {  
+            idx += JTTY_SYNC_HISTORY;  
+        }  
+        idx %= JTTY_SYNC_HISTORY;  
+  
+        if (g_sync_tones[idx] == JTTY_IS13[i]) {  
+            ++matches;  
+        }  
+    }  
+    return matches;  
 }
 
 // -----------------------------------------------------------------------------
@@ -409,6 +468,10 @@ void rx_jtty_init(float center_hz)
     g_hunting = true;
     g_data_count = 0;
     g_hops_since_sync = 0;
+    g_dec_state = JTTY_DEC_IDLE;  
+    g_dec_step = 0;  
+    g_dec_state_i = 0;
+
     jtty_clear_sync_history();
     jtty_message_clear();
 
@@ -449,6 +512,10 @@ void rx_jtty_stop(void)
     g_hunting = true;
     g_data_count = 0;
     g_hops_since_sync = 0;
+    g_dec_state = JTTY_DEC_IDLE;  
+    g_dec_step = 0;  
+    g_dec_state_i = 0;
+
     jtty_clear_sync_history();
     jtty_message_clear();
 
@@ -462,11 +529,18 @@ void rx_jtty_push(int16_t sample)
         return;
     }
 
-    float power[JTTY_NTONES];
-    if (!gb_push_ex(sample, power)) {
-        return;
-    }
-
+    float power[JTTY_NTONES];  
+    if (!gb_push_ex(sample, power)) {  
+        return;  
+    }  
+  
+    // Advance a pending frame decode by one bounded quantum. Runs on every  
+    // completed Goertzel result (~156 Hz), so a frame finishes in well under  
+    // a second without ever blocking the audio loop.  
+    if (g_dec_state != JTTY_DEC_IDLE && jtty_dec_service()) {  
+        jtty_frame_finish();  
+    }  
+  
     if (g_hunting) {
         int best_tone = 0;
         for (int t = 1; t < JTTY_NTONES; ++t) {
@@ -481,15 +555,15 @@ void rx_jtty_push(int16_t sample)
             ++g_sync_count;
         }
 
-        if (jtty_sync_match()) {
-#ifdef JTTY_DEBUG
-            Serial.println(F("# JTTY: sync found"));
-#endif
-            g_hunting = false;
-            g_data_count = 0;
-            g_hops_since_sync = 0;
-        }
-        return;
+    if (jtty_sync_matches()) {
+#ifdef JTTY_DEBUG  
+            Serial.println(F("# JTTY: sync found"));  
+#endif 
+            g_hunting = false;  
+            g_data_count = 0;  
+            g_hops_since_sync = 0;  
+        }  
+        return;  
     }
 
     // The sync detector fires at the end of the final sync-symbol window.
@@ -507,14 +581,14 @@ void rx_jtty_push(int16_t sample)
         ++g_data_count;
     }
 
-    if (g_data_count >= JTTY_NDATA) {
-        jtty_process_frame();
-
-        // Continue using the same global bank and hop cadence. Clear history
-        // so the frame's data tones cannot be mistaken for a fresh preamble.
-        g_hunting = true;
-        g_data_count = 0;
-        g_hops_since_sync = 0;
-        jtty_clear_sync_history();
-    }
+    if (g_data_count >= JTTY_NDATA) {  
+        jtty_frame_launch();  
+  
+        // Return to hunting immediately; the decode state machine keeps  
+        // running in the background on subsequent service calls.  
+        g_hunting = true;  
+        g_data_count = 0;  
+        g_hops_since_sync = 0;  
+        jtty_clear_sync_history();  
+    }  
 }

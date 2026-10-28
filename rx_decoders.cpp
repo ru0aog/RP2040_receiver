@@ -57,6 +57,7 @@ void rx_decoders_sample(int16_t m) {
     case DEC_OLIV:      rx_olivia_push(m);      break;
     case DEC_CONTESTIA: rx_contestia_push(m);   break;
     case DEC_JTTY:      rx_jtty_push(m);        break;
+    case DEC_NONE:                              break;
     default:                                    break;   // DEC_NONE — пока метки нет, не декодируем  
     }  
 }
@@ -67,18 +68,16 @@ volatile uint32_t rsid_callback_max_us = 0;
 // Вызывается из rsid_rx_service() (Core 0, loop) — Serial безопасен.  
 void rx_decoders_on_rsid(const rsid_result_t* r) {  
     const uint32_t t_start = micros();
-
-    if (!r) {
-        return;
-    }
-
+    if (!r) { return; }
     rsid_callback_count++;
-  
     // ЕДИНСТВЕННАЯ точка печати RSID-метки.  
     Serial.printf("# RSID mode=%s code=%d freq=%.1f\n",  
                   r->mode_name, r->mode_code, r->freq_hz);  
   
     switch (r->mode_code) {  
+
+    case DEC_NONE:
+        break;
 
     case RSID_CODE_RTTY45:  
         stop_all_goertzel_decoders(); 
