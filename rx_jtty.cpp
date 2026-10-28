@@ -11,8 +11,8 @@
 #include <stdint.h>
 #include <string.h>
 
-// Отладочный вывод JTTY: синхра, запуск декода, причина сброса кадра.  
-// Убрать/закомментировать перед релизом — печать идёт на Core 0.  
+// Отладочный вывод JTTY включается только при сборке с -DJTTY_DEBUG.
+// Не включать постоянно: Serial-печать может задерживать обработку аудио.
 #define JTTY_DEBUG
 
 // -----------------------------------------------------------------------------
@@ -91,10 +91,11 @@ static int  g_dec_pass2_state = 0; // tail-biting start/end state from pass 1
 static bool g_dec_ok = false;      // traceback passed the circular check  
 static uint8_t g_dec_bits[JTTY_INFO_BITS]; // decoded info bits when g_dec_ok  
   
-// Viterbi quanta per service call. JTTY_VIT_STEPS are state iterations  
-// inside one symbol step; the number of serviced calls is small enough that  
-// a frame finishes within a few Goertzel hops.  
-static constexpr int JTTY_VIT_STATES_PER_CALL = 256; // ~half a state sweep
+// Number of destination states processed per service call. At 256 states
+// per call, 46 symbols × 2 passes × 2 calls/symbol = 184 service calls.
+// With a 100-sample hop at 15625 Hz, the two Viterbi passes take about 1.18 s.
+// Keep this quantum bounded to avoid long pauses in the audio-processing loop.
+static constexpr int JTTY_VIT_STATES_PER_CALL = 256; // half a state sweep
 
 // Output text is assembled until an EOM atom is received.  
 static char g_message[128];  
@@ -142,39 +143,41 @@ static void jtty_message_append(const char* text)
         return;
     }
 
-    const size_t n = strlen(text);  
-    if (n >= sizeof(g_message) - 1) {  
-        return;                         // atom itself can't fit — drop it  
-    }  
-    if (g_message_len + n >= sizeof(g_message) - 1) {  
-        jtty_message_flush();           // emit what we have, keep the new atom  
+    const size_t n = strlen(text);
+
+    if (n >= sizeof(g_message) - 1) {
+        return;  // atom itself can't fit — drop it
     }
 
+    if (g_message_len + n >= sizeof(g_message) - 1) {
+        jtty_message_flush();
+    }
+
+    // Сохраняем атом в буфере для контроля тайм-аута.
     memcpy(g_message + g_message_len, text, n);
     g_message_len += n;
     g_message[g_message_len] = '\0';
+
+    // ПОТОКОВЫЙ ВЫВОД:
+    // отправляем символы сразу после успешной CRC.
+    // '<' считаем заполнителем протокола и не выводим.
+    for (size_t i = 0; i < n; ++i) {
+        const unsigned char c = (unsigned char)text[i];
+
+        if (c >= 32 && c <= 126 && c != '<') {
+            rx_decoders_emit((char)c);
+        }
+    }
 }
 
 static void jtty_message_flush(void)
 {
-    // The protocol filler is represented by '<'. Trim trailing filler and
-    // spaces; do not invent replacements for filler inside the message.
-    while (g_message_len > 0 &&
-           (g_message[g_message_len - 1] == '<' ||
-            g_message[g_message_len - 1] == ' ')) {
-        --g_message_len;
-    }
-    g_message[g_message_len] = '\0';
-
-    for (size_t i = 0; i < g_message_len; ++i) {
-        const unsigned char c = (unsigned char)g_message[i];
-        if (c >= 32 && c <= 126) {
-            rx_decoders_emit((char)c);
-        }
-    }
+    // Символы уже выведены через jtty_message_append().
+    // Здесь только завершаем строку и очищаем буфер.
     if (g_message_len != 0) {
         rx_decoders_emit('\n');
     }
+
     jtty_message_clear();
 }
 
@@ -558,9 +561,9 @@ void rx_jtty_push(int16_t sample)
         return;  
     }  
   
-    // Advance a pending frame decode by one bounded quantum. Runs on every  
-    // completed Goertzel result (~156 Hz), so a frame finishes in well under  
-    // a second without ever blocking the audio loop.  
+    // Advance a pending frame decode by one bounded quantum on each completed
+    // Goertzel result (~156.25 Hz). A full decode takes about 1.18 s at the
+    // current 256-state quantum; each individual call remains bounded.  
     if (g_dec_state != JTTY_DEC_IDLE && jtty_dec_service()) {  
         jtty_frame_finish();  
     }  
@@ -578,11 +581,11 @@ void rx_jtty_push(int16_t sample)
         if (g_sync_count < JTTY_SYNC_HISTORY) {
             ++g_sync_count;
         }
-
-    if (jtty_sync_matches() >= JTTY_SYNC_MIN) {  
-#ifdef JTTY_DEBUG  
-            Serial.printf("# JTTY: sync found %d/%d\n",  
-                          jtty_sync_matches(), JTTY_NSYNC);  
+        const int sync_matches = jtty_sync_matches();
+        if (sync_matches >= JTTY_SYNC_MIN) {
+#ifdef JTTY_DEBUG
+            Serial.printf("# JTTY: sync found %d/%d\n",
+                          sync_matches, JTTY_NSYNC);
 #endif  
             g_hunting = false;  
             g_data_count = 0;  
