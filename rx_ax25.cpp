@@ -28,7 +28,7 @@ static constexpr float    AX25_FS        = 15625.0f;
 static constexpr float    AX25_BAUD      = 300.0f;  
 static constexpr float    AX25_LP_ALPHA  = 0.20f;    // matched-filter LP, ~50 Hz
 
-static constexpr float AX25_SHIFT_HZ  = 200.0f;    // сдвиг mark/space, Гц  
+static constexpr float AX25_SHIFT_HZ  = 1000.0f;   // Bell 202: center ± 500 Гц 
 // Тоны ставятся симметрично вокруг метки RSID:  
 //   mark  = center_hz − SHIFT/2  
 //   space = center_hz + SHIFT/2  
@@ -131,12 +131,19 @@ static void ax25_frame_finish(void) {
     for (int i = 0; i < g_frame_len; ++i) {  
         crc = ax25_fcs_update(crc, g_frame_buf[i]);  
     }  
-    if (crc != AX25_FCS_MAGIC) {  
-#ifdef AX25_DEBUG  
-        Serial.printf("# AX25 FCS bad len=%d crc=%04X\n", g_frame_len, crc);  
-#endif  
-        return;  
-    }  
+if (crc != AX25_FCS_MAGIC) {    
+#ifdef AX25_DEBUG    
+        // Дамп первых 32 байт (без FCS): позывные читаемы как ASCII<<1  
+        // res=crc — остаток CRC по кадру с FCS; 0xF0B8 = идеальный приём  
+        Serial.printf("# AX25 FCS bad len=%d res=%04X bytes: ",  
+                      g_frame_len, crc);  
+        const int n = (g_frame_len - 2 < 32) ? (g_frame_len - 2) : 32;  
+        for (int k = 0; k < n; ++k)  
+            Serial.printf("%02X", g_frame_buf[k]);  
+        Serial.println();  
+#endif    
+        return;    
+    }
     if (g_pll_quality < PLL_GOOD_BITS * 2) ++g_pll_quality;  
   
     const int payload = g_frame_len - 2;              // strip FCS  
