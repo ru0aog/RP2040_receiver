@@ -96,7 +96,7 @@ struct RSIDmap { unsigned short rs; const char* name; };
     ELEM_(26,  "CW")                                         \
     ELEM_(39,  "RTTY-45")        ELEM_(40, "RTTY-50")        \
     ELEM_(49,  "CONT-8/250")                                 \
-    ELEM_(69,  "OLIVIA-8/250")                               \
+    ELEM_(69,  "OLIVIA-8/250")   ELEM_(70, "AX25")           \
     ELEM_(86, "DOMEX8")          ELEM_(137,"THOR8")          \
     ELEM_(138,"THOR16")          ELEM_(57, "MFSK16")         \
     ELEM_(0,   "NONE")
