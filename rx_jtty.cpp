@@ -51,8 +51,13 @@ static constexpr int JTTY_HOPS_PER_SYMBOL =
 
 // Keep enough overlapping-window decisions to test 13 symbols spaced five
 // results apart, for every possible phase modulo 100 samples.
-static constexpr int JTTY_SYNC_HISTORY =
-    (JTTY_NSYNC - 1) * JTTY_HOPS_PER_SYMBOL + 1;
+static constexpr int JTTY_SYNC_HISTORY =  
+    (JTTY_NSYNC - 1) * JTTY_HOPS_PER_SYMBOL + 1;  
+  
+// Minimum matches out of 13 sync positions to accept a preamble.  
+// jtty_mdecode channel 0 requires nsync > 6; 8 gives margin for our  
+// overlapping-window counting, which scores more loosely than theirs.  
+static constexpr int JTTY_SYNC_MIN = 8;
 
 // -----------------------------------------------------------------------------
 // State
@@ -64,9 +69,10 @@ static uint8_t g_sync_tones[JTTY_SYNC_HISTORY];
 static int g_sync_write = 0;
 static int g_sync_count = 0;
 
-static float g_data_power[JTTY_NDATA][JTTY_NTONES];  
-static int g_data_count = 0;  
-static int g_hops_since_sync = 0;  
+static float g_data_power[JTTY_NDATA][JTTY_NTONES];    
+static float g_dec_power[JTTY_NDATA][JTTY_NTONES];  // snapshot for the decoder  
+static int g_data_count = 0;    
+static int g_hops_since_sync = 0;
   
 // Resumable frame decode state machine. The Viterbi passes run in small  
 // quanta so that decoding never blocks the audio polling loop on Core 0.  
@@ -257,7 +263,7 @@ static bool jtty_dec_service(void)
   
     case JTTY_DEC_PASS1:  
         // Pass 1 launch happens in jtty_dec_start(). Here we iterate steps.  
-        if (jtty_vit_step_quanta(g_data_power, g_dec_step)) {  
+        if (jtty_vit_step_quanta(g_dec_power, g_dec_step)) {
             if (++g_dec_step >= JTTY_INFO_BITS) {  
                 // Pick best ending state.  
                 int best_state = 0;  
@@ -280,7 +286,7 @@ static bool jtty_dec_service(void)
         return false;  
   
     case JTTY_DEC_PASS2:  
-        if (jtty_vit_step_quanta(g_data_power, g_dec_step)) {  
+        if (jtty_vit_step_quanta(g_dec_power, g_dec_step)) {
             if (++g_dec_step >= JTTY_INFO_BITS) {  
                 g_dec_ok = false;  
                 if (g_metric_a[g_dec_pass2_state] > NEG_INF / 2.0f) {  
@@ -318,15 +324,16 @@ static bool jtty_dec_service(void)
 }  
   
 // Launch the resumable decode on the collected frame.  
-static void jtty_dec_start(void)  
-{  
-    for (int s = 0; s < JTTY_NSTATES; ++s) {  
-        g_metric_a[s] = 0.0f;  
-    }  
-    g_dec_step = 0;  
-    g_dec_state_i = 0;  
-    g_dec_ok = false;  
-    g_dec_state = JTTY_DEC_PASS1;  
+static void jtty_dec_start(void)    
+{    
+    memcpy(g_dec_power, g_data_power, sizeof(g_dec_power));  // ~0.1 ms, once per frame  
+    for (int s = 0; s < JTTY_NSTATES; ++s) {    
+        g_metric_a[s] = 0.0f;    
+    }    
+    g_dec_step = 0;    
+    g_dec_state_i = 0;    
+    g_dec_ok = false;    
+    g_dec_state = JTTY_DEC_PASS1;    
 }
 
 // -----------------------------------------------------------------------------
@@ -364,13 +371,13 @@ static void jtty_frame_finish(void)
 #ifdef JTTY_DEBUG  
     // Грубая оценка качества: сумма мощностей лучших тонов к полной.  
     float p_sig = 0.0f, p_sum = 0.0f;  
-    for (int i = 0; i < JTTY_NDATA; ++i) {  
-        float best = g_data_power[i][0];  
-        float row = 0.0f;  
-        for (int t = 0; t < JTTY_NTONES; ++t) {  
-            row += g_data_power[i][t];  
-            if (g_data_power[i][t] > best) best = g_data_power[i][t];  
-        }  
+    for (int i = 0; i < JTTY_NDATA; ++i) {    
+        float best = g_dec_power[i][0];    
+        float row = 0.0f;    
+        for (int t = 0; t < JTTY_NTONES; ++t) {    
+            row += g_dec_power[i][t];    
+            if (g_dec_power[i][t] > best) best = g_dec_power[i][t];    
+        }
         p_sig += best;  
         p_sum += row;  
     }  
@@ -395,12 +402,17 @@ if (calculated_crc != received_crc) {
 #ifdef JTTY_DEBUG  
     Serial.println(F("# JTTY: CRC ok"));  
 #endif
+
+    // Payload bits 0..31 are the atom value; bit 32 is reserved and bit 33 EOM.    
+    uint32_t atom = 0;    
+    for (int i = 0; i < 32; ++i) {    
+        atom = (atom << 1) | (info[i] & 1u);    
+    }    
   
-    // Payload bits 0..31 are the atom value; bit 32 is reserved and bit 33 EOM.  
-    uint32_t atom = 0;  
-    for (int i = 0; i < 32; ++i) {  
-        atom = (atom << 1) | (info[i] & 1u);  
-    }  
+#ifdef JTTY_DEBUG    
+    Serial.printf("# JTTY atom=%08lX reserved=%d eom=%d\n",  
+                  (unsigned long)atom, (int)(info[32] != 0), (int)(info[33] != 0));    
+#endif
   
     const bool reserved = info[32] != 0;  
     const bool eom = info[33] != 0;  
@@ -555,15 +567,16 @@ void rx_jtty_push(int16_t sample)
             ++g_sync_count;
         }
 
-    if (jtty_sync_matches()) {
+    if (jtty_sync_matches() >= JTTY_SYNC_MIN) {  
 #ifdef JTTY_DEBUG  
-            Serial.println(F("# JTTY: sync found"));  
-#endif 
+            Serial.printf("# JTTY: sync found %d/%d\n",  
+                          jtty_sync_matches(), JTTY_NSYNC);  
+#endif  
             g_hunting = false;  
             g_data_count = 0;  
             g_hops_since_sync = 0;  
         }  
-        return;  
+        return; 
     }
 
     // The sync detector fires at the end of the final sync-symbol window.
