@@ -12,6 +12,8 @@
  * ============================================================================  
  */
 
+#include "../vfo/vfo_rp2040.h"
+
 #include "hardware/pio.h"
 #include "hardware/clocks.h"
 #include "hardware/pll.h"
@@ -27,7 +29,6 @@
 #include "hardware/structs/pll.h"
 #include "pico/multicore.h"
 #include "pico/stdlib.h"
-#include "vfo_hardware.h"
 
 // данные из параллельного проекта
 // ============================================================================
