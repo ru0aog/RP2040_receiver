@@ -1,4 +1,4 @@
-/**
+﻿/**
  * ============================================================================
  * rx_capture.cpp — DMA-движок приёмной части RP2040
  *
@@ -43,7 +43,8 @@
 #include <Arduino.h>
 #include <string.h>
 
-#include "vfo_hardware.h"
+#include "../vfo/vfo_rp2040.h"
+
 #include "hardware/adc.h"
 #include "hardware/dma.h"
 #include "hardware/irq.h"

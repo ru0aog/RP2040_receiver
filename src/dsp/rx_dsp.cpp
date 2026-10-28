@@ -1,4 +1,4 @@
-/**  
+﻿/**  
  * ============================================================================  
  *  rx_dsp.cpp — модуль децимирующего DSP-тракта (core1)  
  *  Версия 2.26 от 2026-10-20, автор RU0AOG  
@@ -14,9 +14,9 @@
  */  
   
 #include <Arduino.h>  
-#include "vfo_hardware.h"  
+#include "../rsid/rx_rsid.h"
+#include "../vfo/vfo_rp2040.h"  
 #include "pico/multicore.h"
-#include "rx_rsid.h"
   
 // ---- Параметры тракта ----  
 #define RX_FS_IN_HZ           (RX_ADC_SAMPLE_RATE_HZ / 2.0f)  

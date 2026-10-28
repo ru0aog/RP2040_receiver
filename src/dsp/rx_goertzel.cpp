@@ -1,7 +1,7 @@
-#include <Arduino.h>
+﻿#include <Arduino.h>
 #include <math.h>
 #include <string.h>
-#include "rx_goertzel.h"
+#include "../dsp/rx_goertzel.h"
 
 #define GB_COEFF_SHIFT 14
 #define GB_DB_FLOOR    (-120.0f)
