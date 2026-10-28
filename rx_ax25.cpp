@@ -115,6 +115,7 @@ static void ax25_emit_callsign(const uint8_t* p) {
 }  
   
 static void ax25_frame_finish(void) {  
+    if (g_frame_len < 0) { g_frame_len = 0; return; }
     uint16_t crc = 0xFFFF;  
     for (int i = 0; i < g_frame_len; ++i) {  
         crc = ax25_fcs_update(crc, g_frame_buf[i]);  
@@ -140,11 +141,15 @@ static void ax25_frame_finish(void) {
         ax25_emit_callsign(g_frame_buf + i);  
         i += 7;  
     }  
-    rx_decoders_emit(':');  
-  
-    // i -> control, i+1 -> PID (skip both for UI frames)  
-    i += 2;  
-    for (; i < payload; ++i) {  
+    rx_decoders_emit(':');    
+    
+    if (i + 2 > payload) return;              // control+PID должны помещаться    
+    const uint8_t ctrl = g_frame_buf[i];    
+    if ((ctrl & 0x03) != 0x03) return;        // только U-кадры    
+    if (ctrl != 0x03 && ctrl != 0x13) return; // UI (0x03) или UI с P/F (0x13)    
+    // Для UI: i+1 — PID (обычно 0xF0). Печатаем info.    
+    i += 2;    
+    for (; i < payload; ++i) {
         uint8_t c = g_frame_buf[i];  
         rx_decoders_emit((c >= 0x20 && c < 0x7F) ? (char)c : '.');  
     }  
@@ -177,10 +182,11 @@ static void ax25_hdlc_bit(uint8_t raw) {
         g_olen = 0;  
         return;  
     }  
-    if ((g_pat_det & 0xFC) == 0x7C) {  
-        // Five '1' then '0': stuffed bit — discard, keep accumulating  
+    if (dbit == 0 && (g_pat_det & 0x7F) == 0x3E) {  
+        // Текущий '0' после ровно пяти '1' — вставленный бит, отбрасываем.  
+        // 0x3E = ...0 11111 0; шесть единиц = 0x7E (флаг) уже обработан выше.  
         return;  
-    }  
+    }
   
     // Normal data bit  
     g_oacc = (uint8_t)(g_oacc >> 1);  
@@ -189,9 +195,11 @@ static void ax25_hdlc_bit(uint8_t raw) {
   
     if (g_olen >= 8) {  
         g_olen = 0;  
-        if (g_frame_len < AX25_MAX_FRAME) {  
-            g_frame_buf[g_frame_len++] = g_oacc;  
-        }  
+        if (g_frame_len < AX25_MAX_FRAME) {    
+            g_frame_buf[g_frame_len++] = g_oacc;    
+        } else {    
+            g_frame_len = -1;   // переполнение: весь кадр отбрасываем    
+        }
         g_oacc = 0;  
     }  
 }  
