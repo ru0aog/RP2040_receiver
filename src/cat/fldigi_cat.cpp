@@ -1,12 +1,12 @@
-// ============================================================================  
+﻿// ============================================================================  
 // fldigi_cat.cpp — CAT-интерфейс приёмника (подмножество Kenwood TS-2000).  
 // Отдельный USB-CDC порт ("RP2040 RX CAT"). Команды оканчиваются на ';'.  
 // Поддержано: FA (get/set частоты), IF (статус), ID (идентификация).  
 // По set-FA вызывается rx_retune() — перестройка приёмного тракта.  
 // ============================================================================  
-#include "fldigi_cat.h"  
-#include "vfo_hardware.h"  
-#include "rx_audio.h"   
+#include "../cat/fldigi_cat.h"  
+#include "../vfo/vfo_rp2040.h"  
+#include "../audio/rx_audio.h"   
 #include <Adafruit_TinyUSB.h>  
 #include <stdio.h>  
 #include <string.h>  
