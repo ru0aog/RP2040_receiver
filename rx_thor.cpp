@@ -111,7 +111,13 @@ static float  tpwr[THOR_NTONES];
 static int    last_tone = -1;     // тон на прошлом блоке (детект перехода)  
 static int    clk       = 0;      // сэмплы с последнего перехода тона  
 static bool   clk_valid = false;  
-  
+
+// Состояние подтверждения перехода между тонами.
+// Оно сохраняется между вызовами rx_thor_push().
+static int candidate_tone = -1;
+static int candidate_hits = 0;
+static constexpr int THOR_PEAK_HITS = 2;
+
 static int    prev_tone = -1;     // предыдущий символьный тон (IFK)  
 static bool   have_prev = false;  
   
@@ -198,11 +204,7 @@ static void vit_step(uint8_t rx) {
     if (vit_fill < THOR_TR_DEPTH) ++vit_fill;  
     ++vit_pairs;  
 }  
-  
-// Принудительный слив хвоста (при остановке/конце передачи).  
-static void vit_flush(void) {  
-    while (vit_fill > 0) vit_emit_oldest();  
-}  
+
   
 // ---------------------------------------------------------------------------  
 // Varicode-накопитель: биты до «00», потом поиск в таблице.  
@@ -293,7 +295,11 @@ void rx_thor_init(float center_hz) {
     g_base_hz = center_hz - THOR_CENTER_OFFS;  
   
     memset(tpwr, 0, sizeof(tpwr));  
-    last_tone = -1; clk = 0; clk_valid = false;  
+    last_tone = -1; clk = 0; clk_valid = false;
+
+    candidate_tone = -1;
+    candidate_hits = 0;
+
     prev_tone = -1; have_prev = false;  
   
     memset(il_table, 0, sizeof(il_table));  
@@ -317,13 +323,12 @@ void rx_thor_init(float center_hz) {
 }  
   
 void rx_thor_stop(void) {  
-    if (g_active) vit_flush();                      // дожать хвост бит в varicode  
     g_active = false;  
 }  
   
 void rx_thor_push(int16_t m) {  
     if (!g_active) return;  
-    static float pwr[THOR_NTONES];  
+    float pwr[THOR_NTONES];
     if (!gb_push(m, pwr)) return;  
   
     // Сглаживание + argmax тона на этом блоке.  
@@ -332,24 +337,47 @@ void rx_thor_push(int16_t m) {
         tpwr[i] += (pwr[i] - tpwr[i]) * THOR_SMOOTH_A;  
         if (tpwr[i] > bp) { bp = tpwr[i]; best = i; }  
     }  
-  
-// Символьный такт с подтверждением перехода: clk=0 только если  
-    // тон сменился два блока подряд — одиночный шумовой всплеск в другом  
-    // бине Гёрцеля не собьёт синхронизацию.  
-    static int    trans_cnt = 0;  
-    last_tone = -1; clk = 0; clk_valid = false; trans_cnt = 0;;  
-    clk += THOR_BLOCK_N;  
-    if (best != last_tone) {  
-        if (++trans_cnt >= 2) {  
-            clk = 0;  
-            clk_valid = true;  
-            last_tone = best;  
-            trans_cnt = 0;  
-        }  
-    } else {  
-        trans_cnt = 0;  
-    }  
-    if (clk_valid && clk >= THOR_SYM_HALF && clk - THOR_BLOCK_N < THOR_SYM_HALF) {  
-        thor_on_symbol(last_tone);  
-    }  
-}
+
+
+// 1. Подтверждаем новый тон двумя последовательными блоками.
+    //    Кандидат не сбрасывает символьные часы сам по себе.
+    if (best != last_tone) {
+        if (best == candidate_tone) {
+            if (candidate_hits < THOR_PEAK_HITS)
+                ++candidate_hits;
+        } else {
+            candidate_tone = best;
+            candidate_hits = 1;
+        }
+
+        if (candidate_hits >= THOR_PEAK_HITS) {
+            last_tone = candidate_tone;
+            candidate_tone = -1;
+            candidate_hits = 0;
+
+            // После первого подтверждённого тона запускаем часы.
+            if (!clk_valid) {
+                clk = 0;
+                clk_valid = true;
+            }
+        }
+    } else {
+        candidate_tone = -1;
+        candidate_hits = 0;
+    }
+
+    // 2. Символьные часы идут независимо от смены тона.
+    //    Это позволяет принимать два соседних символа с одинаковым
+    //    тоном и не сбрасывать фазу из-за одиночного ложного пика.
+    if (clk_valid) {
+        clk += THOR_BLOCK_N;
+
+        if (clk >= THOR_SYM_SAMP) {
+            clk -= THOR_SYM_SAMP;
+
+            // Декодируем текущий лучший тон на символьном стробе.
+            thor_on_symbol(best);
+        }
+    }
+ }
+
