@@ -24,7 +24,7 @@
 #include <string.h>  
 #include <math.h>  
   
-#define THOR_DEBUG  
+// #define THOR_DEBUG   // посимвольный printf в hot path — вызывает ресет
   
 // ---------------------------------------------------------------------------  
 // Параметры протокола  
@@ -229,20 +229,31 @@ static void vc_emit_code(void) {
     vc_shreg = 0; vc_nbits = 0; vc_zeros = 0;  
 }  
   
-static void vc_push_bit(uint8_t bit) {  
-    if (bit == 0) {  
-        vc_zeros++;  
-        if (vc_zeros >= 2 && vc_nbits > 0) vc_emit_code();  
-        return;                                     // разделитель не копим  
-    }  
-    vc_zeros = 0;  
-    if (vc_nbits < VC_MAX_BITS) {  
-        vc_shreg |= (1u << vc_nbits);  
-        vc_nbits++;  
-    } else {  
-        vc_shreg = 0; vc_nbits = 0;                 // переполнение — сброс  
-    }  
-}  
+static void vc_push_bit(uint8_t bit) {    
+    if (bit == 0) {    
+        ++vc_zeros;    
+        if (vc_zeros >= 2) {                        // "00" — разделитель кодов    
+            if (vc_nbits > 0) vc_emit_code();    
+            else { vc_shreg = 0; vc_nbits = 0; }    
+            vc_zeros = 0;    
+        }    
+        return;                    // одиночный 0 — отложенный: решим по след. биту    
+    }    
+    // bit == 1    
+    if (vc_zeros == 1) {             // отложенный 0 оказался внутренним —    
+        vc_zeros = 0;                // записываем его позицию (бит уже 0)    
+        if (vc_nbits < VC_MAX_BITS) ++vc_nbits;    
+        else { vc_shreg = 0; vc_nbits = 0; return; }    
+    } else {    
+        vc_zeros = 0;    
+    }    
+    if (vc_nbits < VC_MAX_BITS) {    
+        vc_shreg |= (1u << vc_nbits);    
+        ++vc_nbits;    
+    } else {    
+        vc_shreg = 0; vc_nbits = 0;                 // переполнение — сброс    
+    }    
+}
   
 // ---------------------------------------------------------------------------  
 // Приём символьного тона -> IFK-де-дельта -> nibble -> deinterleave -> Витерби.  
@@ -250,10 +261,13 @@ static void vc_push_bit(uint8_t bit) {
 static void thor_on_symbol(int tone) {  
     if (!have_prev) { prev_tone = tone; have_prev = true; return; }  
   
-    int d = tone - prev_tone - THOR_IFK_OFFSET;  
-    while (d < 0) d += THOR_NTONES;  
-    d %= THOR_NTONES;  
-    prev_tone = tone;  
+    int d = tone - prev_tone - THOR_IFK_OFFSET;    
+    while (d < 0) d += THOR_NTONES;    
+    d %= THOR_NTONES;    
+    prev_tone = tone;    
+  
+    if (d > 15) return;               // 16/17 — ошибка тона; пропускаем символ,    
+                                    // Витерби переживёт пропуск пары    
   
     // nibble -> 4 бита (порядок TX: sym4[i] = бит (IL_SIZE-1-i) от nibble)  
     uint8_t sym4[THOR_IL_SIZE];  
@@ -319,12 +333,21 @@ void rx_thor_push(int16_t m) {
         if (tpwr[i] > bp) { bp = tpwr[i]; best = i; }  
     }  
   
-    // Прямые символьные часы: переход тона -> clk=0, строб в середине символа.  
+// Символьный такт с подтверждением перехода: clk=0 только если  
+    // тон сменился два блока подряд — одиночный шумовой всплеск в другом  
+    // бине Гёрцеля не собьёт синхронизацию.  
+    static int    trans_cnt = 0;  
+    last_tone = -1; clk = 0; clk_valid = false; trans_cnt = 0;;  
     clk += THOR_BLOCK_N;  
-    if (best != last_tone) {                        // передний фронт символа  
-        clk = 0;  
-        clk_valid = true;  
-        last_tone = best;  
+    if (best != last_tone) {  
+        if (++trans_cnt >= 2) {  
+            clk = 0;  
+            clk_valid = true;  
+            last_tone = best;  
+            trans_cnt = 0;  
+        }  
+    } else {  
+        trans_cnt = 0;  
     }  
     if (clk_valid && clk >= THOR_SYM_HALF && clk - THOR_BLOCK_N < THOR_SYM_HALF) {  
         thor_on_symbol(last_tone);  
