@@ -24,7 +24,8 @@
 #include <string.h>  
 #include <math.h>  
   
-// #define THOR_DEBUG   // посимвольный printf в hot path — вызывает ресет
+ #define THOR_DEBUG
+ #define THOR_DEBUG_SYM   // посимвольный лог — включать точечно
   
 // ---------------------------------------------------------------------------  
 // Параметры протокола  
@@ -98,8 +99,10 @@ static const char *thor_rx_varicode[] = {
     "1011011100",  "1010111000",  "1011100000",  "1011110000",  
     "101010000000"  
 };  
-#define THOR_VARICODE_N 128  
-#define VC_MAX_BITS     24  
+#define THOR_VARICODE_N \
+    (sizeof(thor_rx_varicode) / sizeof(thor_rx_varicode[0]))
+
+#define VC_MAX_BITS 24
   
 // ---------------------------------------------------------------------------  
 // Состояние  
@@ -109,8 +112,16 @@ static float  g_base_hz = 0.0f;
   
 static float  tpwr[THOR_NTONES];  
 static int    last_tone = -1;     // тон на прошлом блоке (детект перехода)  
-static int    clk       = 0;      // сэмплы с последнего перехода тона  
-static bool   clk_valid = false;  
+static int    clk       = 0;      // сэмплы с последнего перехода тона    
+static bool   clk_valid = false;    
+    
+#ifdef THOR_DEBUG    
+static uint32_t dbg_blocks = 0, dbg_sym = 0;
+static uint32_t dbg_vit_bits = 0, dbg_vc_emit = 0, dbg_vc_miss = 0;    
+static uint32_t dbg_trans = 0;               // подтверждённые переходы    
+static int      dbg_tone_hist[THOR_NTONES];  // гистограмма argmax-тонов    
+static float    dbg_bp_max = 0.0f;           // пик лучшей мощности тона    
+#endif
 
 // Состояние подтверждения перехода между тонами.
 // Оно сохраняется между вызовами rx_thor_push().
@@ -121,18 +132,24 @@ static constexpr int THOR_PEAK_HITS = 2;
 static int    prev_tone = -1;     // предыдущий символьный тон (IFK)  
 static bool   have_prev = false;  
   
-// Обратный перемежитель: одна таблица 4x10.  
-// il_table[i][d]: бит i-й позиции nibble с задержкой d символов.  
-static uint8_t il_table[THOR_IL_SIZE][THOR_IL_DEPTH];  
+// Обратный перемежитель: точное зеркало TX il_symbols (тот же массив  
+// DEPTH x SIZE x SIZE), но выходная диагональ REV: tab[k][i][i].  
+static uint8_t il_table[THOR_IL_DEPTH * THOR_IL_SIZE * THOR_IL_SIZE];  
+static inline uint8_t* il_tab(int i, int j, int k) {  
+    return &il_table[(THOR_IL_SIZE*THOR_IL_SIZE*i) + (THOR_IL_SIZE*j) + k];  
+}  
   
 static void il_rev_bits(uint8_t *sym4 /*4 бита -> 4 бита*/) {  
-    for (int i = 0; i < THOR_IL_SIZE; i++) {  
-        for (int d = THOR_IL_DEPTH - 1; d > i; d--)  
-            il_table[i][d] = il_table[i][d - 1];  
-        il_table[i][i] = sym4[i];                 // вход на глубину i  
-        sym4[i] = il_table[i][THOR_IL_DEPTH - 1]; // выход — самый старый  
+    for (int k = 0; k < THOR_IL_DEPTH; k++) {  
+        for (int i = 0; i < THOR_IL_SIZE; i++)  
+            for (int j = 0; j < THOR_IL_SIZE - 1; j++)  
+                *il_tab(k, i, j) = *il_tab(k, i, j + 1);  
+        for (int i = 0; i < THOR_IL_SIZE; i++)  
+            *il_tab(k, i, THOR_IL_SIZE - 1) = sym4[i];  
+        for (int i = 0; i < THOR_IL_SIZE; i++)   // REV  
+            sym4[i] = *il_tab(k, i, i);  
     }  
-}  
+}
   
 // ---------------------------------------------------------------------------  
 // Витерби (hard-decision, Хэмминг), k=7 -> 64 состояния.  
@@ -169,9 +186,12 @@ static void vit_emit_oldest(void) {
         st  = vit_tr[pos][st];  
         pos = (pos - 1 + THOR_TR_DEPTH) % THOR_TR_DEPTH;  
     }  
-    // st — состояние после самого старого шага; его LSB = входной бит.  
-    vc_push_bit((uint8_t)(st & 1));  
-    --vit_fill;  
+// st — состояние после самого старого шага; его LSB = входной бит.    
+#ifdef THOR_DEBUG    
+    ++dbg_vit_bits;    
+#endif    
+    vc_push_bit((uint8_t)(st & 1));    
+    --vit_fill;
 }  
   
 // Один шаг решётки (одна кодовая пара = 2 бита).  
@@ -213,23 +233,49 @@ static uint32_t vc_shreg = 0;
 static int      vc_nbits = 0;  
 static int      vc_zeros = 0;  
   
-static void vc_emit_code(void) {  
-    for (int c = 0; c < THOR_VARICODE_N; c++) {  
-        const char *s = thor_rx_varicode[c];  
-        int len = (int)strlen(s);  
-        if (len != vc_nbits) continue;  
-        bool match = true;  
-        for (int b = 0; b < len; b++) {  
-            int bit = (vc_shreg >> b) & 1;           // первый бит = LSB  
-            if (bit != (s[b] - '0')) { match = false; break; }  
-        }  
-        if (match) {  
-            if (c >= 32) rx_decoders_emit((char)c);  
-            break;  
-        }  
-    }  
-    vc_shreg = 0; vc_nbits = 0; vc_zeros = 0;  
-}  
+static void vc_emit_code(void) {
+    for (size_t c = 0; c < THOR_VARICODE_N; ++c) {
+        const char *s = thor_rx_varicode[c];
+
+        if (s == nullptr)
+            continue;
+
+        const size_t len = strlen(s);
+
+        if (len != (size_t)vc_nbits)
+            continue;
+
+        bool match = true;
+
+        for (size_t b = 0; b < len; ++b) {
+            const uint32_t bit = (vc_shreg >> b) & 1u;
+
+            if (bit != (uint32_t)(s[b] - '0')) {
+                match = false;
+                break;
+            }
+        }
+
+        if (match) {    
+            if (c >= 32 && c <= 126)    
+                rx_decoders_emit((char)c);    
+#ifdef THOR_DEBUG    
+            ++dbg_vc_emit;    
+#endif    
+            vc_shreg = 0; vc_nbits = 0; vc_zeros = 0;    
+            return;    
+        }    
+    }    
+    
+#ifdef THOR_DEBUG    
+    ++dbg_vc_miss;    
+    Serial.printf("# THOR vc? nbits=%d shreg=%06lX\n",    
+                  vc_nbits, (unsigned long)vc_shreg);    
+#endif    
+    vc_shreg = 0;
+    vc_nbits = 0;
+    vc_zeros = 0;
+}
   
 static void vc_push_bit(uint8_t bit) {    
     if (bit == 0) {    
@@ -271,8 +317,12 @@ static void thor_on_symbol(int tone) {
     if (d > 15) return;               // 16/17 — ошибка тона; пропускаем символ,    
                                     // Витерби переживёт пропуск пары    
   
-    // nibble -> 4 бита (порядок TX: sym4[i] = бит (IL_SIZE-1-i) от nibble)  
-    uint8_t sym4[THOR_IL_SIZE];  
+#ifdef THOR_DEBUG    
+    ++dbg_sym;    
+#endif    
+    
+    // nibble -> 4 бита (порядок TX: sym4[i] = бит (IL_SIZE-1-i) от nibble)    
+    uint8_t sym4[THOR_IL_SIZE];
     for (int i = 0; i < THOR_IL_SIZE; i++)  
         sym4[i] = (uint8_t)((d >> (THOR_IL_SIZE - i - 1)) & 1);  
   
@@ -282,9 +332,9 @@ static void thor_on_symbol(int tone) {
     for (int i = 0; i < THOR_IL_SIZE; i += 2)  
         vit_step((uint8_t)(sym4[i] | (sym4[i + 1] << 1)));  
   
-#ifdef THOR_DEBUG  
-    Serial.printf("# THOR sym=%d pairs=%d\n", d, vit_pairs);  
-#endif  
+#ifdef THOR_DEBUG_SYM    
+    Serial.printf("# THOR sym=%d pairs=%d\n", d, vit_pairs);    
+#endif
 }  
   
 // ---------------------------------------------------------------------------  
@@ -307,9 +357,16 @@ void rx_thor_init(float center_hz) {
     memset(vit_metric, 0x3F, sizeof(vit_metric));  
     vit_metric[0] = 0;                              // старт state=0 (как у TX)  
     memset(vit_tr, 0, sizeof(vit_tr));  
-    vit_wpos = 0; vit_fill = 0; vit_pairs = 0;  
+    vit_wpos = 0; vit_fill = 0; vit_pairs = 0;
   
-    vc_shreg = 0; vc_nbits = 0; vc_zeros = 0;  
+    vc_shreg = 0; vc_nbits = 0; vc_zeros = 0;
+
+#ifdef THOR_DEBUG      
+    dbg_blocks = dbg_sym = 0;      
+    dbg_vit_bits = dbg_vc_emit = dbg_vc_miss = 0;      
+    dbg_trans = 0; dbg_bp_max = 0.0f;      
+    memset(dbg_tone_hist, 0, sizeof(dbg_tone_hist));      
+#endif
   
     gb_cfg_t cfg = { THOR_NTONES, g_base_hz, THOR_STEP_HZ, THOR_FS, THOR_BLOCK_N };  
     gb_init(&cfg);  
@@ -332,11 +389,29 @@ void rx_thor_push(int16_t m) {
     if (!gb_push(m, pwr)) return;  
   
     // Сглаживание + argmax тона на этом блоке.  
-    int best = 0; float bp = -1.0f;  
-    for (int i = 0; i < THOR_NTONES; i++) {  
-        tpwr[i] += (pwr[i] - tpwr[i]) * THOR_SMOOTH_A;  
-        if (tpwr[i] > bp) { bp = tpwr[i]; best = i; }  
-    }  
+    int best = 0; float bp = -1.0f;    
+    for (int i = 0; i < THOR_NTONES; i++) {    
+        tpwr[i] += (pwr[i] - tpwr[i]) * THOR_SMOOTH_A;    
+        if (tpwr[i] > bp) { bp = tpwr[i]; best = i; }    
+    }    
+    
+#ifdef THOR_DEBUG    
+    ++dbg_blocks;    
+    ++dbg_tone_hist[best];    
+    if (bp > dbg_bp_max) dbg_bp_max = bp;    
+    // Одна строка раз в ~5 сек: жив ли вход, куда попадает argmax    
+    if (dbg_blocks >= 300) {    
+        Serial.printf("# THOR blk=%lu bp=%.0f trans=%lu sym=%lu vit=%lu vc=%lu miss=%lu hist:",    
+                      (unsigned long)dbg_blocks, (double)dbg_bp_max,    
+                      (unsigned long)dbg_trans, (unsigned long)dbg_sym,    
+                      (unsigned long)dbg_vit_bits, (unsigned long)dbg_vc_emit,    
+                      (unsigned long)dbg_vc_miss);    
+        for (int i = 0; i < THOR_NTONES; i++)    
+            Serial.printf(" %lu", (unsigned long)dbg_tone_hist[i]);    
+        Serial.println();    
+        dbg_blocks = 0;    
+    }    
+#endif
 
 
 // 1. Подтверждаем новый тон двумя последовательными блоками.
@@ -349,35 +424,38 @@ void rx_thor_push(int16_t m) {
             candidate_tone = best;
             candidate_hits = 1;
         }
-
-        if (candidate_hits >= THOR_PEAK_HITS) {
-            last_tone = candidate_tone;
-            candidate_tone = -1;
-            candidate_hits = 0;
-
-            // После первого подтверждённого тона запускаем часы.
-            if (!clk_valid) {
-                clk = 0;
-                clk_valid = true;
-            }
+    if (candidate_hits >= THOR_PEAK_HITS) {      
+            last_tone = candidate_tone;      
+#ifdef THOR_DEBUG      
+            ++dbg_trans;      
+#endif  
+            candidate_tone = -1;  
+            candidate_hits = 0;  
+  
+            // Каждый подтверждённый переход — граница символа:  
+            // ресинхронизируем часы (компенсирует дрейф кварцев).  
+            clk = 0;  
+            clk_valid = true;  
+        }  
+    } else {  
+        candidate_tone = -1;  
+        candidate_hits = 0;  
+    }  
+  
+    // 2. Строб на середине символа (clk == SYM_HALF).  
+    //    Подтверждение перехода отстаёт от реального фронта на  
+    //    ~1-2 блока (~16-33 мс) — строб смещается чуть позже  
+    //    середины, что безопасно: тон там стабилен.  
+    if (clk_valid) {  
+        clk += THOR_BLOCK_N;  
+  
+        if (clk >= THOR_SYM_HALF && clk - THOR_BLOCK_N < THOR_SYM_HALF) {  
+            thor_on_symbol(last_tone);   // подтверждённый тон, не мгновенный best  
         }
-    } else {
-        candidate_tone = -1;
-        candidate_hits = 0;
+        // Символ без перехода (сбой детекта): не даём clk  
+        // убежать дальше полного периода.  
+        if (clk >= THOR_SYM_SAMP) clk = THOR_SYM_SAMP;  
     }
 
-    // 2. Символьные часы идут независимо от смены тона.
-    //    Это позволяет принимать два соседних символа с одинаковым
-    //    тоном и не сбрасывать фазу из-за одиночного ложного пика.
-    if (clk_valid) {
-        clk += THOR_BLOCK_N;
-
-        if (clk >= THOR_SYM_SAMP) {
-            clk -= THOR_SYM_SAMP;
-
-            // Декодируем текущий лучший тон на символьном стробе.
-            thor_on_symbol(best);
-        }
-    }
  }
 
