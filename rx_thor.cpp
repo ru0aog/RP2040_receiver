@@ -1,4 +1,4 @@
-﻿// rx_thor.cpp — THOR-11 decoder for RP2040_receiver.  
+// rx_thor.cpp — THOR-11 decoder for RP2040_receiver.  
 //  
 // Сигнал (RP2040_beacon/thor_modem.cpp, fldigi thor.cxx):  
 //   18 тонов, шаг 10.7666 Гц (11025/1024), символ 92879 мкс (~1451 сэмпл);  
@@ -9,11 +9,10 @@
 //  
 // Конвейер приёма:  
 //   банк Гёрцеля (gb_push, block=256) -> argmax тона -> IFK-де-дельта ->  
-//   nibble -> обратный перемежитель -> 4 бита -> инкрементальный Viterbi  
-//   (k=7, hard, кольцевой traceback) -> биты varicode -> rx_decoders_emit.  
+//   nibble -> обратный перемежитель -> 4 бита -> Viterbi (k=7, hard) ->  
+//   биты varicode -> символ -> rx_decoders_emit.  
 //  
-// Символьные часы — прямые: счётчик сэмплов, смена пика тона сбрасывает  
-// часы на 0, строб на середине символа.  
+// Символьные часы фиксированной длительности; не сбрасываются от каждого изменения тона.  
   
 #include "rx_thor.h"  
 #include "src/modes/rx_decoders.h"  
@@ -24,8 +23,7 @@
 #include <string.h>  
 #include <math.h>  
   
- #define THOR_DEBUG
- #define THOR_DEBUG_SYM   // посимвольный лог — включать точечно
+#define THOR_DEBUG  
   
 // ---------------------------------------------------------------------------  
 // Параметры протокола  
@@ -40,8 +38,8 @@ static constexpr float   THOR_SMOOTH_A    = 0.4f;
 // Символ 92879 мкс ~ 1451 сэмпл; блок Гёрцеля 256 сэмплов (~16.4 мс)  
 // -> ~5.7 блока на символ.  
 static constexpr int     THOR_BLOCK_N     = 256;  
-static constexpr int     THOR_SYM_SAMP    = 1451;  
-static constexpr int     THOR_SYM_HALF    = THOR_SYM_SAMP / 2;  
+static constexpr int     THOR_SYM_SAMP    = 1451;                // отсчётов на символ  
+static constexpr int     THOR_SYM_HALF    = THOR_SYM_SAMP / 2;   // строб — середина  
   
 // FEC  
 static constexpr int     THOR_K           = 7;  
@@ -49,19 +47,20 @@ static constexpr uint8_t THOR_POLY1       = 0x6d;
 static constexpr uint8_t THOR_POLY2       = 0x4f;  
 static constexpr int     THOR_NSTATES     = 1 << (THOR_K - 1);   // 64  
   
-// Перемежитель 4x10  
+// Перемежитель 4x10 (как у маяка: THOR_IL_SIZE x THOR_IL_DEPTH)  
 static constexpr int     THOR_IL_SIZE     = 4;  
 static constexpr int     THOR_IL_DEPTH    = 10;  
   
-// Кольцевое окно traceback Витерби: 96 шагов x 64 состояния = 6 КБ.  
-// Глубина >> 5*K=35 — длины сходимости решётки хватает с запасом.  
-static constexpr int     THOR_TR_DEPTH    = 96;  
+// Максимум информационных бит на сообщение. Один шаг Витерби = 1 инфо-бит  
+// = 2 кодовых бита = половина nibble.  
+static constexpr int     THOR_MAX_BITS    = 2048;                // информационных бит  
+static constexpr int     THOR_MAX_PAIRS   = THOR_MAX_BITS;       // пар по 2 кодовых бита  
   
 // ---------------------------------------------------------------------------  
 // Varicode — инверсия таблицы маяка (varicode[]/thor_varicode[]).  
 // Биты кода считываются LSB-first из vc_shreg: s[b] == бит b.  
-// ВНИМАНИЕ: сверить с побитовой инверсией varicode[] маяка —  
-// в исходной таблице были дубликаты записей (n/t и др.).  
+// ВНИМАНИЕ: сверить с побитовой инверсией varicode[] маяка — записи  
+// 'n'/'t' в исходной таблице были с дубликатами, здесь исправлены.  
 // ---------------------------------------------------------------------------  
 static const char *thor_rx_varicode[] = {  
     "11101011100", "11101100000", "11101101000", "11101101100",  
@@ -99,10 +98,8 @@ static const char *thor_rx_varicode[] = {
     "1011011100",  "1010111000",  "1011100000",  "1011110000",  
     "101010000000"  
 };  
-#define THOR_VARICODE_N \
-    (sizeof(thor_rx_varicode) / sizeof(thor_rx_varicode[0]))
-
-#define VC_MAX_BITS 24
+#define THOR_VARICODE_N (sizeof(thor_rx_varicode) / sizeof(thor_rx_varicode[0]))  
+#define VC_MAX_BITS     24        // глубина накопителя varicode  
   
 // ---------------------------------------------------------------------------  
 // Состояние  
@@ -111,56 +108,38 @@ static bool   g_active = false;
 static float  g_base_hz = 0.0f;  
   
 static float  tpwr[THOR_NTONES];  
-static int    last_tone = -1;     // тон на прошлом блоке (детект перехода)  
-static int    clk       = 0;      // сэмплы с последнего перехода тона    
-static bool   clk_valid = false;    
-    
-#ifdef THOR_DEBUG    
-static uint32_t dbg_blocks = 0, dbg_sym = 0;
-static uint32_t dbg_vit_bits = 0, dbg_vc_emit = 0, dbg_vc_miss = 0;    
-static uint32_t dbg_trans = 0;               // подтверждённые переходы    
-static int      dbg_tone_hist[THOR_NTONES];  // гистограмма argmax-тонов    
-static float    dbg_bp_max = 0.0f;           // пик лучшей мощности тона    
-#endif
-
-// Состояние подтверждения перехода между тонами.
-// Оно сохраняется между вызовами rx_thor_push().
-static int candidate_tone = -1;
-static int candidate_hits = 0;
-static constexpr int THOR_PEAK_HITS = 2;
-
-static int    prev_tone = -1;     // предыдущий символьный тон (IFK)  
+static int    last_tone   = -1;   // тон на прошлом блоке (для детекта перехода)  
+static int    clk         = 0;    // сэмплы с последнего перехода тона  
+static bool   clk_valid   = false;  
+  
+static int    prev_tone = -1;     // предыдущий принятый символьный тон (IFK)  
 static bool   have_prev = false;  
   
-// Обратный перемежитель: точное зеркало TX il_symbols (тот же массив  
-// DEPTH x SIZE x SIZE), но выходная диагональ REV: tab[k][i][i].  
-static uint8_t il_table[THOR_IL_DEPTH * THOR_IL_SIZE * THOR_IL_SIZE];  
-static inline uint8_t* il_tab(int i, int j, int k) {  
-    return &il_table[(THOR_IL_SIZE*THOR_IL_SIZE*i) + (THOR_IL_SIZE*j) + k];  
+// Обратный перемежитель: ОДНА таблица 4x4 (не DEPTH экземпляров).  
+// TX-схема: столбцы сдвигаются влево, новый nibble в последний столбец,  
+// читается диагональ [i][i]; глубина реализуется очередью по i.  
+static uint8_t il_table[THOR_IL_SIZE][THOR_IL_DEPTH];  
+// il_table[i][d]: d — задержка в символах, столбец диагонали  
+static void il_rev_bits(uint8_t *sym4 /*4 бита -> 4 бита*/) {  
+    // Сдвиг задержек: старшие глубины вправо, новый бит i попадает на глубину i.  
+    for (int i = 0; i < THOR_IL_SIZE; i++) {  
+        for (int d = THOR_IL_DEPTH - 1; d > i; d--)  
+            il_table[i][d] = il_table[i][d - 1];  
+        il_table[i][i] = sym4[i];  
+        sym4[i] = il_table[i][THOR_IL_DEPTH - 1];   // выход — самый «старый»  
+    }  
 }  
   
-static void il_rev_bits(uint8_t *sym4 /*4 бита -> 4 бита*/) {  
-    for (int k = 0; k < THOR_IL_DEPTH; k++) {  
-        for (int i = 0; i < THOR_IL_SIZE; i++)  
-            for (int j = 0; j < THOR_IL_SIZE - 1; j++)  
-                *il_tab(k, i, j) = *il_tab(k, i, j + 1);  
-        for (int i = 0; i < THOR_IL_SIZE; i++)  
-            *il_tab(k, i, THOR_IL_SIZE - 1) = sym4[i];  
-        for (int i = 0; i < THOR_IL_SIZE; i++)   // REV  
-            sym4[i] = *il_tab(k, i, i);  
-    }  
-}
-  
-// ---------------------------------------------------------------------------  
-// Витерби (hard-decision, Хэмминг), k=7 -> 64 состояния.  
-// Инкрементальный: метрики [64], кольцо traceback [96][64] (~6.5 КБ).  
-// ---------------------------------------------------------------------------  
-static uint16_t vit_metric[THOR_NSTATES];  
-static uint8_t  vit_tr[THOR_TR_DEPTH][THOR_NSTATES];  // parent state на шаг  
-static int      vit_wpos  = 0;   // куда пишется следующий шаг  
-static int      vit_fill  = 0;   // сколько шагов хранится (<= TR_DEPTH)  
-static int      vit_pairs = 0;   // всего принято кодовых пар  
-  
+// Потоковый Витерби с ограниченной памятью: traceback 96 x 64 = 6144 байта.
+static constexpr int THOR_TRACE_DEPTH = 96;
+static constexpr uint16_t VIT_INF = 0x3FFF;
+static uint16_t vit_metric[THOR_NSTATES];
+static uint16_t vit_next[THOR_NSTATES];
+static uint8_t vit_trace[THOR_TRACE_DEPTH][THOR_NSTATES];
+static uint32_t vit_steps = 0;
+static int g_vit_pairs = 0;
+static void vc_push_bit(uint8_t bit); // вызывается из Витерби
+
 static inline uint8_t parity8(uint8_t x) { return (uint8_t)__builtin_parity(x); }  
   
 // Кодовый выход кодера для (state, input bit):  
@@ -170,62 +149,6 @@ static inline uint8_t enc_out(int state, int bit) {
     return (uint8_t)(parity8(sh & THOR_POLY1) | (parity8(sh & THOR_POLY2) << 1));  
 }  
   
-static void vc_push_bit(uint8_t bit);   // fwd  
-  
-// Эмит бита самого старого шага в кольце: traceback от лучшего  
-// состояния на (vit_fill - 1) шаг назад, бит = LSB состояния.  
-static void vit_emit_oldest(void) {  
-    if (vit_fill < 2) return;  
-    int best = 0;  
-    for (int s = 1; s < THOR_NSTATES; s++)  
-        if (vit_metric[s] < vit_metric[best]) best = s;  
-  
-    int st  = best;  
-    int pos = (vit_wpos - 1 + THOR_TR_DEPTH) % THOR_TR_DEPTH;  // новейший  
-    for (int k = vit_fill - 1; k > 0; k--) {  
-        st  = vit_tr[pos][st];  
-        pos = (pos - 1 + THOR_TR_DEPTH) % THOR_TR_DEPTH;  
-    }  
-// st — состояние после самого старого шага; его LSB = входной бит.    
-#ifdef THOR_DEBUG    
-    ++dbg_vit_bits;    
-#endif    
-    vc_push_bit((uint8_t)(st & 1));    
-    --vit_fill;
-}  
-  
-// Один шаг решётки (одна кодовая пара = 2 бита).  
-static void vit_step(uint8_t rx) {  
-    // Если кольцо полно — сначала выталкиваем самый старый бит  
-    // (иначе перезапишем его parent-информацию).  
-    if (vit_fill == THOR_TR_DEPTH) vit_emit_oldest();  
-  
-    uint16_t nm[THOR_NSTATES];  
-    memset(nm, 0x3F, sizeof(nm));  
-    for (int s = 0; s < THOR_NSTATES; s++) {  
-        if (vit_metric[s] > 0x3E00) continue;  
-        for (int b = 0; b < 2; b++) {  
-            int ns = ((s << 1) | b) & (THOR_NSTATES - 1);  
-            uint8_t exp = enc_out(s, b);  
-            uint8_t dd  = (uint8_t)(exp ^ rx);  
-            uint16_t m  = vit_metric[s] + (uint16_t)((dd & 1) + (dd >> 1));  
-            if (m < nm[ns]) { nm[ns] = m; vit_tr[vit_wpos][ns] = (uint8_t)s; }  
-        }  
-    }  
-  
-    // Нормализация: вычесть минимум, uint16 не переполняется бесконечно.  
-    uint16_t mn = nm[0];  
-    for (int s = 1; s < THOR_NSTATES; s++) if (nm[s] < mn) mn = nm[s];  
-    if (mn) for (int s = 0; s < THOR_NSTATES; s++) nm[s] -= mn;  
-  
-    memcpy(vit_metric, nm, sizeof(nm));  
-  
-    vit_wpos = (vit_wpos + 1) % THOR_TR_DEPTH;  
-    if (vit_fill < THOR_TR_DEPTH) ++vit_fill;  
-    ++vit_pairs;  
-}  
-
-  
 // ---------------------------------------------------------------------------  
 // Varicode-накопитель: биты до «00», потом поиск в таблице.  
 // ---------------------------------------------------------------------------  
@@ -233,103 +156,110 @@ static uint32_t vc_shreg = 0;
 static int      vc_nbits = 0;  
 static int      vc_zeros = 0;  
   
-static void vc_emit_code(void) {
-    for (size_t c = 0; c < THOR_VARICODE_N; ++c) {
-        const char *s = thor_rx_varicode[c];
-
-        if (s == nullptr)
-            continue;
-
-        const size_t len = strlen(s);
-
-        if (len != (size_t)vc_nbits)
-            continue;
-
-        bool match = true;
-
-        for (size_t b = 0; b < len; ++b) {
-            const uint32_t bit = (vc_shreg >> b) & 1u;
-
-            if (bit != (uint32_t)(s[b] - '0')) {
-                match = false;
-                break;
-            }
-        }
-
-        if (match) {    
-            if (c >= 32 && c <= 126)    
-                rx_decoders_emit((char)c);    
-#ifdef THOR_DEBUG    
-            ++dbg_vc_emit;    
-#endif    
-            vc_shreg = 0; vc_nbits = 0; vc_zeros = 0;    
-            return;    
-        }    
-    }    
-    
-#ifdef THOR_DEBUG    
-    ++dbg_vc_miss;    
-    Serial.printf("# THOR vc? nbits=%d shreg=%06lX\n",    
-                  vc_nbits, (unsigned long)vc_shreg);    
-#endif    
-    vc_shreg = 0;
-    vc_nbits = 0;
-    vc_zeros = 0;
-}
+static void vc_emit_code(void) {  
+    for (int c = 0; c < THOR_VARICODE_N; c++) {  
+        const char *s = thor_rx_varicode[c];  
+        int len = (int)strlen(s);  
+        if (len != vc_nbits) continue;  
+        bool match = true;  
+        for (int b = 0; b < len; b++) {  
+            int bit = (vc_shreg >> b) & 1;           // первый бит = LSB  
+            if (bit != (s[b] - '0')) { match = false; break; }  
+        }  
+        if (match) {  
+            if (c >= 32) rx_decoders_emit((char)c);  
+            vc_shreg = 0; vc_nbits = 0; vc_zeros = 0;  
+            return;  
+        }  
+    }  
+    vc_shreg = 0; vc_nbits = 0; vc_zeros = 0;        // код не найден — сброс  
+}  
   
 static void vc_push_bit(uint8_t bit) {  
-    if (vc_nbits >= VC_MAX_BITS) {                  // сброс зависшего накопителя  
-        vc_shreg = 0; vc_nbits = 0; vc_zeros = 0;  
+    if (bit == 0) {  
+        vc_zeros++;  
+        if (vc_zeros >= 2 && vc_nbits > 0) vc_emit_code();  
+        return;                                     // разделитель не копим  
     }  
-    if (bit) vc_shreg |= (1u << vc_nbits);          // нули — тоже биты кода  
-    ++vc_nbits;  
+    vc_zeros = 0;  
+    if (vc_nbits < VC_MAX_BITS) {                   // ИСПРАВЛЕНО: было «24»  
+        vc_shreg |= (1u << vc_nbits);  
+        vc_nbits++;  
+    } else {  
+        vc_shreg = 0; vc_nbits = 0;                 // переполнение — мусор  
+    }  
+}  
   
-    if (bit) { vc_zeros = 0; return; }  
-    // Каждый код сам заканчивается минимум двумя нулями:  
-    // "00" — конец кода, а не внешний разделитель.  
-        if (++vc_zeros >= 2) {  
-            if (vc_shreg != 0)  
-                vc_emit_code();            // есть единицы — реальный код  
-            else {                         // голые нули — простой, не код  
-                vc_nbits = 0;  
-                vc_shreg = 0;  
-            }  
-            vc_zeros = 0;  
-        }
+// ---------------------------------------------------------------------------
+// Потоковый Витерби: один шаг на принятую пару кодовых бит.
+// В каждом шаге хранится только выбор предшественника (0/1), а не вся история.
+static void vit_reset() {
+    for (int i = 0; i < THOR_NSTATES; ++i) vit_metric[i] = VIT_INF;
+    vit_metric[0] = 0;
+    vit_steps = 0;
+    g_vit_pairs = 0;
 }
-  
+
+static void vit_step(uint8_t rx) {
+    const uint32_t step = vit_steps;
+    uint8_t *row = vit_trace[step % THOR_TRACE_DEPTH];
+    for (int ns = 0; ns < THOR_NSTATES; ++ns) {
+        const int bit = ns & 1;
+        const int p0 = ns >> 1;
+        const int p1 = p0 | 32;
+        const uint8_t e0 = enc_out(p0, bit);
+        const uint8_t e1 = enc_out(p1, bit);
+        const int d0 = ((e0 ^ rx) & 1) + (((e0 ^ rx) >> 1) & 1);
+        const int d1 = ((e1 ^ rx) & 1) + (((e1 ^ rx) >> 1) & 1);
+        const uint16_t m0 = (vit_metric[p0] >= VIT_INF) ? VIT_INF : (uint16_t)(vit_metric[p0] + d0);
+        const uint16_t m1 = (vit_metric[p1] >= VIT_INF) ? VIT_INF : (uint16_t)(vit_metric[p1] + d1);
+        if (m1 < m0) { vit_next[ns] = m1; row[ns] = 1; }
+        else         { vit_next[ns] = m0; row[ns] = 0; }
+    }
+    uint16_t mn = VIT_INF;
+    for (int i = 0; i < THOR_NSTATES; ++i) if (vit_next[i] < mn) mn = vit_next[i];
+    for (int i = 0; i < THOR_NSTATES; ++i)
+        vit_metric[i] = (vit_next[i] >= VIT_INF || mn >= VIT_INF) ? VIT_INF : (uint16_t)(vit_next[i] - mn);
+    ++vit_steps;
+    ++g_vit_pairs;
+    if (vit_steps < THOR_TRACE_DEPTH) return;
+
+    int st = 0;
+    for (int i = 1; i < THOR_NSTATES; ++i) if (vit_metric[i] < vit_metric[st]) st = i;
+    // Пройти назад до входного бита самого старого перехода в окне.
+    for (int back = 0; back < THOR_TRACE_DEPTH - 1; ++back) {
+        const uint32_t tr_step = vit_steps - 1 - (uint32_t)back;
+        const uint8_t high = vit_trace[tr_step % THOR_TRACE_DEPTH][st] & 1;
+        st = (st >> 1) | (high ? 32 : 0);
+    }
+    vc_push_bit((uint8_t)(st & 1));
+}
+
 // ---------------------------------------------------------------------------  
 // Приём символьного тона -> IFK-де-дельта -> nibble -> deinterleave -> Витерби.  
 // ---------------------------------------------------------------------------  
 static void thor_on_symbol(int tone) {  
     if (!have_prev) { prev_tone = tone; have_prev = true; return; }  
   
-    int d = tone - prev_tone - THOR_IFK_OFFSET;    
-    while (d < 0) d += THOR_NTONES;    
-    d %= THOR_NTONES;    
-    prev_tone = tone;    
+    int d = tone - prev_tone - THOR_IFK_OFFSET;  
+    while (d < 0) d += THOR_NTONES;  
+    d %= THOR_NTONES;  
+    prev_tone = tone;  
   
-    if (d > 15) return;               // 16/17 — ошибка тона; пропускаем символ,    
-                                    // Витерби переживёт пропуск пары    
-  
-#ifdef THOR_DEBUG    
-    ++dbg_sym;    
-#endif    
-    
-    // nibble -> 4 бита (порядок TX: sym4[i] = бит (IL_SIZE-1-i) от nibble)    
-    uint8_t sym4[THOR_IL_SIZE];
+    // nibble -> 4 бита (порядок TX: sym4[i] = бит (IL_SIZE-1-i) от nibble)  
+    uint8_t sym4[THOR_IL_SIZE];  
     for (int i = 0; i < THOR_IL_SIZE; i++)  
         sym4[i] = (uint8_t)((d >> (THOR_IL_SIZE - i - 1)) & 1);  
   
     il_rev_bits(sym4);  
   
-    // 4 бита = 2 кодовые пары по 2 бита (порядок TX: o0 потом o1)  
-    for (int i = 0; i < THOR_IL_SIZE; i += 2)  
-        vit_step((uint8_t)(sym4[i] | (sym4[i + 1] << 1)));  
-  
-#ifdef THOR_DEBUG_SYM    
-    Serial.printf("# THOR sym=%d pairs=%d\n", d, vit_pairs);    
-#endif
+    // 4 бита -> две кодовые пары; не храним всю историю в SRAM.
+    for (int i = 0; i < THOR_IL_SIZE; i += 2)
+        vit_step((uint8_t)(sym4[i] | (sym4[i + 1] << 1)));
+
+#ifdef THOR_DEBUG  
+    Serial.printf("# THOR sym=%d pairs=%d\n", d, g_vit_pairs);  
+#endif  
 }  
   
 // ---------------------------------------------------------------------------  
@@ -340,28 +270,13 @@ void rx_thor_init(float center_hz) {
     g_base_hz = center_hz - THOR_CENTER_OFFS;  
   
     memset(tpwr, 0, sizeof(tpwr));  
-    last_tone = -1; clk = 0; clk_valid = false;
-
-    candidate_tone = -1;
-    candidate_hits = 0;
-
+    last_tone = -1; clk = 0; clk_valid = false;  
     prev_tone = -1; have_prev = false;  
   
-    memset(il_table, 0, sizeof(il_table));  
-  
-    memset(vit_metric, 0x3F, sizeof(vit_metric));  
-    vit_metric[0] = 0;                              // старт state=0 (как у TX)  
-    memset(vit_tr, 0, sizeof(vit_tr));  
-    vit_wpos = 0; vit_fill = 0; vit_pairs = 0;
-  
-    vc_shreg = 0; vc_nbits = 0; vc_zeros = 0;
-
-#ifdef THOR_DEBUG      
-    dbg_blocks = dbg_sym = 0;      
-    dbg_vit_bits = dbg_vc_emit = dbg_vc_miss = 0;      
-    dbg_trans = 0; dbg_bp_max = 0.0f;      
-    memset(dbg_tone_hist, 0, sizeof(dbg_tone_hist));      
-#endif
+    memset(il_table, 0, sizeof(il_table));
+    vit_reset();
+    memset(vit_trace, 0, sizeof(vit_trace));
+    vc_shreg = 0; vc_nbits = 0; vc_zeros = 0;  
   
     gb_cfg_t cfg = { THOR_NTONES, g_base_hz, THOR_STEP_HZ, THOR_FS, THOR_BLOCK_N };  
     gb_init(&cfg);  
@@ -374,83 +289,31 @@ void rx_thor_init(float center_hz) {
 #endif  
 }  
   
-void rx_thor_stop(void) {  
-    g_active = false;  
-}  
+void rx_thor_stop(void) { g_active = false; }  
   
 void rx_thor_push(int16_t m) {  
     if (!g_active) return;  
-    float pwr[THOR_NTONES];
+    static float pwr[THOR_NTONES];  
     if (!gb_push(m, pwr)) return;  
   
     // Сглаживание + argmax тона на этом блоке.  
-    int best = 0; float bp = -1.0f;    
-    for (int i = 0; i < THOR_NTONES; i++) {    
-        tpwr[i] += (pwr[i] - tpwr[i]) * THOR_SMOOTH_A;    
-        if (tpwr[i] > bp) { bp = tpwr[i]; best = i; }    
-    }    
-    
-#ifdef THOR_DEBUG    
-    ++dbg_blocks;    
-    ++dbg_tone_hist[best];    
-    if (bp > dbg_bp_max) dbg_bp_max = bp;    
-    // Одна строка раз в ~5 сек: жив ли вход, куда попадает argmax    
-    if (dbg_blocks >= 300) {    
-        Serial.printf("# THOR blk=%lu bp=%.0f trans=%lu sym=%lu vit=%lu vc=%lu miss=%lu hist:",    
-                      (unsigned long)dbg_blocks, (double)dbg_bp_max,    
-                      (unsigned long)dbg_trans, (unsigned long)dbg_sym,    
-                      (unsigned long)dbg_vit_bits, (unsigned long)dbg_vc_emit,    
-                      (unsigned long)dbg_vc_miss);    
-        for (int i = 0; i < THOR_NTONES; i++)    
-            Serial.printf(" %lu", (unsigned long)dbg_tone_hist[i]);    
-        Serial.println();    
-        dbg_blocks = 0;    
-    }    
-#endif
-
-
-// 1. Подтверждаем новый тон двумя последовательными блоками.
-    //    Кандидат не сбрасывает символьные часы сам по себе.
-    if (best != last_tone) {
-        if (best == candidate_tone) {
-            if (candidate_hits < THOR_PEAK_HITS)
-                ++candidate_hits;
-        } else {
-            candidate_tone = best;
-            candidate_hits = 1;
-        }
-    if (candidate_hits >= THOR_PEAK_HITS) {      
-            last_tone = candidate_tone;      
-#ifdef THOR_DEBUG      
-            ++dbg_trans;      
-#endif  
-            candidate_tone = -1;  
-            candidate_hits = 0;  
-  
-            // Каждый подтверждённый переход — граница символа:  
-            // ресинхронизируем часы (компенсирует дрейф кварцев).  
-            clk = 0;  
-            clk_valid = true;  
-        }  
-    } else {  
-        candidate_tone = -1;  
-        candidate_hits = 0;  
+    int best = 0; float bp = -1.0f;  
+    for (int i = 0; i < THOR_NTONES; i++) {  
+        tpwr[i] += (pwr[i] - tpwr[i]) * THOR_SMOOTH_A;  
+        if (tpwr[i] > bp) { bp = tpwr[i]; best = i; }  
     }  
   
-    // 2. Строб на середине символа (clk == SYM_HALF).  
-    //    Подтверждение перехода отстаёт от реального фронта на  
-    //    ~1-2 блока (~16-33 мс) — строб смещается чуть позже  
-    //    середины, что безопасно: тон там стабилен.  
-    if (clk_valid) {  
-        clk += THOR_BLOCK_N;  
-  
-        if (clk >= THOR_SYM_HALF && clk - THOR_BLOCK_N < THOR_SYM_HALF) {  
-            thor_on_symbol(last_tone);   // подтверждённый тон, не мгновенный best  
-        }
-        // Символ без перехода (сбой детекта): не даём clk  
-        // убежать дальше полного периода.  
-        if (clk >= THOR_SYM_SAMP) clk = THOR_SYM_SAMP;  
+    // Фиксированная символьная сетка: не сбрасываем часы на каждом изменении argmax.
+    // Частота 15625 Гц, блок 256, символ около 1451 отсчёта.
+    last_tone = best;
+    if (!clk_valid) {
+        clk_valid = true;
+        clk = 0;
+        return;
     }
-
- }
-
+    const int old_clk = clk;
+    clk += THOR_BLOCK_N;
+    if (old_clk < THOR_SYM_HALF && clk >= THOR_SYM_HALF)
+        thor_on_symbol(best);
+    if (clk >= THOR_SYM_SAMP) clk -= THOR_SYM_SAMP;
+}
