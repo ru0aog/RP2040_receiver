@@ -27,7 +27,7 @@
 #define RTTY_SHIFT_HZ      170.0f
 #define RSID_CODE_IFKP     1171
 #define RSID_CODE_JTTY     1172
-#define RSID_CODE_THOR16   143
+#define RSID_CODE_THOR11   143
 #define RSID_CODE_AX25_300 70   // AX.25/PACKET 300bd
 #define RSID_CODE_OLIVIA_8_250      69
 #define RSID_CODE_CONTESTIA_8_250   49
@@ -41,7 +41,7 @@ enum {
     DEC_CONTESTIA, 
     DEC_JTTY,  
     DEC_AX25,
-    DEC_THOR16,
+    DEC_THOR11,
 };
   
 static int   active_dec = DEC_NONE;  
@@ -66,7 +66,7 @@ void rx_decoders_sample(int16_t m) {
     case DEC_CONTESTIA: rx_contestia_push(m);   break;
     case DEC_JTTY:      rx_jtty_push(m);        break;
     case DEC_AX25:      rx_ax25_push(m);        break;
-    case DEC_THOR16:    rx_thor_push(m);        break;
+    case DEC_THOR11:    rx_thor_push(m);        break;
     case DEC_NONE:                              break;
     default:                                    break;   // DEC_NONE — пока метки нет, не декодируем  
     }  
@@ -137,11 +137,11 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
         Serial.printf("# DECODER=AX25 center=%.1f Hz\n", (double)r->freq_hz);  
         break;
 
-    case DEC_THOR16:
+    case DEC_THOR11:
         stop_all_goertzel_decoders();
         rx_thor_init(r->freq_hz);
-        active_dec = DEC_THOR16;
-        Serial.printf("# DECODER=THOR16 center=%.1f Hz\n", (double)r->freq_hz);  
+        active_dec = DEC_THOR11;
+        Serial.printf("# DECODER=THOR11 center=%.1f Hz\n", (double)r->freq_hz);  
         break;
 
     default:  
@@ -166,7 +166,7 @@ static void stop_all_goertzel_decoders() {
     else if (active_dec == DEC_CONTESTIA)   { rx_contestia_stop();  }
     else if (active_dec == DEC_JTTY)        { rx_jtty_stop();       }
     else if (active_dec == DEC_AX25)        { rx_ax25_stop();       }
-    else if (active_dec == DEC_THOR16)      { rx_thor_stop();       }
+    else if (active_dec == DEC_THOR11)      { rx_thor_stop();       }
 }
 
 void rx_decoders_init(float fs_hz) {  
