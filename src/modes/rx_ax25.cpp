@@ -36,7 +36,7 @@ static constexpr int AX25_MAX_FRAME = 330;
 
 static constexpr uint16_t AX25_FCS_MAGIC = 0xF0B8;
 
-#define AX25_DEBUG 1
+#define AX25_DEBUG 0
 #define AX25_FIXED_MIDPOINT 1
 
 static constexpr float PLL_SEARCHING = 0.25f;
