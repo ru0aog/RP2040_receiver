@@ -137,7 +137,7 @@ void rx_decoders_on_rsid(const rsid_result_t* r) {
         Serial.printf("# DECODER=AX25 center=%.1f Hz\n", (double)r->freq_hz);  
         break;
 
-    case DEC_THOR11:
+    case RSID_CODE_THOR11:
         stop_all_goertzel_decoders();
         rx_thor_init(r->freq_hz);
         active_dec = DEC_THOR11;
