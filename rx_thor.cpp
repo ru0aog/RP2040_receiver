@@ -277,30 +277,25 @@ static void vc_emit_code(void) {
     vc_zeros = 0;
 }
   
-static void vc_push_bit(uint8_t bit) {    
-    if (bit == 0) {    
-        ++vc_zeros;    
-        if (vc_zeros >= 2) {                        // "00" — разделитель кодов    
-            if (vc_nbits > 0) vc_emit_code();    
-            else { vc_shreg = 0; vc_nbits = 0; }    
-            vc_zeros = 0;    
-        }    
-        return;                    // одиночный 0 — отложенный: решим по след. биту    
-    }    
-    // bit == 1    
-    if (vc_zeros == 1) {             // отложенный 0 оказался внутренним —    
-        vc_zeros = 0;                // записываем его позицию (бит уже 0)    
-        if (vc_nbits < VC_MAX_BITS) ++vc_nbits;    
-        else { vc_shreg = 0; vc_nbits = 0; return; }    
-    } else {    
-        vc_zeros = 0;    
-    }    
-    if (vc_nbits < VC_MAX_BITS) {    
-        vc_shreg |= (1u << vc_nbits);    
-        ++vc_nbits;    
-    } else {    
-        vc_shreg = 0; vc_nbits = 0;                 // переполнение — сброс    
-    }    
+static void vc_push_bit(uint8_t bit) {  
+    if (vc_nbits >= VC_MAX_BITS) {                  // сброс зависшего накопителя  
+        vc_shreg = 0; vc_nbits = 0; vc_zeros = 0;  
+    }  
+    if (bit) vc_shreg |= (1u << vc_nbits);          // нули — тоже биты кода  
+    ++vc_nbits;  
+  
+    if (bit) { vc_zeros = 0; return; }  
+    // Каждый код сам заканчивается минимум двумя нулями:  
+    // "00" — конец кода, а не внешний разделитель.  
+        if (++vc_zeros >= 2) {  
+            if (vc_shreg != 0)  
+                vc_emit_code();            // есть единицы — реальный код  
+            else {                         // голые нули — простой, не код  
+                vc_nbits = 0;  
+                vc_shreg = 0;  
+            }  
+            vc_zeros = 0;  
+        }
 }
   
 // ---------------------------------------------------------------------------  
